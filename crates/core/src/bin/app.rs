@@ -1,0 +1,2827 @@
+//! `thclaws` — unified binary: desktop GUI by default, CLI via --cli.
+//!
+//! Default: opens desktop GUI window.
+//! `--cli`: interactive REPL in the terminal (same as thclaws-cli).
+//! `--print`: non-interactive single-prompt mode (implies --cli).
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use thclaws_core::bridge::BridgeConfig;
+use thclaws_core::config::AppConfig;
+use thclaws_core::dotenv::load_dotenv;
+use thclaws_core::repl::run_repl;
+use thclaws_core::sandbox::Sandbox;
+use thclaws_core::{endpoints, schedule, secrets};
+
+#[derive(Parser)]
+#[command(
+    name = "thclaws",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"), "\n",
+        "revision: ", env!("THCLAWS_GIT_SHA"),
+            " (", env!("THCLAWS_GIT_BRANCH"), ")\n",
+        "built:    ", env!("THCLAWS_BUILD_TIME"),
+            " (", env!("THCLAWS_BUILD_PROFILE"), ")"
+    ),
+    about = "thClaws AI agent workspace (GUI + CLI)"
+)]
+struct Cli {
+    /// Subcommands. When omitted, the legacy flag-based CLI runs
+    /// (GUI default / `--cli` REPL / `--print` / `--serve`).
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run in CLI mode (interactive REPL) instead of GUI
+    #[arg(long)]
+    cli: bool,
+
+    /// Non-interactive: run prompt and exit (implies --cli)
+    #[arg(short, long)]
+    print: bool,
+
+    /// Override model for this run only — applies to CLI, GUI, and --serve.
+    /// One-shot, in-memory. Pair with --set-model to persist instead.
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// Persist a model to `.thclaws/settings.json` as the project
+    /// default, then use it for this run. Unlike --model (one-shot),
+    /// subsequent invocations without --model will pick up this value.
+    /// Refuses to overwrite an unreadable settings file to avoid
+    /// clobbering sibling fields (maxTokens, allowedTools, etc.).
+    #[arg(long, value_name = "MODEL")]
+    set_model: Option<String>,
+
+    /// Never ask for tool-call approval (alias: --dangerously-skip-permissions)
+    #[arg(long, alias = "dangerously-skip-permissions")]
+    accept_all: bool,
+
+    /// Permission mode: auto, ask (default: from config)
+    #[arg(long)]
+    permission_mode: Option<String>,
+
+    /// Override system prompt
+    #[arg(long)]
+    system_prompt: Option<String>,
+
+    /// Show per-turn token usage + timing on stderr (only takes effect with -p / --print)
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
+    /// Resume a previous session by ID (or "last" for most recent)
+    #[arg(long, alias = "continue")]
+    resume: Option<String>,
+
+    /// Print mode: don't persist the session (pre-upgrade `-p` behavior)
+    #[arg(long)]
+    no_session: bool,
+
+    /// Print mode output: text (default) streams the answer; json prints one
+    /// object at the end (result, stop_reason, exit_code, usage, timing)
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    output_format: String,
+
+    /// Comma-separated list of allowed tool names
+    #[arg(long)]
+    allowed_tools: Option<String>,
+
+    /// Comma-separated list of disallowed tool names
+    #[arg(long)]
+    disallowed_tools: Option<String>,
+
+    /// Max agent loop iterations per turn (0 = unlimited; default from
+    /// maxIterations, 50). In print mode, hitting it exits 3.
+    #[arg(long)]
+    max_iterations: Option<usize>,
+
+    /// Print mode: stop the turn after this many seconds, save the session
+    /// and exit 124
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
+
+    /// Print mode: sampling temperature, sent by OpenAI-compatible providers
+    /// (env THCLAWS_TEMPERATURE)
+    #[arg(long)]
+    temperature: Option<f64>,
+
+    /// Print mode: nucleus sampling top_p, sent by OpenAI-compatible
+    /// providers (env THCLAWS_TOP_P)
+    #[arg(long)]
+    top_p: Option<f64>,
+
+    /// Print mode: sampling seed, sent by OpenAI-compatible providers
+    /// (env THCLAWS_SEED)
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Read the prompt from this file ("-" = stdin) instead of the
+    /// positional arguments
+    #[arg(long, value_name = "PATH")]
+    prompt_file: Option<std::path::PathBuf>,
+
+    /// Read the system prompt from this file ("-" = stdin)
+    #[arg(long, value_name = "PATH")]
+    system_prompt_file: Option<std::path::PathBuf>,
+
+    /// System prompt from the base prompt, date and working directory only:
+    /// no git, project instructions, memory, KMS, skills or MCP sections
+    /// (env THCLAWS_BARE=1). Pair with THCLAWS_FIXED_DATE=YYYY-MM-DD for a
+    /// prompt that is the same on every run
+    #[arg(long)]
+    bare: bool,
+
+    /// Max output tokens per model call (overrides maxTokens)
+    #[arg(long)]
+    max_tokens: Option<u32>,
+
+    /// Print mode: append every request body sent to the model to this
+    /// JSONL file (env THCLAWS_REQUEST_LOG). Created 0600
+    #[arg(long, value_name = "PATH")]
+    request_log: Option<std::path::PathBuf>,
+
+    /// Run as a team agent
+    #[arg(long)]
+    team_agent: Option<String>,
+
+    /// Team directory
+    #[arg(long)]
+    team_dir: Option<String>,
+
+    /// M6.36: serve the React frontend over HTTP + WebSocket so the
+    /// project is reachable from a browser. Single-user; binds to
+    /// 127.0.0.1 by default — use an SSH tunnel for remote access.
+    /// `--bind 0.0.0.0` exposes the server publicly (only with auth
+    /// in front: e.g. Tailscale, Cloudflare Access, reverse proxy
+    /// with basic auth). One project per process; cd into the project
+    /// dir before running. Compose with `--gui` to also open the
+    /// desktop window on the same engine; mutually exclusive with
+    /// --cli / --print.
+    #[arg(long)]
+    serve: bool,
+
+    /// dev-plan/59: run `--serve` as the workspace HOST — a supervisor
+    /// that starts one `thclaws --serve` per agent from
+    /// `.thclaws/bots.json`, proxies the browser's socket to it and
+    /// restarts it when it dies. The host itself loads no agent, no
+    /// model and no MCP. This build supervises the first agent listed.
+    #[arg(long)]
+    supervisor: bool,
+
+    /// Port for `--serve` mode. Default 8443.
+    #[arg(long, default_value_t = 8443)]
+    port: u16,
+
+    /// Bind address for `--serve` mode. Default 127.0.0.1 (localhost).
+    /// Set to `0.0.0.0` to bind all interfaces — only safe behind
+    /// auth (Tailscale, reverse proxy, etc.).
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
+    /// dev-plan/33 Tier 2 Mode B: bind a GUI Shell as the served
+    /// frontend. When set, `--serve` mounts the shell at `/t/<token>/`
+    /// instead of the React app at `/`. Without this flag, `--serve`
+    /// keeps its existing behaviour (React frontend). Falls back to
+    /// `settings.json::guiShell.serveDefault` (or shorthand) when
+    /// omitted; if neither is set, serves React.
+    #[arg(long, value_name = "SHELL_ID")]
+    gui_shell: Option<String>,
+
+    /// Pin the per-shell auth token (16+ chars). Without this flag,
+    /// `--serve --gui-shell <id>` generates and persists a token in
+    /// ~/.config/thclaws/gui-shell-tokens.json so the URL is stable
+    /// across restarts. Use this for reproducible deployments
+    /// (k8s manifests, systemd units) where the URL must not change.
+    #[arg(long, value_name = "TOKEN", requires = "gui_shell")]
+    gui_shell_token: Option<String>,
+
+    /// Override the persisted token TTL (e.g. "30d", "12h", "never").
+    /// Default 30 days. Tokens past their TTL get regenerated on next
+    /// launch — the old URL stops working.
+    #[arg(long, value_name = "DURATION", requires = "gui_shell")]
+    gui_shell_token_ttl: Option<String>,
+
+    /// Serve the shell without the /t/<token>/ token prefix — routes
+    /// mount at /. Refuses non-loopback binds unless
+    /// --gui-shell-no-auth-allow-public is also passed. Loud stdout
+    /// warning. Same guardrail pattern as
+    /// --dangerously-skip-permissions.
+    #[arg(long, requires = "gui_shell")]
+    gui_shell_no_auth: bool,
+
+    /// Permit --gui-shell-no-auth on non-loopback addresses. Required
+    /// in addition to --gui-shell-no-auth to override the safety
+    /// check. Use behind your own auth proxy (Cloudflare Access,
+    /// OAuth2 proxy, mTLS, etc.).
+    #[arg(long, requires = "gui_shell_no_auth")]
+    gui_shell_no_auth_allow_public: bool,
+
+    /// dev-plan/35 Tier 1: enable multi-tenant `--serve` mode. The
+    /// pod accepts HMAC-signed X-Thclaws-User headers from a trusted
+    /// routing layer (typically dev-plan/34 thClaws.cloud) and routes
+    /// each request to a per-user SharedSessionHandle. Without this
+    /// flag, `--serve` is single-tenant (today's behaviour).
+    ///
+    /// `--multiuser` is the dev-plan/42 alias; combined with a
+    /// workspaces-base it gives each authenticated user their own
+    /// `workspace-<id>/` working directory.
+    #[arg(long, visible_alias = "multiuser", requires = "serve")]
+    multi_tenant: bool,
+
+    /// dev-plan/42: parent directory for per-user working directories.
+    /// When set (flag or env `THCLAWS_WORKSPACES_BASE`), each user runs
+    /// in `<base>/workspace-<user_id>/` instead of sharing one cwd.
+    /// Falls back to env; unset keeps the dev-plan/35 shared-cwd layout.
+    #[arg(long, value_name = "DIR", requires = "multi_tenant")]
+    multi_tenant_workspaces_base: Option<String>,
+
+    /// HMAC-SHA256 secret for verifying X-Thclaws-User-Proof. Must
+    /// match the secret the cloud routing layer signs with. Falls
+    /// back to env `THCLAWS_CLOUD_HMAC_SECRET`. Required when
+    /// --multi-tenant is set (or panic at startup — fail loud, not
+    /// silently allow forged identities).
+    #[arg(long, value_name = "SECRET", requires = "multi_tenant")]
+    multi_tenant_secret: Option<String>,
+
+    /// Cap on concurrent resident user sessions per pod. LRU evicts
+    /// past this. Default 1000 — at ~2-5MB per session that's 2-5GB
+    /// pod RAM in the worst case, which matches typical HPA targets.
+    #[arg(long, default_value_t = 1000, requires = "multi_tenant")]
+    multi_tenant_max_users: usize,
+
+    /// Idle timeout per user — sessions checkpoint + evict after no
+    /// activity for this duration. Parsed via parse_ttl_secs ("30m",
+    /// "2h", "never"). Default 30 minutes.
+    #[arg(long, value_name = "DURATION", requires = "multi_tenant")]
+    multi_tenant_idle_timeout: Option<String>,
+
+    /// Open the desktop GUI window. GUI is the implicit default when no
+    /// other surface flag is set, so this flag's main use is composing
+    /// with `--serve` (`--serve --gui`): the desktop window and any
+    /// browser tab attach to the same Agent + Session — same
+    /// conversation, two surfaces.
+    #[arg(long)]
+    gui: bool,
+
+    /// Disable the in-process scheduler. Schedules stay in the store
+    /// but won't auto-fire while this process runs — use external
+    /// cron / launchd or `thclaws schedule run <id>` instead. Has no
+    /// effect on `--print` and the `schedule` subcommand, neither of
+    /// which spawn the scheduler in the first place.
+    #[arg(long)]
+    no_scheduler: bool,
+
+    /// Run the Telegram bot headless (no GUI window). Reads the bot token
+    /// from TELEGRAM_BOT_TOKEN or ~/.config/thclaws/telegram.json; set
+    /// TELEGRAM_OWNER_ID=<your id> for instant DM access. The agent runs
+    /// locally; Telegram is just the chat surface. dev-plan/29.
+    #[arg(long)]
+    telegram: bool,
+
+    /// Run the Facebook Page Messenger bridge headless (no GUI window).
+    /// Connects to the relay using the binding JWT in
+    /// ./.thclaws/messenger.json — project-scoped since dev-plan/33
+    /// Tier 2; the legacy ~/.config/thclaws/messenger.json is only read
+    /// when THCLAWS_MESSENGER_USER_CONFIG=1. Pair via the GUI first. The
+    /// agent runs locally; Messenger is just the chat surface.
+    /// dev-plan/31.
+    #[arg(long)]
+    messenger: bool,
+
+    /// Run a pre-authored workflow script headlessly (dev-plan/32
+    /// Stage L). Skips the `/workflow run` author + review phase
+    /// entirely — the file is expected to be vetted by the operator.
+    /// Pair with --resume <id> to continue an interrupted run.
+    /// Writes the workflow id + done-summary to stderr; the script's
+    /// final value goes to stdout. Exit 0 on success, 1 on script
+    /// failure.
+    #[arg(long, value_name = "FILE")]
+    workflow: Option<PathBuf>,
+
+    /// Prompt (positional args joined with spaces)
+    prompt: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage scheduled jobs.
+    #[command(subcommand)]
+    Schedule(ScheduleCmd),
+    /// Run the scheduler daemon in the foreground. Normally invoked
+    /// by launchd / systemd via `thclaws schedule install`. Run it
+    /// manually to test schedules without installing the supervisor
+    /// (Ctrl-C to stop).
+    Daemon,
+    /// Deploy the current project's `.thclaws/` (skills, MCP, plugins,
+    /// KMS, AGENTS.md, settings.json) to a running `thclaws --serve`
+    /// pod. Sessions / memory / team-runtime on the pod side are
+    /// preserved across deploys. See dev-plan/28 for the contract.
+    Deploy {
+        /// Pod base URL (e.g. https://agent.example.com). Required.
+        #[arg(long)]
+        pod: String,
+        /// Bearer token for the pod's /v1/* API. Falls back to
+        /// $THCLAWS_DEPLOY_TOKEN if unset.
+        #[arg(long)]
+        token: Option<String>,
+        /// Include `.thclaws/memory/` in the upload (private agent
+        /// notes — opt-in).
+        #[arg(long)]
+        include_memory: bool,
+        /// Don't reject stdio MCP entries. They'll fail to start on
+        /// the pod side; useful only for iterating on the cloud config.
+        #[arg(long)]
+        allow_stdio_mcp: bool,
+        /// Print what would upload (file list + bytes) without sending.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the diff handshake and always upload the full bundle.
+        /// Default is to query /v1/deploy/manifest first and only ship
+        /// changed files (Phase 2 from dev-plan/28).
+        #[arg(long)]
+        full: bool,
+        /// Skip the auto-restart after a successful deploy. By
+        /// default the client POSTs /v1/restart so the pod
+        /// re-initialises MCP servers, plugin runtimes, skill caches,
+        /// and the system prompt. Pass --no-restart to keep the
+        /// running --serve process up across the deploy (rare: hot
+        /// config edits the snapshot doesn't read).
+        #[arg(long = "no-restart")]
+        no_restart: bool,
+    },
+    /// Manage the Telegram adapter (dev-plan/29). `status` prints the
+    /// resolved config; `pair` prints setup instructions. Connecting a
+    /// bot is done from the GUI Telegram Connect modal (or auto-loads on
+    /// launch when `~/.config/thclaws/telegram.json` is present + enabled).
+    Telegram {
+        #[command(subcommand)]
+        cmd: TelegramCmd,
+    },
+    /// Manage the Facebook Page Messenger adapter (dev-plan/31).
+    /// `status` prints the resolved binding config; `pair` prints setup
+    /// instructions. Connecting a Page is done from the GUI Messenger
+    /// Connect modal.
+    Messenger {
+        #[command(subcommand)]
+        cmd: MessengerCmd,
+    },
+    /// thClaws.cloud catalog client (dev-plan/34) — RETIRED FROM THE
+    /// SHELL. Every cloud operation now happens inside a thclaws
+    /// session as a slash command, so the catalog token never
+    /// passes through shell argv, env, or terminal history. Every
+    /// subcommand below prints the corresponding /cloud … or GUI
+    /// pointer and exits non-zero:
+    ///   login/logout → Settings → thClaws.cloud panel in the GUI
+    ///   status       → /cloud status
+    ///   list         → /cloud list [--mine]
+    ///   get          → /cloud get <slug>
+    ///   publish      → /cloud publish
+    ///   unbind       → /cloud unbind
+    Cloud {
+        #[command(subcommand)]
+        cmd: CloudCmd,
+        /// Override the catalog URL for this invocation. Usually
+        /// unnecessary — the URL is persisted to settings.json on
+        /// first `cloud login` (or from the GUI Settings → thClaws.cloud
+        /// panel). Precedence: this flag > `THCLAWS_CLOUD_URL` env >
+        /// `settings.json::cloud.url` > default `https://thclaws.cloud`.
+        #[arg(long, global = true, value_name = "URL")]
+        cloud_url: Option<String>,
+    },
+    /// Package or validate an agent folder headlessly (dev-plan/47.5).
+    /// `pack` produces the same fused tarball `/cloud publish` uploads;
+    /// `validate` lints the folder before publish. Lets scripts/CI reuse
+    /// the canonical packer instead of re-deriving the strip rules.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
+    /// dev-plan/59: workspaces that hold more than one agent — inspect the
+    /// layout, or move a single-agent workspace into it.
+    #[cfg(feature = "gui")]
+    Bots {
+        #[command(subcommand)]
+        cmd: BotsCmd,
+    },
+    /// GUI Shell authoring (dev-plan/39 Tier 2) — scaffold a new shell
+    /// from a vendored template, preview locally with hot-reload, lint
+    /// the manifest, or pack into a single-file HTML for publish.
+    #[cfg(feature = "gui")]
+    Shell {
+        #[command(subcommand)]
+        cmd: ShellCmd,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Subcommand)]
+enum BotsCmd {
+    /// Print the workspace layout version and the agents in it.
+    Status {
+        /// Workspace to inspect. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Get an Agent Template into this workspace as an agent
+    /// (`.thclaws/bots/<slug>/`) and list it in `.thclaws/bots.json`.
+    /// A running host picks it up on its next start.
+    Add {
+        /// Agent Template name, as `/cloud list` shows it.
+        slug: String,
+        /// Pin a version instead of taking the latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Overwrite a folder bound to a different Agent Template.
+        #[arg(long)]
+        force: bool,
+        /// Workspace to install into. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Remove an agent from this workspace. Its folder — sessions, KMS, browser logins —
+    /// stays on disk unless `--purge`.
+    Remove {
+        slug: String,
+        /// Also delete the agent's folder and everything in it.
+        #[arg(long)]
+        purge: bool,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Move a single-agent (v2) workspace into the v3 layout,
+    /// which can hold more than one agent.
+    /// Everything at the workspace root — your files, your git repository
+    /// and `.thclaws/` alike — becomes `.thclaws/bots/main/`, and the root
+    /// becomes the host that supervises it. Resumable: if it is interrupted,
+    /// run it again.
+    Migrate {
+        /// Print what would move, then stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace to migrate. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Point an agent's own `.thclaws/…` paths back at its folder. Migration
+    /// does this for workspaces it moves; this is for one already on disk,
+    /// whose agent still looks for its scripts and state at the workspace root
+    /// and so reports an empty project.
+    FixPaths {
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Workspace to repair. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Undo a double migration: a workspace an older engine migrated twice
+    /// holds its real agent one level too deep, and the host supervises a
+    /// folder that is not an agent. Promotes the inner workspace and keeps the
+    /// bare outer host beside it.
+    Unnest {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace to un-nest. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Undo `migrate` for a workspace whose one agent is `main`: the agent goes
+    /// back to the root, and the host's `.thclaws/` is kept beside it.
+    Unmigrate {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Workspace to convert back. Defaults to the current directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Scaffold a best-practice agent skeleton (dev-plan/48.6) that
+    /// `thclaws agent validate` passes out of the box: role subagents
+    /// (planner / worker / read-only verifier) + output_schema files,
+    /// and a deterministic workflow for the static patterns.
+    New {
+        /// Destination folder (created if missing).
+        path: std::path::PathBuf,
+        /// Starter shape: static-pipeline | batch-fanout | dynamic.
+        #[arg(long, default_value = "static-pipeline")]
+        pattern: String,
+        /// Agent id/name (defaults to the folder name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Scaffold into a non-empty folder.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run an agent's pre-authored workflow headlessly (Task + MCP
+    /// registered, unlike `-p`) to behaviorally smoke-test it (dev-plan/48.2).
+    /// Exits non-zero if the workflow errors.
+    Run {
+        /// Agent folder.
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Workflow script relative to the agent folder. Defaults to the
+        /// sole `.thclaws/workflows/*.js` when there's exactly one.
+        #[arg(long)]
+        workflow: Option<std::path::PathBuf>,
+        /// JSON value passed to the script as the `args` global.
+        #[arg(long)]
+        args: Option<String>,
+        /// Skip MCP + native media tools — run control-flow without real
+        /// generation / external spend.
+        #[arg(long)]
+        dry_tools: bool,
+    },
+    /// Pack an agent folder into the canonical fused tarball (identity +
+    /// catalog manifest) — the exact bytes `/cloud publish` uploads.
+    Pack {
+        /// Agent folder (must contain AGENTS.md + manifest.json).
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Output file. Defaults to <path>/<id>-<version>.tar.gz.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Validate an agent folder before publish: manifest + identity,
+    /// subagent output/input schemas, workflow scripts, and a trial pack.
+    /// Exits non-zero on any error.
+    Validate {
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Subcommand)]
+enum ShellCmd {
+    /// Scaffold a new shell from a starter template.
+    /// Templates: chat-enhanced / grid / form / dashboard / kanban /
+    /// document / report.
+    New {
+        /// Template id (see `thclaws shell new --help` for the list).
+        template: String,
+        /// Destination folder. Created if missing; refused if non-empty
+        /// without --force.
+        dest: std::path::PathBuf,
+        /// Overwrite a non-empty destination.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run the shell against a mock agent, with hot-reload on save.
+    /// Opens at http://localhost:<port>/ by default.
+    Preview {
+        /// Path to the shell folder (must contain shell.json).
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Port to bind. 0 = pick a free one.
+        #[arg(long, default_value_t = 8088)]
+        port: u16,
+    },
+    /// Lint a shell folder. Emits errors + warnings; exits 1 on any
+    /// error.
+    Check {
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+    /// Bundle a shell folder into a single-file HTML (inlines sibling
+    /// style.css and script.js if present).
+    Pack {
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Output file. Defaults to <path>/dist/index.html.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCmd {
+    /// REMOVED — open thclaws and paste your CLI token in
+    /// Settings → thClaws.cloud. The shell subcommand exits with a
+    /// pointer so the token never has to pass through shell argv.
+    Login {
+        /// Provide the token inline instead of prompting.
+        #[arg(long)]
+        token: Option<String>,
+        /// Sign in through the browser (your organisation's login) and store
+        /// a token for this machine. The one form of `cloud login` kept: no
+        /// token ever passes through argv.
+        #[arg(long)]
+        browser: bool,
+    },
+    /// REMOVED — open thclaws and clear the CLI token in
+    /// Settings → thClaws.cloud.
+    Logout,
+    /// REMOVED — use `/cloud publish` from inside a thclaws session.
+    /// The shell subcommand printed (and now refuses with a pointer
+    /// to the slash flow) so the catalog token doesn't have to live
+    /// in shell env / terminal history.
+    Publish {
+        /// Path to the agent folder. Defaults to cwd.
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Show what would be uploaded without sending.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// REMOVED — use `/cloud get <slug>` from inside a thclaws session.
+    /// The shell subcommand refuses with a pointer to the slash flow
+    /// so the catalog token doesn't have to live in shell env /
+    /// terminal history.
+    Get {
+        /// Catalog slug (`manifest.id`).
+        slug: String,
+        /// Target directory. Defaults to ./<slug>/. Refuses to overwrite
+        /// non-empty dirs unless --force.
+        #[arg(default_value = "")]
+        target: String,
+        /// Specific version to download. Defaults to latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Allow extracting into a non-empty directory.
+        #[arg(long)]
+        force: bool,
+    },
+    /// REMOVED — use `/cloud list [--mine]` from inside a thclaws session.
+    List {
+        #[arg(long)]
+        mine: bool,
+    },
+    /// REMOVED — use `/cloud status` from inside a thclaws session.
+    Status,
+    /// REMOVED — use `/cloud unbind` from inside a thclaws session in
+    /// the agent folder you want to fork.
+    Unbind,
+}
+
+#[derive(Subcommand)]
+enum TelegramCmd {
+    /// Print the resolved Telegram config: whether a token is present
+    /// (redacted), DM/group policy, allowlist size, output ceiling.
+    Status,
+    /// Print step-by-step instructions for creating a bot with
+    /// @BotFather and connecting it.
+    Pair,
+}
+
+#[derive(Subcommand)]
+enum MessengerCmd {
+    /// Print the resolved Messenger binding config: relay URL, whether
+    /// a binding token is present (redacted), cached Page name/id.
+    Status,
+    /// Print step-by-step instructions for connecting a Facebook Page.
+    Pair,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Add a new schedule. Errors if the id already exists.
+    Add {
+        /// Stable id for the schedule (used as the lookup key and log dir name).
+        id: String,
+        /// Standard 5-field POSIX cron expression for a recurring job
+        /// (e.g. "30 8 * * MON-FRI"). Mutually exclusive with --at/--in.
+        #[arg(long)]
+        cron: Option<String>,
+        /// One-shot: fire once at this absolute RFC 3339 time
+        /// (e.g. "2026-05-24T15:30:00Z"), then auto-disable. Mutually
+        /// exclusive with --cron and --in.
+        #[arg(long, conflicts_with_all = ["cron", "in_delay"])]
+        at: Option<String>,
+        /// One-shot: fire once after this relative delay (e.g. 15m, 2h,
+        /// 90s, 1d), then auto-disable. Mutually exclusive with --cron
+        /// and --at.
+        #[arg(long = "in", conflicts_with_all = ["cron", "at"])]
+        in_delay: Option<String>,
+        /// Prompt text to feed `thclaws --print` when this schedule fires.
+        #[arg(long)]
+        prompt: String,
+        /// Working directory for the spawned job. Defaults to the current
+        /// working directory at add time.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Override model alias for this job (defaults to whatever the
+        /// cwd's `.thclaws/settings.json` picks).
+        #[arg(long)]
+        model: Option<String>,
+        /// Heartbeat mode: chain every fire into ONE session (history
+        /// accumulates) instead of a fresh run each time. Use "last"
+        /// (recommended — resumes this cwd's most-recent session; the
+        /// first fire starts it) or an existing session id.
+        #[arg(long)]
+        resume_session: Option<String>,
+        /// Per-job iteration cap.
+        #[arg(long)]
+        max_iterations: Option<usize>,
+        /// Per-job timeout in seconds. Default 600 (10 min). Pass 0 for no timeout.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Add as disabled. Edit `~/.config/thclaws/schedules.json` (set
+        /// `"enabled": true`) to turn it on later.
+        #[arg(long)]
+        disabled: bool,
+        /// Also fire when any file in the schedule's working directory
+        /// changes (debounced ~2s). Daemon-only — the in-process
+        /// scheduler ignores this flag.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// List all schedules.
+    List,
+    /// Print one schedule's full record as JSON.
+    Show { id: String },
+    /// Remove a schedule (does not delete its log directory).
+    Rm { id: String },
+    /// Fire a schedule once, synchronously. Captures stdout+stderr to
+    /// `~/.local/share/thclaws/logs/<id>/<ts>.log` and returns the
+    /// child's exit code as this process's exit code.
+    Run { id: String },
+    /// Install the scheduler daemon as a user-level supervised
+    /// service (launchd plist on macOS, systemd-user unit on Linux).
+    /// On macOS this also bootstraps the agent so the daemon starts
+    /// immediately and on every login.
+    Install,
+    /// Stop and remove the daemon's supervisor entry. Schedules in
+    /// the store are preserved.
+    Uninstall,
+    /// Print scheduler daemon status (running / stale / not running)
+    /// and a brief recent-fires summary across all schedules.
+    Status,
+}
+/// Any panic in a tokio task unwinds that task but leaves the runtime — and
+/// the bound port — alive, so systemd `Restart=on-failure` sits on a
+/// never-failing parent and the user has to `kill -9` to get the port back.
+/// Chain the default hook so the traceback still reaches stderr, then abort so
+/// the OS releases the listening socket immediately (#151). Shared by
+/// `--serve` and `--serve --supervisor`, which have the same port to lose.
+#[cfg(feature = "gui")]
+fn install_serve_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".into());
+        let text = format!("panic at {where_}: {payload}");
+        // Kept where a dead stderr cannot swallow it (#210).
+        thclaws_core::util::write_panic_log(&text);
+        if thclaws_core::util::panic_is_print_failure(&payload) {
+            // Our own log write failed, which means the host's pipe is gone.
+            // Reporting it would write to that same pipe and panic again —
+            // a panic inside a panic is an abort, and that is the crash report
+            // users saw on every quit. Leave quietly instead; this agent's work
+            // is done the moment its host is.
+            std::process::exit(0);
+        }
+        default_hook(info);
+        thclaws_core::util::log_line(
+            "\x1b[31m[--serve] panic — aborting so the port is released\x1b[0m",
+        );
+        std::process::abort();
+    }));
+}
+
+/// Hide the console allocated for the Windows console-subsystem binary when
+/// the user is launching the GUI. CLI mode keeps the console attached so
+/// `thclaws --cli` can read keys normally from PowerShell/CMD.
+// Called only from the `#[cfg(feature = "gui")]` launch paths below, so a
+// CLI-only build (`cargo build` without `--features gui`) never reaches it.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn detach_console_for_gui() {
+    use windows_sys::Win32::System::Console::FreeConsole;
+
+    // SAFETY: `FreeConsole` detaches this process from its console and has no
+    // Rust-side invariants. Failure only means there was no console to detach.
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn detach_console_for_gui() {}
+
+/// Parse a TTL string like "30d" / "12h" / "60m" / "120s" / "never"
+/// into seconds. Used by `--gui-shell-token-ttl`. Returns `None` for
+/// "never" (no expiry) or any unparseable input — the caller falls
+/// back to the manifest / launcher default.
+// Only reached from the `#[cfg(feature = "gui")]` serve path, so a
+// CLI-only build wouldn't otherwise use it.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn parse_ttl_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("never") || s.is_empty() {
+        return None;
+    }
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c.to_ascii_lowercase()),
+        _ => (s, 's'),
+    };
+    let n: u64 = num.parse().ok()?;
+    Some(match unit {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 60 * 60,
+        'd' => n * 60 * 60 * 24,
+        'w' => n * 60 * 60 * 24 * 7,
+        _ => return None,
+    })
+}
+
+/// Windows-only: when about to launch the GUI from a console (cmd.exe /
+/// PowerShell), respawn ourselves as a detached child and exit the parent
+/// so the shell prompt returns immediately. Issue #109.
+///
+/// Background: `thclaws.exe` is built as a **console-subsystem** binary
+/// (PR #60 / issue #48) so that `--cli`'s rustyline gets working stdio.
+/// The side effect is that cmd.exe / PowerShell `WaitForSingleObject` on
+/// every console-subsystem child until exit — `notepad.exe` returns the
+/// prompt instantly only because it's a windows-subsystem binary, and
+/// `FreeConsole()` in the child doesn't change cmd's wait. Result: typing
+/// `thclaws.exe` from a shell blocks the prompt until the GUI window closes.
+///
+/// Workaround: at the GUI dispatch entry, respawn `current_exe()` with
+/// `THCLAWS_GUI_DETACHED=1` and `DETACHED_PROCESS`, then `exit(0)`. The
+/// child sees the env var, skips the respawn, runs the GUI in-process,
+/// and survives parent / terminal closure because `DETACHED_PROCESS`
+/// breaks the parent process group. The parent exits in microseconds,
+/// so cmd's wait returns and the next prompt appears.
+///
+/// Called before the in-process scheduler and `/v1` loopback bind so
+/// neither runs in the doomed parent (avoiding a port-bind race on
+/// 18443). No-op on macOS / Linux — terminals there don't block on
+/// GUI children.
+#[cfg(all(windows, feature = "gui"))]
+fn respawn_detached_for_gui_if_needed(cli: &Cli) {
+    // Skip in the detached child itself.
+    if std::env::var_os("THCLAWS_GUI_DETACHED").is_some() {
+        return;
+    }
+    // Only respawn when the dispatch is actually GUI: not --cli/--print/
+    // --telegram/--messenger, and either plain GUI (no --serve) or the
+    // --serve --gui combo.
+    let use_cli = cli.cli
+        || cli.print
+        || cli.telegram
+        || cli.messenger
+        || cli.workflow.is_some()
+        || cli.team_agent.is_some();
+    let is_gui_dispatch = !use_cli && (!cli.serve || cli.gui);
+    if !is_gui_dispatch {
+        return;
+    }
+
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS (0x00000008) — child has no console, no process-
+    // group ties to the parent shell.
+    const DETACHED_PROCESS: u32 = 0x00000008;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let spawn = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("THCLAWS_GUI_DETACHED", "1")
+        .creation_flags(DETACHED_PROCESS)
+        .spawn();
+    if spawn.is_ok() {
+        std::process::exit(0);
+    }
+    // Spawn failed (antivirus quarantine, ENOMEM, etc.): fall through
+    // and run the GUI in-process. User loses the prompt-return but
+    // keeps a working app.
+}
+
+#[cfg(not(all(windows, feature = "gui")))]
+fn respawn_detached_for_gui_if_needed(_cli: &Cli) {}
+
+/// dev-plan/59: a workspace holding `.thclaws/bots.json` is a v3 host tree.
+/// The layout decides the process shape — see `server::run_supervisor`.
+#[cfg(feature = "gui")]
+fn workspace_is_v3() -> bool {
+    std::env::current_dir()
+        .map(|d| d.join(thclaws_core::bots::CONFIG_REL).exists())
+        .unwrap_or(false)
+}
+
+#[cfg(not(feature = "gui"))]
+fn workspace_is_v3() -> bool {
+    false
+}
+
+#[tokio::main]
+async fn main() {
+    // dev-plan/49: if this is the internal `__confine` re-exec (Linux Landlock
+    // path), install the ruleset + exec the target here and never return.
+    thclaws_core::confine::maybe_handle_confine_subcommand();
+    secrets::load_into_env();
+    endpoints::load_into_env();
+    load_dotenv();
+    // Co-located AI Server (DGX Spark appliance): if the loopback discovery
+    // endpoint answers, point the `litellm` provider at its gateway. Runs
+    // after the three env layers above so it can only fill in what none of
+    // them set. A no-op (one refused loopback connection) everywhere else.
+    thclaws_core::aiserver::bootstrap().await;
+    let _ = Sandbox::init();
+
+    // M6.45 / #79-followup: warn if there are additional thclaws
+    // copies elsewhere on PATH. On Windows pairs with the MSI's
+    // Part="first" PATH addition (which makes the new install win
+    // PATH-search regardless of older entries) — this surfaces the
+    // duplicates so the user can clean them up. On macOS/Linux,
+    // catches version mismatch (e.g. /usr/local/bin/thclaws +
+    // /opt/homebrew/bin/thclaws after a brew migration). Not gated
+    // on any mode (CLI / GUI / --serve / --print).
+    warn_about_stale_binaries();
+
+    // Org policy file enforcement (Enterprise Edition foundation).
+    // Runs before CLI parse so a fail-closed refusal happens identically
+    // whether the user invoked GUI, CLI, or print mode. Open-core builds
+    // with no policy file and no key are unaffected — `load_or_refuse`
+    // returns Ok(false).
+    if let Err(e) = thclaws_core::policy::load_or_refuse() {
+        eprintln!("\x1b[31m{}\x1b[0m", e.refuse_message());
+        std::process::exit(2);
+    }
+    thclaws_core::audit::init();
+
+    let cli = Cli::parse();
+    #[cfg(feature = "gui")]
+    if cli.serve {
+        thclaws_core::bots::supervisor::take_handover_from_stdin();
+    }
+
+    // clap's `requires = "serve"` does not fire for a flag: `--serve` has an
+    // implicit `false` default, which counts as present. Without this check
+    // `--supervisor` on its own silently opened the desktop GUI.
+    if cli.supervisor && !cli.serve {
+        eprintln!(
+            "\x1b[31m--supervisor is a mode of --serve; use `thclaws --serve --supervisor`\x1b[0m"
+        );
+        std::process::exit(1);
+    }
+
+    // Subcommand short-circuit. `thclaws schedule …` and
+    // `thclaws daemon` don't need the bootstrap, don't open a
+    // session, and shouldn't fall through to GUI/CLI/serve
+    // dispatch — handle them here and exit.
+    match cli.command {
+        Some(Command::Schedule(sub)) => {
+            let code = run_schedule_subcommand(sub);
+            std::process::exit(code);
+        }
+        Some(Command::Daemon) => {
+            // The daemon spawns its own scheduler — ensure the
+            // app.rs auto-spawn block below does NOT also spawn one
+            // (would mean two schedulers running against the same
+            // store). The `cli.command.is_some()` check below
+            // handles that.
+            match schedule::run_daemon().await {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("\x1b[31m[daemon] {e}\x1b[0m");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Command::Deploy {
+            pod,
+            token,
+            include_memory,
+            allow_stdio_mcp,
+            dry_run,
+            full,
+            no_restart,
+        }) => {
+            let code = thclaws_core::deploy_client::run(thclaws_core::deploy_client::DeployArgs {
+                pod,
+                token,
+                include_memory,
+                allow_stdio_mcp,
+                dry_run,
+                full,
+                restart: !no_restart,
+            })
+            .await;
+            std::process::exit(code);
+        }
+        Some(Command::Telegram { cmd }) => {
+            let code = run_telegram_subcommand(cmd);
+            std::process::exit(code);
+        }
+        Some(Command::Messenger { cmd }) => {
+            let code = run_messenger_subcommand(cmd);
+            std::process::exit(code);
+        }
+        Some(Command::Cloud { cmd, cloud_url }) => {
+            let code = run_cloud_subcommand(cmd, cloud_url).await;
+            std::process::exit(code);
+        }
+        Some(Command::Agent { cmd }) => {
+            let code = run_agent_subcommand(cmd).await;
+            std::process::exit(code);
+        }
+        #[cfg(feature = "gui")]
+        Some(Command::Bots { cmd }) => {
+            let code = run_bots_subcommand(cmd).await;
+            std::process::exit(code);
+        }
+        #[cfg(feature = "gui")]
+        Some(Command::Shell { cmd }) => {
+            let code = run_shell_subcommand(cmd).await;
+            std::process::exit(code);
+        }
+        None => {}
+    }
+
+    let use_cli = cli.cli
+        || cli.print
+        || cli.telegram
+        || cli.messenger
+        || cli.workflow.is_some()
+        || cli.team_agent.is_some();
+    // Whether this process still has to be told which folder it is for. A
+    // desktop opened from an icon starts wherever the OS put it — Documents on
+    // Windows, where the Start-menu shortcut sets
+    // `WorkingDirectory="PersonalFolder"`. Nothing may write into that folder
+    // until the picker is answered: `.thclaws/state` alone makes
+    // `looks_like_v2_agent` true, so a bootstrap there turns the user's
+    // Documents into a workspace that the next launch offers to upgrade —
+    // and `is_never_a_workspace` does not cover it, because it guards home
+    // itself, not the folders inside it. A pick carries the answer across a
+    // re-exec in THCLAWS_PICKER_ANSWERED; a CLI / `-p` / `--serve` run chose
+    // its folder by `cd`-ing into it.
+    #[cfg(feature = "gui")]
+    let folder_undecided =
+        thclaws_core::util::folder_undecided(!use_cli && (!cli.serve || cli.gui));
+    #[cfg(not(feature = "gui"))]
+    let folder_undecided = false;
+    // dev-plan/59 §7.8: opening a v2 workspace in the app upgrades it. The
+    // desktop and `--serve` are the surfaces a person is looking at, so the
+    // banner below is seen; `-p` and the adapters are left alone, because a
+    // script that opens a folder must not find it rearranged. A container
+    // never does this on its own — 71 hosted workspaces migrating at once on
+    // an image roll is a separate, rehearsed decision (`THCLAWS_AUTO_MIGRATE`).
+    #[cfg(feature = "gui")]
+    {
+        let opens_desktop = !use_cli && (!cli.serve || cli.gui);
+        let auto_allowed = thclaws_core::bots::migrate::auto_migrate_allowed();
+        // `!folder_undecided`: upgrading a folder is the most destructive
+        // thing a launch does, so it waits for the picker like every other
+        // write. A v2 folder that is picked opens as a host, which re-execs,
+        // and the restarted process — marker set — upgrades it then.
+        if auto_allowed
+            && !use_cli
+            && !cli.multi_tenant
+            && !folder_undecided
+            && (cli.serve || opens_desktop)
+        {
+            if let Ok(cwd) = std::env::current_dir() {
+                use thclaws_core::bots::migrate::AutoOutcome;
+                thclaws_core::util::wait_for_reexec_parent(std::time::Duration::from_secs(15));
+                match thclaws_core::bots::migrate::auto_migrate_if_v2(&cwd) {
+                    AutoOutcome::Migrated(report, moves_git) => {
+                        eprintln!("\x1b[36m[thclaws] This workspace can now hold more than one agent.\x1b[0m");
+                        eprintln!(
+                            "\x1b[36m  Your project — files, sessions{} — is now at {}\x1b[0m",
+                            if moves_git { ", git repository" } else { "" },
+                            report.bot_dir.display()
+                        );
+                        eprintln!("\x1b[36m  Anything holding the old path (an editor window, a script, another clone) needs the new one.\x1b[0m");
+                        // The tree under cwd changed; the sandbox root did not,
+                        // but re-derive it rather than trust that.
+                        let _ = Sandbox::init();
+                    }
+                    AutoOutcome::Busy => eprintln!(
+                        "\x1b[33m[thclaws] another thClaws is upgrading this workspace — opening it as it is for now\x1b[0m"
+                    ),
+                    AutoOutcome::Failed(e) => eprintln!(
+                        "\x1b[33m[thclaws] could not upgrade this workspace ({e}) — opening it as it is\x1b[0m"
+                    ),
+                    AutoOutcome::GaveUp(n, e) => eprintln!(
+                        "\x1b[33m[thclaws] this workspace's upgrade failed {n} times ({e}) — not retrying; close thClaws and run `thclaws bots migrate` here\x1b[0m"
+                    ),
+                    AutoOutcome::AlreadyV3 => {}
+                    AutoOutcome::NotV2 => match thclaws_core::bots::migrate::mint_if_fresh(&cwd) {
+                        Some(Ok(_)) => eprintln!(
+                            "\x1b[36m[thclaws] new workspace — it can hold more than one agent\x1b[0m"
+                        ),
+                        Some(Err(e)) => eprintln!(
+                            "\x1b[33m[thclaws] could not set up this new workspace for agents ({e}) — opening it as a single agent\x1b[0m"
+                        ),
+                        None => {}
+                    },
+                }
+            }
+        }
+    }
+
+    // dev-plan/59: a v3 root holds the host, not an agent. A script or a
+    // person running `-p` / `--cli` there meant the workspace's agent, which
+    // is now `bots[0]` — so go there, the way `agent run` enters an agent
+    // folder, instead of loading the migration tombstone as instructions.
+    #[cfg(feature = "gui")]
+    if use_cli && workspace_is_v3() {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let target = thclaws_core::bots::BotsConfig::load(&cwd)
+            .ok()
+            .and_then(|c| {
+                c.bots
+                    .first()
+                    .map(|b| thclaws_core::bots::bot_dir(&cwd, &b.slug))
+            });
+        match target {
+            Some(dir) if dir.is_dir() => {
+                // dev-plan/61: the agent's folder becomes the cwd for its
+                // settings and sessions, but its files are the workspace's.
+                // Set before `Sandbox::init` below reads it.
+                std::env::set_var("THCLAWS_WORKSPACE_ROOT", &cwd);
+                if let Err(e) = std::env::set_current_dir(&dir) {
+                    eprintln!("\x1b[31mcannot enter {}: {e}\x1b[0m", dir.display());
+                    std::process::exit(1);
+                }
+                // Same re-init `run_on` does after a gui-shell chdir: the
+                // sandbox root and the project `.env` both follow cwd.
+                let _ = Sandbox::init();
+                load_dotenv();
+                eprintln!(
+                    "\x1b[2m[thclaws] workspace host — running in {}\x1b[0m",
+                    dir.display()
+                );
+            }
+            _ => {
+                eprintln!("\x1b[31mThis directory is a workspace host and its default agent is missing; cd into .thclaws/bots/<slug> and run again.\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Issue #109: on Windows, respawn detached so cmd.exe / PowerShell
+    // return the prompt instead of waiting on the GUI window. Runs
+    // before the scheduler + /v1 loopback so they don't bind ports in
+    // the doomed parent. See `respawn_detached_for_gui_if_needed`.
+    respawn_detached_for_gui_if_needed(&cli);
+
+    // Held back until a folder is chosen — see `folder_undecided` above.
+    // `set_cwd` runs both of these against the folder the user picks.
+    if !folder_undecided {
+        // Workspace layout migration (v1 flat → v2 `state/`): relocate any
+        // legacy runtime dirs under `.thclaws/state/` and seed authored
+        // workflows. Runs BEFORE the default-settings bootstrap so a legacy
+        // workspace (runtime dirs, no settings.json) is detected as legacy
+        // rather than freshly stamped v2. No-op on already-migrated or
+        // multiuser workspaces.
+        thclaws_core::config::ProjectConfig::migrate_workspace_if_needed();
+
+        // First-run bootstrap: drop a `.thclaws/settings.json` with model +
+        // permissions defaults into the project so users get a working
+        // config the first time they `cd` in. Skipped if a config already
+        // exists or if a Claude Code `.claude/settings.json` is present.
+        thclaws_core::config::ProjectConfig::ensure_default_exists();
+    }
+
+    // Wire up `--set-model` / `--model` before any AppConfig::load runs.
+    // `--set-model` persists to `.thclaws/settings.json` (refusing to
+    // overwrite an unreadable file so we don't clobber sibling settings)
+    // and also takes effect this run; `--model` is in-memory only. Both
+    // route through `set_cli_model_override`, which `AppConfig::load`
+    // applies last — so every surface (CLI, GUI, --serve) sees the same
+    // model without each path re-implementing the override step.
+    if let Some(ref m) = cli.set_model {
+        let resolved = thclaws_core::providers::ProviderKind::resolve_alias(m);
+        match thclaws_core::config::persist_model_to_project_settings(&resolved) {
+            Ok(path) => eprintln!(
+                "\x1b[32m--set-model: persisted model={resolved} to {}\x1b[0m",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("\x1b[31m--set-model: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+        thclaws_core::config::set_cli_model_override(resolved);
+    } else if let Some(ref m) = cli.model {
+        let resolved = thclaws_core::providers::ProviderKind::resolve_alias(m);
+        thclaws_core::config::set_cli_model_override(resolved);
+    }
+
+    // In-process scheduler (Step 2): spawn a background tokio task
+    // that polls `~/.config/thclaws/schedules.json` every 30s and
+    // fires due jobs as `thclaws --print` subprocesses. Skipped for
+    // `--print` (short-lived, would add subprocess noise to a 5s
+    // run) and when the user passes `--no-scheduler`. The task
+    // ends when the process exits.
+    //
+    // dev-plan/59: also skipped when this process is a host. Firing a job is
+    // running an agent, which the host does not do — and each bot runs its
+    // own scheduler over its own HOME, so a host scheduler would fire the
+    // USER-level schedules a second time, in whatever cwd they named. The
+    // check is on what the process IS, not on the flag: `--serve` and the
+    // desktop both become hosts by detecting the layout.
+    // Same shape as `respawn_detached_for_gui_if_needed`: the desktop window
+    // is what runs when no CLI-ish mode was asked for.
+    // dev-plan/60 G1: the scheduler belongs to whichever process owns the
+    // real HOME — a desktop window, a plain --serve, or a workspace host. The
+    // host used to skip it and leave it to its agents, whose HOME is their own
+    // folder; nothing then read the user's schedules at all.
+    let supervised_child = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
+    if schedule::in_process_scheduler_wanted(cli.print, cli.no_scheduler, supervised_child) {
+        match std::env::current_exe() {
+            Ok(binary) => {
+                schedule::spawn_scheduler_task(binary);
+            }
+            Err(e) => {
+                eprintln!("\x1b[33m[schedule] could not resolve current_exe: {e} — scheduler disabled\x1b[0m");
+            }
+        }
+    }
+
+    // Always-on loopback `/v1/*` listener for out-of-process MCP-Apps
+    // servers that need to reach the user's authenticated LLM provider
+    // (e.g. thclaws-gamedev-mcp's HTTP-transport server forwarding game
+    // AI moves). Binds 127.0.0.1:18443 by default (override with
+    // $THCLAWS_LOOPBACK_PORT) behind a per-launch bearer, exported as
+    // `THCLAWS_API_TOKEN` + `THCLAWS_LOOPBACK_URL` before anything below
+    // spawns a child (MCP servers, the v3 host's agents), and written to
+    // `~/.config/<app>/loopback.json` for clients we did not spawn. Not
+    // started under `allow_serve: false`. Skipped under `--print`
+    // (short-lived runs don't host MCP widgets) and `--serve` (that path
+    // already mounts /v1 on the user's chosen bind). Failures are logged
+    // + ignored — MCP-Apps widgets that don't need the bridge keep working.
+    if !cli.print && !cli.serve {
+        if let Err(e) = thclaws_core::api_v1::spawn_loopback().await {
+            eprintln!(
+                "\x1b[33m[api_v1] loopback listener not started: {e} — out-of-process MCP-Apps tools relying on the /v1 bridge (e.g. GamedevAiMove) won't be reachable; set THCLAWS_LOOPBACK_PORT if the port is taken\x1b[0m"
+            );
+        }
+    }
+
+    // M6.36 SERVE5: --serve mode short-circuits the CLI/GUI dispatch.
+    // Single-purpose deployment shape — operator runs one process per
+    // project on a server. Gated behind `gui` because crate::server
+    // transitively depends on crate::shared_session (also gui-gated)
+    // — they share the same WorkerState engine. The CLI-only
+    // thclaws-cli binary doesn't ship --serve.
+    //
+    // `--serve --gui` is the combo path: same process owns the desktop
+    // window and the HTTP/WS listener, both attached to one engine.
+    if cli.serve {
+        #[cfg(feature = "gui")]
+        {
+            let bind_ip: std::net::IpAddr = match cli.bind.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    eprintln!("\x1b[31m--bind: invalid IP '{}': {e}\x1b[0m", cli.bind);
+                    std::process::exit(1);
+                }
+            };
+            // dev-plan/59 Step 3: the host is a different process shape,
+            // not a flag on the old one — it never builds a ServeConfig,
+            // never spawns a shared session, and serves only the bot
+            // surface. Dispatched before any of the agent-side resolution
+            // below so none of it runs in a supervisor.
+            // dev-plan/59 Step 4: the LAYOUT decides the process shape, not a
+            // flag. A workspace holding `.thclaws/bots.json` is a v3 host, and
+            // serving it as a project would start the agent on the host's own
+            // tree. Detecting it here is what makes the cloud runner template
+            // need no change at all: a migrated workspace becomes a host on
+            // its next start, on desktop and in a pod alike.
+            if cli.supervisor || workspace_is_v3() {
+                // A host has no per-user sessions to route; a multiuser pod
+                // is a v2 shape. Refuse rather than silently drop the flag.
+                if cli.multi_tenant {
+                    eprintln!(
+                        "\x1b[31m--multiuser cannot be combined with a workspace that holds more than one agent\x1b[0m"
+                    );
+                    std::process::exit(1);
+                }
+                install_serve_panic_hook();
+                let bind = std::net::SocketAddr::new(bind_ip, cli.port);
+                if let Err(e) = thclaws_core::server::run_supervisor(bind).await {
+                    eprintln!("\n\x1b[31mhost error: {e}\x1b[0m");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            // dev-plan/33 Tier 2 Mode B + dev-plan/39 Tier 1: resolve
+            // the bound shell from (a) explicit --gui-shell flag,
+            // (b) settings.json::guiShell.serveDefault, (c)
+            // manifest.json::default_shell at the working directory.
+            // None of those means "serve React frontend as before".
+            let settings_default = thclaws_core::config::AppConfig::load().ok().and_then(|c| {
+                c.gui_shell
+                    .and_then(|s| s.serve_default().map(str::to_string))
+            });
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // dev-plan/59: a bot under a workspace host always serves the
+            // full router. Its window or tab is the host's, which needs
+            // `/ws`; a bound-shell router 404s everything but the shell, so
+            // a bot whose settings name a default shell (`guiShell:
+            // "voxel-craft"`) never took a session, and the desktop opened
+            // on "couldn't reach its backend". The shell still opens — in
+            // the UI tab, through `tabDefault`, as it does on the desktop.
+            let supervised = std::env::var("THCLAWS_SUPERVISED").ok().as_deref() == Some("1");
+            let resolved_shell_id = if supervised {
+                None
+            } else {
+                thclaws_core::gui_shell::resolve_default_shell(
+                    cli.gui_shell.as_deref(),
+                    settings_default.as_deref(),
+                    &cwd,
+                )
+            };
+            let gui_shell_mode =
+                resolved_shell_id.map(|shell_id| thclaws_core::server::ShellServeMode {
+                    shell_id,
+                    pinned_token: cli.gui_shell_token.clone(),
+                    token_ttl_secs: cli.gui_shell_token_ttl.as_deref().and_then(parse_ttl_secs),
+                    no_auth: cli.gui_shell_no_auth,
+                    no_auth_allow_public: cli.gui_shell_no_auth_allow_public,
+                });
+            // dev-plan/35 Tier 1: multi-tenant mode.
+            let multi_tenant_mode = if cli.multi_tenant {
+                let secret = cli
+                    .multi_tenant_secret
+                    .clone()
+                    .or_else(|| std::env::var("THCLAWS_CLOUD_HMAC_SECRET").ok())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "\x1b[31m--multi-tenant requires --multi-tenant-secret or THCLAWS_CLOUD_HMAC_SECRET\x1b[0m"
+                        );
+                        std::process::exit(1);
+                    });
+                let idle_timeout_secs = cli
+                    .multi_tenant_idle_timeout
+                    .as_deref()
+                    .and_then(parse_ttl_secs)
+                    .unwrap_or(30 * 60);
+                // dev-plan/42: per-user working dirs when a base is given
+                // (flag or env). Unset → dev-plan/35 shared-cwd layout.
+                let workspaces_base = cli
+                    .multi_tenant_workspaces_base
+                    .clone()
+                    .or_else(|| std::env::var("THCLAWS_WORKSPACES_BASE").ok())
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from);
+                // dev-plan/42: read-only agent-def source seeded into each
+                // new per-user workspace (env-injected by the cloud).
+                let def_source = std::env::var("THCLAWS_SHARED_DEF_SOURCE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from);
+                // dev-plan/42 Phase 5: the workspace owner — their seeded def
+                // is writable so they can author + publish updates.
+                let owner_user_id = std::env::var("THCLAWS_OWNER_USER_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                Some(thclaws_core::server::MultiTenantMode {
+                    hmac_secret: secret.into_bytes(),
+                    max_users: cli.multi_tenant_max_users,
+                    idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
+                    workspaces_base,
+                    def_source,
+                    owner_user_id,
+                })
+            } else {
+                None
+            };
+            let serve_config = thclaws_core::server::ServeConfig {
+                bind: std::net::SocketAddr::new(bind_ip, cli.port),
+                gui_shell: gui_shell_mode,
+                multi_tenant: multi_tenant_mode,
+                ..Default::default()
+            };
+            if cli.gui {
+                if use_cli {
+                    eprintln!("\x1b[31m--gui is incompatible with --cli/--print\x1b[0m");
+                    std::process::exit(1);
+                }
+                detach_console_for_gui();
+                thclaws_core::gui::run_gui_with_serve(serve_config);
+                return;
+            }
+            install_serve_panic_hook();
+            if let Err(e) = thclaws_core::server::run(serve_config).await {
+                eprintln!("\n\x1b[31mserve error: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!(
+                "\x1b[31m--serve not available — rebuild with: cargo build --features gui --bin thclaws\x1b[0m"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    if !use_cli {
+        #[cfg(feature = "gui")]
+        {
+            detach_console_for_gui();
+            // The desktop window is the one surface whose stderr genuinely
+            // has no reader: double-clicked, it is wired to nothing, and
+            // every `[research] …` line the engine writes about what it is
+            // doing is discarded. Keep it. Only here — `--cli`, `-p` and
+            // `--serve` all have someone listening, and a supervised
+            // `--serve` child in particular is read by this very process,
+            // which relays it prefixed and keeps a tail to explain a child
+            // that dies before it serves. Redirecting there would take that
+            // away; redirecting here captures it, relayed lines included.
+            thclaws_core::util::redirect_stderr_to_log();
+            // dev-plan/59 §7.6 step 2: in a v3 workspace the supervisor runs
+            // alongside the window, which is still the window that shipped —
+            // same protocol, same IPC bridge, same untouched bundle. Nothing
+            // about the page changes yet; this only proves the children can
+            // come up without disturbing it.
+            if workspace_is_v3() {
+                let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[host] cannot bind a loopback port: {e}\x1b[0m");
+                        std::process::exit(1);
+                    }
+                };
+                let addr = match listener.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[host] listener has no address: {e}\x1b[0m");
+                        std::process::exit(1);
+                    }
+                };
+                let token = thclaws_core::bots::supervisor::mint_token();
+                // In-process, not the env: a child inherits the env at exec,
+                // where any same-user process can read it back.
+                thclaws_core::api_v1::guard::set_serve_token(Some(token.clone()));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let default_bot = thclaws_core::bots::BotsConfig::load(&cwd)
+                    .ok()
+                    .and_then(|c| c.bots.first().map(|b| b.slug.clone()))
+                    .unwrap_or_else(|| "main".to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = thclaws_core::server::run_supervisor_on(listener).await {
+                        eprintln!("\n\x1b[31mhost error: {e}\x1b[0m");
+                    }
+                });
+                thclaws_core::gui::run_gui_host(addr, &token, &default_bot);
+            } else {
+                thclaws_core::gui::run_gui();
+            }
+            return;
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("\x1b[31mGUI not available — rebuild with: cargo build --features gui --bin thclaws\x1b[0m");
+            eprintln!("\x1b[31mOr use --cli for terminal mode.\x1b[0m");
+            std::process::exit(1);
+        }
+    }
+
+    let mut config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("\x1b[31mconfig error: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    };
+
+    // CLI overrides. `--model` / `--set-model` already routed through
+    // `set_cli_model_override` above, so `AppConfig::load` has applied
+    // them. The rest of these flags are CLI/REPL-only knobs that the
+    // GUI and --serve don't honor today.
+    if cli.accept_all {
+        config.permissions = "auto".to_string();
+    }
+    if let Some(ref mode) = cli.permission_mode {
+        config.permissions = mode.clone();
+    }
+    // Re-apply after the CLI flags above: a policy a `--permission-mode`
+    // flag could climb over would not be a policy.
+    config.apply_runtime_policy();
+    if let Some(ref sp) = cli.system_prompt {
+        config.system_prompt = sp.clone();
+    }
+    if let Some(ref path) = cli.system_prompt_file {
+        let stdin_twice = path.as_os_str() == "-"
+            && cli
+                .prompt_file
+                .as_ref()
+                .is_some_and(|p| p.as_os_str() == "-");
+        if stdin_twice {
+            eprintln!(
+                "\x1b[31m--prompt-file and --system-prompt-file can't both read stdin\x1b[0m"
+            );
+            std::process::exit(1);
+        }
+        match read_text_arg(path) {
+            Ok(sp) => config.system_prompt = sp,
+            Err(e) => {
+                eprintln!(
+                    "\x1b[31m--system-prompt-file {}: {e}\x1b[0m",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    if cli.bare {
+        std::env::set_var("THCLAWS_BARE", "1");
+    }
+    if let Some(ref tools) = cli.allowed_tools {
+        config.allowed_tools = Some(tools.split(',').map(|s| s.trim().to_string()).collect());
+    }
+    if let Some(ref tools) = cli.disallowed_tools {
+        config.disallowed_tools = Some(tools.split(',').map(|s| s.trim().to_string()).collect());
+    }
+    if let Some(ref session_id) = cli.resume {
+        config.resume_session = Some(session_id.clone());
+    }
+    if let Some(n) = cli.max_iterations {
+        config.max_iterations = n;
+    }
+    if let Some(n) = cli.max_tokens {
+        config.max_tokens = n;
+    }
+    if let Some(ref agent_name) = cli.team_agent {
+        let team_dir = cli.team_dir.as_deref().unwrap_or(".thclaws/state/team");
+        std::env::set_var("THCLAWS_TEAM_AGENT", agent_name);
+        std::env::set_var("THCLAWS_TEAM_DIR", team_dir);
+    }
+
+    if let Some(script_path) = cli.workflow {
+        // Headless workflow — pre-authored JS file, no review phase.
+        // dev-plan/32 Stage L. --resume <id> combines with --workflow
+        // to replay completed workers from state.jsonl.
+        match thclaws_core::workflow::headless::run(config, script_path, cli.resume.clone()).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("\n\x1b[31m[workflow] error: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+    } else if cli.telegram {
+        // Headless Telegram bot — its own agent loop (the GUI worker is
+        // gui-gated). Runs until Ctrl-C. dev-plan/29 Tier 1.
+        if let Err(e) = thclaws_core::telegram::headless::run(config).await {
+            eprintln!("\n\x1b[31m[telegram] error: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    } else if cli.messenger {
+        // Headless Facebook Page Messenger bridge — its own agent loop.
+        // Runs until Ctrl-C. dev-plan/31 Tier 1.
+        if let Err(e) = thclaws_core::messenger::headless::run(config).await {
+            eprintln!("\n\x1b[31m[messenger] error: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    } else if cli.print {
+        let prompt = match &cli.prompt_file {
+            Some(path) if !cli.prompt.is_empty() => {
+                eprintln!(
+                    "\x1b[31m--prompt-file {} and a positional prompt: pick one\x1b[0m",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+            Some(path) => match read_text_arg(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31m--prompt-file {}: {e}\x1b[0m", path.display());
+                    std::process::exit(1);
+                }
+            },
+            None => cli.prompt.join(" "),
+        };
+        if prompt.is_empty() {
+            eprintln!("\x1b[31m--print requires a prompt argument\x1b[0m");
+            std::process::exit(1);
+        }
+        let opts = thclaws_core::repl::PrintOptions {
+            verbose: cli.verbose,
+            save_session: !cli.no_session,
+            json: cli.output_format == "json",
+            timeout: cli.timeout.map(std::time::Duration::from_secs),
+            temperature: cli.temperature,
+            top_p: cli.top_p,
+            seed: cli.seed,
+            request_log: cli.request_log.clone(),
+        };
+        let code = match thclaws_core::repl::run_print_mode_opts(config, &prompt, opts).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("\n\x1b[31merror: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        };
+        if code != 0 {
+            thclaws_core::audit::shutdown();
+            std::process::exit(code);
+        }
+        thclaws_core::audit::shutdown();
+    } else {
+        if let Err(e) = run_repl(config).await {
+            eprintln!("\n\x1b[31merror: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Dispatch table for `thclaws schedule …`. Returns the exit code the
+/// process should report. `run` returns the child's exit code (or 124
+/// on timeout, mirroring GNU `timeout(1)`); the management subcommands
+/// return 0 on success and 1 on user error.
+fn run_telegram_subcommand(cmd: TelegramCmd) -> i32 {
+    use thclaws_core::telegram::{config::redact_token, TelegramConfig};
+    match cmd {
+        TelegramCmd::Status => {
+            let cfg = match TelegramConfig::load() {
+                Ok(Some(c)) => c,
+                Ok(None) => TelegramConfig::default(),
+                Err(e) => {
+                    eprintln!("\x1b[31m[telegram] failed to read config: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            let token = cfg.resolved_token();
+            println!("Telegram adapter status");
+            println!("  enabled:        {}", cfg.enabled);
+            match token {
+                Some(t) => println!("  bot token:      {} (present)", redact_token(&t)),
+                None => println!(
+                    "  bot token:      <none> (set TELEGRAM_BOT_TOKEN or connect via the GUI)"
+                ),
+            }
+            println!("  dm policy:      {:?}", cfg.dm_policy);
+            println!("  group policy:   {:?}", cfg.group_policy);
+            println!("  allow_from:     {} user(s)", cfg.allow_from.len());
+            println!("  groups:         {} allowlisted", cfg.groups.len());
+            println!("  output ceiling: {} chars", cfg.output_ceiling);
+            0
+        }
+        TelegramCmd::Pair => {
+            println!(
+                "Connect a Telegram bot to thClaws\n\
+                 \n\
+                 1. In Telegram, message @BotFather and send /newbot. Follow the\n\
+                    prompts to pick a name and username; it replies with a bot token\n\
+                    that looks like 123456789:AA…\n\
+                 2. Either:\n\
+                    • paste the token into the GUI \u{2192} Settings \u{2192} Telegram Connect, or\n\
+                    • export TELEGRAM_BOT_TOKEN=<token> and relaunch thClaws.\n\
+                 3. DM your bot. The first message mints a 6-digit pairing code;\n\
+                    approve it in the Telegram Connect modal. You're then chatting\n\
+                    with thClaws over Telegram.\n\
+                 \n\
+                 Run `thclaws telegram status` to confirm the token is detected."
+            );
+            0
+        }
+    }
+}
+
+/// `thclaws messenger …` — print binding status or setup help.
+fn run_messenger_subcommand(cmd: MessengerCmd) -> i32 {
+    use thclaws_core::messenger::MessengerConfig;
+    match cmd {
+        MessengerCmd::Status => {
+            let cfg = match MessengerConfig::load() {
+                Ok(Some(c)) => c,
+                Ok(None) => MessengerConfig::default(),
+                Err(e) => {
+                    eprintln!("\x1b[31m[messenger] failed to read config: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            println!("Messenger adapter status");
+            println!("  relay:          {}", cfg.resolved_server_url());
+            if cfg.binding_token.trim().is_empty() {
+                println!("  binding token:  <none> (pair a Page via the GUI Messenger Connect)");
+            } else {
+                let shown = cfg.binding_token.chars().take(6).collect::<String>();
+                println!("  binding token:  {shown}… (present)");
+            }
+            println!(
+                "  page:           {}",
+                cfg.page_name.as_deref().unwrap_or("<unknown>")
+            );
+            println!(
+                "  page id:        {}",
+                cfg.page_id.as_deref().unwrap_or("<unknown>")
+            );
+            0
+        }
+        MessengerCmd::Pair => {
+            println!(
+                "Connect a Facebook Page to thClaws (Messenger)\n\
+                 \n\
+                 1. In Meta for Developers, create an app (type: Business) and add the\n\
+                    Messenger product. Generate a Page Access Token for your Page and\n\
+                    note your App Secret.\n\
+                 2. Configure the relay (operator step) with MESSENGER_PAGE_ACCESS_TOKEN,\n\
+                    MESSENGER_APP_SECRET, MESSENGER_VERIFY_TOKEN, MESSENGER_PAGE_ID, and\n\
+                    point the app's webhook at https://<relay>/messenger/webhook\n\
+                    subscribed to the `messages` field.\n\
+                 3. Message your Page. The relay DMs a pairing code; paste it into the\n\
+                    GUI \u{2192} Messenger Connect modal to bind this machine.\n\
+                 4. Run `thclaws --messenger` (or connect from the GUI) to start the\n\
+                    bridge. You're then chatting with thClaws from the Page inbox.\n\
+                 \n\
+                 Note: messaging users beyond your app's admins/testers needs Meta App\n\
+                 Review + Business Verification for the pages_messaging permission.\n\
+                 \n\
+                 Run `thclaws messenger status` to confirm the binding is detected."
+            );
+            0
+        }
+    }
+}
+#[cfg(feature = "gui")]
+async fn run_bots_subcommand(cmd: BotsCmd) -> i32 {
+    use thclaws_core::bots::migrate;
+
+    let resolve = |p: Option<String>| -> std::path::PathBuf {
+        p.map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    };
+
+    match cmd {
+        BotsCmd::Status { path } => {
+            let ws = resolve(path);
+            match migrate::plan(&ws) {
+                Ok(p) => {
+                    println!("workspace  {}", p.workspace.display());
+                    match &p.status {
+                        migrate::Status::AlreadyV3 => {
+                            println!("layout     multiple agents (v3 or later)");
+                            if let Some((slug, _)) = migrate::nested_bot(&ws) {
+                                println!(
+                                    "nested     agent '{slug}' runs a level below this shelf — \
+                                     an older migration ran twice. It is followed, so nothing \
+                                     is missing; `thclaws bots unnest` flattens it"
+                                );
+                            }
+                        }
+                        migrate::Status::Migrate => println!(
+                            "layout     v2 (single agent) — `thclaws bots migrate` moves it to v3"
+                        ),
+                        migrate::Status::Resume(phase) => {
+                            println!(
+                                "layout     MIGRATION INTERRUPTED at '{phase:?}' — re-run `thclaws bots migrate` to finish it"
+                            );
+                            if let Some((n, e)) = migrate::stuck_migration(&ws) {
+                                println!(
+                                    "attempts   {n} failed, last: {e} — opening the workspace no longer retries it"
+                                );
+                            }
+                        }
+                    }
+                    match thclaws_core::bots::BotsConfig::load(&ws) {
+                        Ok(cfg) => {
+                            for b in &cfg.bots {
+                                println!("agent      {} ({})", b.slug, b.display_name());
+                            }
+                        }
+                        Err(_) => println!("agents     none"),
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Add {
+            slug,
+            version,
+            force,
+            path,
+        } => {
+            let ws = resolve(path);
+            // `main` is already on a runtime — `block_on` here panicked with
+            // "Cannot start a runtime from within a runtime".
+            match thclaws_core::bots::install::install(&ws, &slug, version.as_deref(), force).await
+            {
+                Ok(done) => {
+                    for line in &done.lines {
+                        println!("{line}");
+                    }
+                    println!(
+                        "\n\x1b[32m✓\x1b[0m {} at {}",
+                        if done.newly_registered {
+                            "installed"
+                        } else {
+                            "updated"
+                        },
+                        done.dir.display()
+                    );
+                    if done.newly_registered {
+                        println!("  restart the host to start it: thclaws --serve");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Remove { slug, purge, path } => {
+            let ws = resolve(path);
+            match thclaws_core::bots::install::deregister(&ws, &slug, purge) {
+                Ok(true) => {
+                    println!(
+                        "✓ removed '{slug}'{}",
+                        if purge {
+                            " and deleted its folder"
+                        } else {
+                            " — its folder is still on disk"
+                        }
+                    );
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("no agent '{slug}' in this workspace");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Migrate { dry_run, yes, path } => {
+            let ws = resolve(path);
+            let plan = match migrate::plan(&ws) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if plan.is_noop() {
+                println!(
+                    "{} is already on the v3 layout — nothing to do.",
+                    ws.display()
+                );
+                return 0;
+            }
+
+            println!("\n\x1b[1mthClaws workspace migration — v2 → v3\x1b[0m\n");
+            println!("  workspace  {}", plan.workspace.display());
+            println!(
+                "  becomes    {}",
+                plan.workspace.join(".thclaws/bots/main").display()
+            );
+            if let migrate::Status::Resume(phase) = &plan.status {
+                println!("  resuming   an interrupted migration, from '{phase:?}'");
+            }
+            println!("\n  moves into the agent folder ({}):", plan.moves.len());
+            for chunk in plan.moves.chunks(4) {
+                println!("    {}", chunk.join("  "));
+            }
+            if !plan.keeps.is_empty() {
+                println!("\n  stays at the root: {}", plan.keeps.join("  "));
+            }
+            if !plan.schedules.is_empty() {
+                println!(
+                    "\n  schedules rewritten to the new path: {}",
+                    plan.schedules.join(", ")
+                );
+            }
+            if plan.moves_git {
+                println!("\n\x1b[33m  Your git repository moves with everything else.\x1b[0m");
+                println!("  Anything holding the old path — an editor window, CI, another");
+                println!("  clone — will need the new one.");
+            }
+            if dry_run {
+                println!("\n(dry run — nothing was moved)");
+                return 0;
+            }
+            // There is no per-workspace lock on a running engine, so this is
+            // the only thing standing between a migration and a `--serve`
+            // holding the tree it is about to move.
+            println!(
+                "\n\x1b[33m  Close any thClaws window, `--serve`, or agent run on this\x1b[0m"
+            );
+            println!("\x1b[33m  workspace before continuing — nothing here can detect one.\x1b[0m");
+            if !yes {
+                print!("\nType `yes` to continue: ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+                    println!("cancelled — nothing was moved.");
+                    return 1;
+                }
+            }
+            match migrate::apply(&plan) {
+                Ok(report) => {
+                    println!("\n\x1b[32m✓ migrated\x1b[0m");
+                    println!("  {} entries moved", report.moved);
+                    println!("  your project is now at {}", report.bot_dir.display());
+                    if report.minted_identity {
+                        println!("  minted an agent identity for it (needed to publish)");
+                    }
+                    if !report.rewritten_schedules.is_empty() {
+                        println!(
+                            "  rewrote {} schedule(s): {}",
+                            report.rewritten_schedules.len(),
+                            report.rewritten_schedules.join(", ")
+                        );
+                    }
+                    // `--serve` detects `.thclaws/bots.json` on its own now, so the
+                    // flag is not part of the instruction.
+                    println!("\n  open it with:  thclaws --serve");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\n\x1b[31mmigration failed: {e}\x1b[0m");
+                    eprintln!("The workspace is mid-migration and safe to resume — run the same");
+                    eprintln!("command again once the cause is fixed.");
+                    1
+                }
+            }
+        }
+        BotsCmd::FixPaths { dry_run, path } => {
+            let ws = resolve(path);
+            let cfg = match thclaws_core::bots::BotsConfig::load(&ws) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "\x1b[31m{} has no agents to repair: {e}\x1b[0m",
+                        ws.display()
+                    );
+                    return 1;
+                }
+            };
+            println!("workspace  {}", ws.display());
+            let mut total = 0usize;
+            for def in &cfg.bots {
+                let dir = thclaws_core::bots::bot_dir(&ws, &def.slug);
+                match thclaws_core::bots::agent_paths::fix(&dir, dry_run) {
+                    Ok(r) => {
+                        total += r.commands + r.literals;
+                        println!(
+                            "{}      {}{} file(s): {} command(s), {} path(s)",
+                            def.slug,
+                            if dry_run { "would change " } else { "" },
+                            r.files,
+                            r.commands,
+                            r.literals
+                        );
+                        for skipped in &r.skipped {
+                            println!("           left alone (no import block): {skipped}");
+                        }
+                    }
+                    Err(e) => eprintln!("\x1b[31m{}: {e}\x1b[0m", def.slug),
+                }
+            }
+            if total == 0 {
+                println!("nothing to change — these agents already find their own files");
+            } else if !dry_run {
+                println!("\n\x1b[33m  Restart thClaws on this workspace to pick it up.\x1b[0m");
+            }
+            0
+        }
+        BotsCmd::Unnest { yes, path } => {
+            let ws = resolve(path);
+            let Some((slug, dir)) = migrate::nested_bot(&ws) else {
+                eprintln!(
+                    "\x1b[31m{} is not a doubly-migrated workspace — nothing to un-nest\x1b[0m",
+                    ws.display()
+                );
+                return 1;
+            };
+            println!("workspace  {}", ws.display());
+            println!(
+                "nested     {} (agent '{slug}' is a workspace of its own)",
+                dir.display()
+            );
+            println!(
+                "action     promote it to the root; the bare outer host is kept as {}",
+                migrate::NESTED_BACKUP
+            );
+            println!(
+                "\n\x1b[33m  Close any thClaws window or `--serve` on this workspace first.\x1b[0m"
+            );
+            if !yes {
+                print!("\nType `yes` to continue: ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+                    println!("cancelled — nothing was moved.");
+                    return 1;
+                }
+            }
+            match migrate::unnest(&ws) {
+                Ok(r) => {
+                    println!("moved      {} entries to the root", r.moved);
+                    println!("kept       {}", r.host_backup.display());
+                    if !r.rewritten_schedules.is_empty() {
+                        println!("schedules  {}", r.rewritten_schedules.join(", "));
+                    }
+                    // The layout is fixed; the agent's own paths are not. An
+                    // agent installed before agents learned $THCLAWS_AGENT_DIR
+                    // still looks for its state at the workspace root, and it
+                    // reports that as an empty project rather than an error —
+                    // "No book yet" for a book that is right there.
+                    println!(
+                        "\n\x1b[33m  The layout is fixed. If '{slug}' still shows nothing, it \
+                         was installed before agents learned to find their own files — \
+                         `thclaws bots fix-paths` repairs it, or get the agent again.\x1b[0m"
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        BotsCmd::Unmigrate { yes, path } => {
+            let ws = resolve(path);
+            println!("\n\x1b[1mthClaws workspace — back to a single agent (v3 → v2)\x1b[0m\n");
+            println!("  workspace  {}", ws.display());
+            println!(
+                "  moves      {} back to the root",
+                ws.join(".thclaws/bots/main").display()
+            );
+            println!(
+                "  keeps      the host's .thclaws/ at {}",
+                ws.join(migrate::HOST_BACKUP).display()
+            );
+            println!(
+                "\n\x1b[33m  Close any thClaws window or `--serve` on this workspace first.\x1b[0m"
+            );
+            if !yes {
+                print!("\nType `yes` to continue: ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+                    println!("cancelled — nothing was moved.");
+                    return 1;
+                }
+            }
+            match migrate::unmigrate(&ws) {
+                Ok(report) => {
+                    println!("\n\x1b[32m✓ back to a single agent\x1b[0m");
+                    println!("  {} entries moved back to the root", report.moved);
+                    if !report.rewritten_schedules.is_empty() {
+                        println!("  rewrote {} schedule(s)", report.rewritten_schedules.len());
+                    }
+                    println!(
+                        "  the host's old tree is at {} and can be deleted",
+                        report.host_backup.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\n\x1b[31m{e}\x1b[0m");
+                    1
+                }
+            }
+        }
+    }
+}
+
+async fn run_agent_subcommand(cmd: AgentCmd) -> i32 {
+    use thclaws_core::cloud::{agent_cli, agent_scaffold};
+    match cmd {
+        AgentCmd::Run {
+            path,
+            workflow,
+            args,
+            dry_tools,
+        } => {
+            // Resolve the workflow (sole *.js when --workflow omitted).
+            let wf = match workflow {
+                Some(w) => w,
+                None => {
+                    let wfdir = path.join(".thclaws/state/workflows");
+                    let js: Vec<std::path::PathBuf> = std::fs::read_dir(&wfdir)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("js"))
+                        .collect();
+                    match js.len() {
+                        1 => std::path::Path::new(".thclaws/state/workflows")
+                            .join(js[0].file_name().unwrap()),
+                        0 => {
+                            eprintln!(
+                                "✗ no .thclaws/state/workflows/*.js in {} — pass --workflow",
+                                path.display()
+                            );
+                            return 1;
+                        }
+                        n => {
+                            eprintln!("✗ {n} workflows found — pass --workflow to pick one");
+                            return 1;
+                        }
+                    }
+                }
+            };
+            let args_val = match args {
+                Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("✗ --args is not valid JSON: {e}");
+                        return 1;
+                    }
+                },
+                None => None,
+            };
+            // cd into the agent folder so AppConfig + script_path resolve there.
+            if let Err(e) = std::env::set_current_dir(&path) {
+                eprintln!("✗ cannot enter {}: {e}", path.display());
+                return 1;
+            }
+            let config = match AppConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("✗ config: {e}");
+                    return 1;
+                }
+            };
+            thclaws_core::repl::run_agent_workflow(config, wf, args_val, dry_tools).await
+        }
+        AgentCmd::New {
+            path,
+            pattern,
+            name,
+            force,
+        } => match agent_scaffold::scaffold_agent(&path, &pattern, name.as_deref(), force) {
+            Ok(files) => {
+                eprintln!(
+                    "✓ scaffolded {} ({} pattern) — {} file(s):",
+                    path.display(),
+                    pattern,
+                    files.len()
+                );
+                for f in &files {
+                    eprintln!("    {f}");
+                }
+                // Confirm the scaffold is valid out of the box.
+                let report = agent_cli::validate_folder(&path);
+                if report.ok() {
+                    eprintln!("✓ validates — edit the subagents + AGENTS.md, then `thclaws agent validate {}`", path.display());
+                    0
+                } else {
+                    for e in &report.errors {
+                        eprintln!("✗ {e}");
+                    }
+                    eprintln!("✗ scaffold did not validate (this is a bug)");
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                1
+            }
+        },
+        AgentCmd::Pack { path, out } => match agent_cli::pack_to_file(&path, out) {
+            Ok((out_path, res)) => {
+                eprintln!(
+                    "✓ packed {} → {} ({} file(s), {} stripped, {:.1} KB)",
+                    path.display(),
+                    out_path.display(),
+                    res.included.len(),
+                    res.stripped.len(),
+                    res.bytes.len() as f64 / 1024.0
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ pack failed: {e}");
+                1
+            }
+        },
+        AgentCmd::Validate { path } => {
+            let report = agent_cli::validate_folder(&path);
+            for i in &report.info {
+                eprintln!("  {i}");
+            }
+            for w in &report.warnings {
+                eprintln!("⚠ {w}");
+            }
+            for e in &report.errors {
+                eprintln!("✗ {e}");
+            }
+            if report.ok() {
+                eprintln!("✓ {} validates", path.display());
+                0
+            } else {
+                eprintln!("✗ {} — {} error(s)", path.display(), report.errors.len());
+                1
+            }
+        }
+    }
+}
+
+async fn run_cloud_subcommand(cmd: CloudCmd, _cloud_url: Option<String>) -> i32 {
+    if let CloudCmd::Login { browser: true, .. } = cmd {
+        let settings = thclaws_core::config::ProjectConfig::load().unwrap_or_default();
+        let url =
+            thclaws_core::cloud::resolve_cloud_url(_cloud_url.as_deref(), settings.cloud.as_ref());
+        eprintln!("Signing in to {url} in your browser…");
+        return match thclaws_core::cloud::browser_login::login(&url).await {
+            Ok(()) => {
+                eprintln!("✓ signed in — token stored for this machine");
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                1
+            }
+        };
+    }
+    // Every `thclaws cloud …` subcommand now redirects to the
+    // in-session slash equivalent (or the GUI Settings panel for
+    // login/logout). The clap subcommand structure stays so users
+    // who paste an old command get the targeted "use /cloud X"
+    // message rather than "unknown subcommand". No more catalog
+    // network calls from the shell — that's the whole point.
+    let result: Result<(), String> = match cmd {
+        // login + logout moved to the GUI Settings → thClaws.cloud
+        // panel (and the equivalent IPC `cloud_config_set` for
+        // headless). Same reason as publish/get below: no token
+        // through shell argv or env.
+        CloudCmd::Login { .. } => Err("`thclaws cloud login --token` was removed — use \
+                 `thclaws cloud login --browser`, or open thclaws, go to \
+                 Settings → thClaws.cloud, paste your CLI token from the \
+                 dashboard (https://thclaws.cloud/dashboard). The token \
+                 is stored in the OS keychain and used via the \
+                 Authorization header — never through shell argv."
+            .to_string()),
+        // An org-gateway build signs out of its organisation's cloud: revoke
+        // the token server-side, then forget it.
+        CloudCmd::Logout if thclaws_core::policy::thclaws_cloud_url().is_some() => {
+            let url = thclaws_core::policy::thclaws_cloud_url().unwrap_or_default();
+            match thclaws_core::cloud::browser_login::sign_out(&url).await {
+                Ok(thclaws_core::cloud::browser_login::SignOut::Revoked) => {
+                    eprintln!("✓ signed out of {url}");
+                    Ok(())
+                }
+                Ok(thclaws_core::cloud::browser_login::SignOut::NotSignedIn) => {
+                    eprintln!("not signed in to {url}");
+                    Ok(())
+                }
+                Ok(thclaws_core::cloud::browser_login::SignOut::LocalOnly(why)) => {
+                    eprintln!(
+                        "✓ signed out on this machine — but not revoked on the server ({why}); \
+                         the sign-in stays valid until it expires or an admin revokes it"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        CloudCmd::Logout => Err("`thclaws cloud logout` was removed. Open thclaws, go to \
+                 Settings → thClaws.cloud, click the clear button next to \
+                 the CLI token field."
+            .to_string()),
+        // Publish + Get were moved into the in-session slash surface so
+        // the catalog token never has to be threaded through a shell
+        // env (which made it leak into terminal histories, dotenv
+        // tooling, and stray `ps` output). Both subcommands now refuse
+        // to run and tell the user the new flow.
+        CloudCmd::Publish { .. } => Err(
+            "`thclaws cloud publish` was removed. From inside a thclaws \
+                 session in the agent folder, run:\n  \
+                     /cloud publish\n\
+                 The slash command uses the session's stored token via the \
+                 Authorization header — no shell-env leak."
+                .to_string(),
+        ),
+        CloudCmd::Get { slug, .. } => {
+            let slug_display = if slug.is_empty() {
+                "<slug>".to_string()
+            } else {
+                slug
+            };
+            Err(format!(
+                "`thclaws cloud get` was removed. From inside a thclaws session \
+                 in the folder you want to install into, run:\n  \
+                     /cloud get {slug_display}\n\
+                 The slash command uses the session's stored token via the \
+                 Authorization header — no shell-env leak."
+            ))
+        }
+        // status / list / unbind also moved to /cloud … slash for
+        // consistency — every cloud op now happens inside a thclaws
+        // session, so there's exactly one surface to teach.
+        CloudCmd::List { .. } => Err(
+            "`thclaws cloud list` was removed. From inside a thclaws session, run:\n  \
+                     /cloud list           (full catalog)\n  \
+                     /cloud list --mine    (just yours)"
+                .to_string(),
+        ),
+        CloudCmd::Status => Err(
+            "`thclaws cloud status` was removed. From inside a thclaws session, run:\n  \
+                     /cloud status"
+                .to_string(),
+        ),
+        CloudCmd::Unbind => Err(
+            "`thclaws cloud unbind` was removed. From inside a thclaws session in the \
+                 agent folder you want to fork, run:\n  \
+                     /cloud unbind"
+                .to_string(),
+        ),
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("\x1b[31merror:\x1b[0m {}", e);
+            1
+        }
+    }
+}
+
+fn run_schedule_subcommand(cmd: ScheduleCmd) -> i32 {
+    match cmd {
+        ScheduleCmd::Add {
+            id,
+            cron,
+            at,
+            in_delay,
+            prompt,
+            cwd,
+            model,
+            resume_session,
+            max_iterations,
+            timeout,
+            disabled,
+            watch,
+        } => {
+            // Resolve the trigger: one-shot (--at absolute / --in
+            // relative) vs recurring (--cron). clap already enforces
+            // mutual exclusion; here we require exactly one and turn
+            // --in into an absolute run_at.
+            let run_at = match (at, in_delay) {
+                (Some(ts), _) => match schedule::parse_run_at(&ts) {
+                    Ok(dt) => Some(dt.to_rfc3339()),
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+                (_, Some(dur)) => match schedule::parse_relative_duration(&dur) {
+                    Ok(d) => Some((chrono::Utc::now() + d).to_rfc3339()),
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+                (None, None) => None,
+            };
+            if run_at.is_none() && cron.is_none() {
+                eprintln!(
+                    "\x1b[31merror: a schedule needs a trigger — pass --cron \
+                     for recurring, or --at/--in for a one-shot\x1b[0m"
+                );
+                return 1;
+            }
+            let cwd_path = match cwd {
+                Some(p) => std::path::PathBuf::from(p),
+                None => match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: cannot read current dir: {e}\x1b[0m");
+                        return 1;
+                    }
+                },
+            };
+            if !cwd_path.exists() {
+                eprintln!(
+                    "\x1b[31merror: cwd does not exist: {}\x1b[0m",
+                    cwd_path.display()
+                );
+                return 1;
+            }
+            let mut store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            let entry = schedule::Schedule {
+                id: id.clone(),
+                cron: cron.unwrap_or_default(),
+                run_at,
+                cwd: cwd_path,
+                prompt,
+                model,
+                resume_session,
+                max_iterations,
+                timeout_secs: if timeout == 0 { None } else { Some(timeout) },
+                enabled: !disabled,
+                watch_workspace: watch,
+                last_run: None,
+                last_exit: None,
+            };
+            if let Err(e) = store.add(entry) {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                return 1;
+            }
+            if let Err(e) = store.save() {
+                eprintln!("\x1b[31merror: save schedule store: {e}\x1b[0m");
+                return 1;
+            }
+            println!("added schedule '{id}'");
+            0
+        }
+        ScheduleCmd::List => {
+            let store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if store.schedules.is_empty() {
+                println!(
+                    "no schedules — `thclaws schedule add <id> --cron \"...\" --prompt \"...\"`"
+                );
+                return 0;
+            }
+            // Compact list: id, cron, enabled flag, watchWorkspace
+            // indicator, last-run timestamp (or "never"), and cwd.
+            // One line per schedule.
+            for s in &store.schedules {
+                let status = if s.enabled { "on " } else { "off" };
+                let watch = if s.watch_workspace {
+                    "+watch"
+                } else {
+                    "      "
+                };
+                let last = schedule::display_last_run(s.last_run.as_deref());
+                let exit = match s.last_exit {
+                    Some(0) => " ok ",
+                    Some(_) => " err",
+                    None => "    ",
+                };
+                // Trigger column: cron expression for recurring jobs,
+                // or "once@<run_at> (pending|fired)" for one-shots.
+                let trigger = match &s.run_at {
+                    Some(run_at) => {
+                        let state = if s.last_run.is_some() {
+                            "fired"
+                        } else {
+                            "pending"
+                        };
+                        format!("once@{run_at} ({state})")
+                    }
+                    None => s.cron.clone(),
+                };
+                println!(
+                    "{status} {exit} {watch}  {:24}  {:30}  {}  {}",
+                    s.id,
+                    trigger,
+                    last,
+                    s.cwd.display()
+                );
+            }
+            0
+        }
+        ScheduleCmd::Show { id } => {
+            let store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            match store.get(&id) {
+                Some(s) => match serde_json::to_string_pretty(s) {
+                    Ok(json) => {
+                        println!("{json}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31merror: serialize: {e}\x1b[0m");
+                        1
+                    }
+                },
+                None => {
+                    eprintln!("\x1b[31merror: no schedule with id '{id}'\x1b[0m");
+                    1
+                }
+            }
+        }
+        ScheduleCmd::Rm { id } => {
+            let mut store = match schedule::ScheduleStore::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: load schedule store: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            if !store.remove(&id) {
+                eprintln!("\x1b[31merror: no schedule with id '{id}'\x1b[0m");
+                return 1;
+            }
+            if let Err(e) = store.save() {
+                eprintln!("\x1b[31merror: save schedule store: {e}\x1b[0m");
+                return 1;
+            }
+            println!("removed schedule '{id}'");
+            0
+        }
+        ScheduleCmd::Install => match schedule::install_daemon() {
+            Ok(report) => {
+                println!("wrote {}", report.supervisor_path.display());
+                if report.next_steps.is_empty() {
+                    println!("daemon bootstrapped — `thclaws schedule status` to verify");
+                } else {
+                    println!("\nnext steps:");
+                    for step in &report.next_steps {
+                        println!("  $ {step}");
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                1
+            }
+        },
+        ScheduleCmd::Uninstall => match schedule::uninstall_daemon() {
+            Ok(path) => {
+                if path.exists() {
+                    println!(
+                        "warning: supervisor file at {} still exists",
+                        path.display()
+                    );
+                    1
+                } else {
+                    println!("daemon uninstalled");
+                    0
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31merror: {e}\x1b[0m");
+                1
+            }
+        },
+        ScheduleCmd::Status => {
+            let status = schedule::daemon_status();
+            match status {
+                schedule::DaemonStatus::Running(pid) => {
+                    println!("daemon: \x1b[32mrunning\x1b[0m (pid {pid})");
+                }
+                schedule::DaemonStatus::Stale(pid) => {
+                    println!(
+                        "daemon: \x1b[33mstale PID file\x1b[0m (last pid {pid} not alive — \
+                         supervisor will reclaim on next start)"
+                    );
+                }
+                schedule::DaemonStatus::NotRunning => {
+                    println!(
+                        "daemon: \x1b[33mnot running\x1b[0m \
+                         (`thclaws schedule install` to enable)"
+                    );
+                }
+            }
+            // Compact recent-fires summary so the user can see
+            // whether jobs are firing without `tail`-ing each log.
+            match schedule::ScheduleStore::load() {
+                Ok(store) if !store.schedules.is_empty() => {
+                    println!("\nrecent fires:");
+                    for s in &store.schedules {
+                        let last = s.last_run.as_deref().unwrap_or("never");
+                        let exit = match s.last_exit {
+                            Some(0) => "ok ",
+                            Some(_) => "err",
+                            None => "—  ",
+                        };
+                        println!("  {exit}  {:24}  {}", s.id, last);
+                        if !matches!(s.last_exit, Some(0)) {
+                            if let Some(log) = schedule::latest_log(&s.id) {
+                                println!("       \u{21b3} log: {}", log.display());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            0
+        }
+        ScheduleCmd::Run { id } => {
+            // Use the *currently running* binary as the spawn target so
+            // the scheduled job runs against the same thclaws build that
+            // registered it. `current_exe` follows symlinks on macOS so
+            // a homebrew-installed thclaws still resolves correctly.
+            let binary = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("\x1b[31merror: cannot resolve current_exe: {e}\x1b[0m");
+                    return 1;
+                }
+            };
+            match schedule::run_once(&id, &binary) {
+                Ok(outcome) => {
+                    eprintln!(
+                        "\x1b[36m[schedule] '{id}' ran in {}.{:03}s, log: {}\x1b[0m",
+                        outcome.duration.as_secs(),
+                        outcome.duration.subsec_millis(),
+                        outcome.log_path.display(),
+                    );
+                    if outcome.timed_out {
+                        eprintln!("\x1b[33m[schedule] '{id}' timed out\x1b[0m");
+                        return 124;
+                    }
+                    outcome.exit_code.unwrap_or(1)
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31merror: {e}\x1b[0m");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// M6.45 / #79-followup: scan PATH for additional thclaws copies
+/// and warn the user. Cross-platform: Windows looks for `thclaws.exe`,
+/// Mac/Linux for `thclaws`; PATH is split via `std::env::split_paths`
+/// which handles `;` (Windows) vs `:` (Unix) correctly.
+///
+/// On Windows the MSI's `Part="first"` PATH addition guarantees the
+/// new install wins PATH-search — this function is informational,
+/// nudging the user to clean up stale copies (e.g. the manual
+/// `C:\tools\thclaws.exe` from before the installer existed).
+///
+/// On macOS / Linux there's no installer-side PATH manipulation so
+/// PATH order is whatever the user set — the warning catches version
+/// mismatch when multiple manual / brew installs coexist (e.g.
+/// `/usr/local/bin/thclaws` + `/opt/homebrew/bin/thclaws`).
+fn warn_about_stale_binaries() {
+    #[cfg(windows)]
+    const BIN_NAME: &str = "thclaws.exe";
+    #[cfg(not(windows))]
+    const BIN_NAME: &str = "thclaws";
+    #[cfg(windows)]
+    const RM_HINT: &str = "del \"<path-above>\"";
+    #[cfg(not(windows))]
+    const RM_HINT: &str = "rm <path-above>";
+
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let current_canon = std::fs::canonicalize(&current_exe).ok();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return;
+    };
+
+    let mut duplicates: Vec<std::path::PathBuf> = Vec::new();
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(BIN_NAME);
+        if !candidate.is_file() {
+            continue;
+        }
+        let canon = match std::fs::canonicalize(&candidate) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Skip if same file as we're running (covers symlinks too —
+        // a symlink in /usr/local/bin pointing at the .app bundle
+        // binary canonicalizes to the same path as current_exe).
+        if let Some(curr) = &current_canon {
+            if &canon == curr {
+                continue;
+            }
+        }
+        if !duplicates.iter().any(|p| p == &canon) {
+            duplicates.push(canon);
+        }
+    }
+    if duplicates.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\x1b[33m[thclaws] warning: {} additional {} install(s) found on PATH:\x1b[0m",
+        duplicates.len(),
+        BIN_NAME
+    );
+    eprintln!("  running:  {}", current_exe.display());
+    for d in &duplicates {
+        eprintln!("  also at:  {}", d.display());
+    }
+    eprintln!(
+        "\x1b[33m[thclaws] only the first one on PATH is invoked when you type `thclaws`. The other copies still take ~17 MB each.\nTo clean up:  {}\x1b[0m",
+        RM_HINT
+    );
+}
+
+#[cfg(feature = "gui")]
+async fn run_shell_subcommand(cmd: ShellCmd) -> i32 {
+    use thclaws_core::gui_shell::shell_cli;
+    match cmd {
+        ShellCmd::New {
+            template,
+            dest,
+            force,
+        } => match shell_cli::shell_new(&template, &dest, force) {
+            Ok(files) => {
+                eprintln!(
+                    "\x1b[32m✓ scaffolded {} into {}\x1b[0m",
+                    template,
+                    dest.display(),
+                );
+                for f in files {
+                    eprintln!("  + {}", f.display());
+                }
+                eprintln!(
+                    "\n   next: cd {} && thclaws shell preview .",
+                    dest.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                1
+            }
+        },
+        ShellCmd::Check { path } => match shell_cli::shell_check(&path) {
+            Ok(findings) => {
+                let mut errors = 0;
+                for (sev, msg) in &findings {
+                    let color = match sev {
+                        shell_cli::Severity::Error => "\x1b[31m",
+                        shell_cli::Severity::Warning => "\x1b[33m",
+                    };
+                    eprintln!("{}{:8}{}\x1b[0m {msg}", color, sev.label(), "");
+                    if *sev == shell_cli::Severity::Error {
+                        errors += 1;
+                    }
+                }
+                if findings.is_empty() {
+                    eprintln!("\x1b[32m✓ shell.json clean\x1b[0m");
+                }
+                if errors > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                1
+            }
+        },
+        ShellCmd::Pack { path, out } => {
+            let out = out.unwrap_or_else(|| path.join("dist/index.html"));
+            match shell_cli::shell_pack(&path, &out) {
+                Ok(_) => {
+                    eprintln!("\x1b[32m✓ packed → {}\x1b[0m", out.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m✗ {e}\x1b[0m");
+                    1
+                }
+            }
+        }
+        ShellCmd::Preview { path, port } => {
+            match thclaws_core::gui_shell::shell_preview::run_preview(&path, port).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("\x1b[31m✗ preview: {e}\x1b[0m");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// A `--…-file` argument: the file's text, or stdin for "-".
+fn read_text_arg(path: &std::path::Path) -> std::io::Result<String> {
+    if path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}

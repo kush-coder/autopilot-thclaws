@@ -1,0 +1,3799 @@
+//! Model Context Protocol (MCP) client over stdio JSON-RPC.
+//!
+//! Scope (Phase 15a):
+//! - Spawn a subprocess configured via [`McpServerConfig`] or attach to any
+//!   `AsyncRead` + `AsyncWrite` pair via [`McpClient::from_streams`] (used by
+//!   tests with `tokio::io::duplex`).
+//! - JSON-RPC 2.0 request/response with numeric ids, notifications for
+//!   fire-and-forget messages.
+//! - MCP handshake (`initialize` + `notifications/initialized`).
+//! - Tool discovery (`tools/list`) and invocation (`tools/call`).
+//! - [`McpTool`] adapter that implements the existing [`crate::tools::Tool`]
+//!   trait, so discovered MCP tools register into the existing
+//!   [`crate::tools::ToolRegistry`] and are indistinguishable from built-ins
+//!   from the agent loop's perspective.
+//!
+//! Deferred:
+//! - Resources, prompts, and bidirectional notifications (not needed for the
+//!   tool-routing use case).
+//! - HTTP/SSE transport — stdio is primary; HTTP is Phase 15b+ if needed.
+//! - Cancellation / `$/cancelRequest`.
+
+use crate::error::{Error, Result};
+use crate::tools::Tool;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::time::{timeout, Duration};
+
+/// Whether `THCLAWS_MCP_DEBUG=1` is set in the env. Cached on first
+/// read so per-POST logging doesn't pay an env-var lookup. Used by
+/// the `mcp_debug!` macro to gate routine HTTP-transport noise out
+/// of shipped binaries — M6.15 BUG 8.
+fn mcp_debug_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("THCLAWS_MCP_DEBUG").is_ok())
+}
+
+/// `eprintln!` that fires only when `THCLAWS_MCP_DEBUG=1`. Use for
+/// per-request routine logging (POST bodies, redirect chases, probe
+/// ping results). Real errors and one-shot setup notices stay on
+/// plain `eprintln!` so users see them by default.
+macro_rules! mcp_debug {
+    ($($arg:tt)*) => {
+        if crate::mcp::mcp_debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Budget for the `initialize` handshake alone.
+///
+/// A server launched through `uvx`/`npx` resolves and downloads its whole
+/// dependency tree on first run before it can answer anything — the Qwen
+/// `core` capability pulls 93 packages and takes ~38 s cold, then 0.5 s once
+/// the cache is warm. Sharing [`REQUEST_TIMEOUT_SECS`] with tool calls forces
+/// a choice between tolerating that and noticing a stalled server quickly;
+/// splitting them gets both. Only the first launch is slow, so a generous
+/// value here costs nothing in the steady state.
+pub const INIT_TIMEOUT_SECS: u64 = 300;
+
+/// Env overrides for the two budgets above, for a server slower than either
+/// default.
+fn timeout_secs(var: &str, default: u64) -> u64 {
+    parse_timeout(std::env::var(var).ok().as_deref(), default)
+}
+
+/// Core of [`timeout_secs`], parametrized on the raw value so it's testable
+/// without mutating process env. `set_var` races with the `posix_spawn` in
+/// `hooks::tests::fire_passes_env_vars_to_command` under the parallel runner —
+/// the child read an empty environment and the test failed on Linux CI while
+/// passing on macOS. Same hazard `interpolate_with` is split out for.
+///
+/// Invalid or zero values fall back rather than disabling the timeout: an
+/// unbounded wait is the failure mode these guard against, so `0` must not be
+/// a way to ask for one.
+fn parse_timeout(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+pub fn request_timeout_secs() -> u64 {
+    timeout_secs("THCLAWS_MCP_TIMEOUT_SECS", REQUEST_TIMEOUT_SECS)
+}
+
+pub fn init_timeout_secs() -> u64 {
+    timeout_secs("THCLAWS_MCP_INIT_TIMEOUT_SECS", INIT_TIMEOUT_SECS)
+}
+pub const CLIENT_NAME: &str = "thclaws-core";
+pub const CLIENT_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    pub name: String,
+    /// "stdio" (default) or "http".
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// For stdio: the command to spawn.
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// For HTTP transport: the server URL.
+    #[serde(default)]
+    pub url: String,
+    /// Optional HTTP headers (e.g. Authorization). Each entry is sent
+    /// verbatim on every POST. Use for Bearer tokens or API keys when
+    /// the server requires auth but you don't have a full OAuth flow.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Whether this MCP server is trusted to render UI widgets and
+    /// receive widget-initiated tool calls (`callServerTool`). Set to
+    /// `true` only by the marketplace install flow — hand-added
+    /// servers default to `false` and get text-only fallback (the
+    /// model still sees their tool results, just no inline iframe).
+    /// Trust is the gate for arbitrary HTML rendering inside chat;
+    /// see dev-log/112.
+    #[serde(default)]
+    pub trusted: bool,
+    /// Set ONLY by engine code for servers thClaws itself injects
+    /// (e.g. the `browser` Playwright MCP from `browserEnabled`).
+    /// Skips the first-spawn allowlist prompt — the engine chose the
+    /// command, not a cloned repo's mcp.json. `#[serde(skip)]` is the
+    /// security boundary: deserialization always yields `false`, so a
+    /// malicious mcp.json can't grant itself the bypass.
+    #[serde(skip)]
+    pub engine_managed: bool,
+}
+
+fn default_transport() -> String {
+    "stdio".into()
+}
+
+/// How much of a stdio child's stderr to keep. Enough lines to carry a
+/// whole npm/uvx error block, short enough that the resulting message
+/// still fits a GUI error panel.
+const STDERR_TAIL_LINES: usize = 8;
+const STDERR_TAIL_LINE_CHARS: usize = 300;
+
+fn clip_stderr_line(line: &str) -> String {
+    if line.chars().count() <= STDERR_TAIL_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(STDERR_TAIL_LINE_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The npx install directory named in an npm error (`…/.npm/_npx/<hash>/…`).
+/// Worth lifting out verbatim: that directory is pure cache, deleting it
+/// is the fix for the half-written state npm leaves behind when an
+/// install is interrupted, and the hash is unguessable.
+fn npx_cache_dir(tail: &str) -> Option<String> {
+    let idx = tail.find("/_npx/")?;
+    let start = tail[..idx]
+        .rfind(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let after = idx + "/_npx/".len();
+    let rest = tail.get(after..)?;
+    let end = rest
+        .find(|c: char| c == '/' || c == '\'' || c == '"' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(format!("{}{}", &tail[start..after], &rest[..end]))
+}
+
+/// Map a dead child's stderr onto the command that fixes it. Only
+/// fingerprints we are sure about — a wrong suggestion costs the reader
+/// more than no suggestion.
+fn stderr_fix_hint(tail: &str) -> Option<String> {
+    let broken_install = [
+        "ENOTEMPTY",
+        "EEXIST",
+        "ENOTDIR",
+        "Cannot find module",
+        "ERR_MODULE_NOT_FOUND",
+    ];
+    if broken_install.iter().any(|p| tail.contains(p)) {
+        if let Some(dir) = npx_cache_dir(tail) {
+            return Some(format!(
+                "rm -rf {dir} — that npx cache entry is half-written (an install was interrupted); \
+                 it re-downloads on the next start"
+            ));
+        }
+    }
+    if tail.contains("Executable doesn't exist") || tail.contains("playwright install") {
+        return Some(
+            "npx playwright install chromium — the browser binary the server drives is missing"
+                .into(),
+        );
+    }
+    if tail.contains("ETARGET") || tail.contains("404 Not Found") {
+        return Some(
+            "check the package name/version in this server's command/args — the registry has no \
+             such version"
+                .into(),
+        );
+    }
+    if tail.contains("EACCES") || tail.to_lowercase().contains("permission denied") {
+        return Some(
+            "something in the install cache is not writable — fix its ownership, or delete the \
+             cache directory and retry"
+                .into(),
+        );
+    }
+    if ["ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN"]
+        .iter()
+        .any(|p| tail.contains(p))
+    {
+        return Some(
+            "the package registry was unreachable — check network/proxy, then retry".into(),
+        );
+    }
+    None
+}
+
+/// Compose what a failed stdio start-up reports: the protocol-level
+/// error, the child's own last words, and a fix when we can name one.
+/// Without the stderr block the user sees only `mcp transport closed`,
+/// which names the symptom and nothing else.
+fn start_failure_message(command: &str, err: &Error, tail: &[String]) -> String {
+    // Unwrap `Provider` rather than Display it: the caller re-wraps the
+    // result in the same variant, and "provider error: provider error:"
+    // is what that reads like otherwise.
+    let mut msg = match err {
+        Error::Provider(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if tail.is_empty() {
+        return msg;
+    }
+    msg.push_str(&format!("\n`{command}` stderr:\n"));
+    for line in tail {
+        msg.push_str("  ");
+        msg.push_str(line);
+        msg.push('\n');
+    }
+    if let Some(hint) = stderr_fix_hint(&tail.join("\n")) {
+        msg.push_str(&format!("fix: {hint}"));
+    }
+    msg.trim_end().to_string()
+}
+
+// ── MCP stdio spawn allowlist ────────────────────────────────────────
+
+/// Path to the persistent per-user allowlist of MCP stdio commands.
+fn mcp_allowlist_path() -> Option<std::path::PathBuf> {
+    let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(xdg)
+    } else {
+        crate::util::home_dir()?.join(".config")
+    };
+    Some(
+        base.join(crate::profile::app_dir_name())
+            .join("mcp_allowlist.json"),
+    )
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct McpAllowlist {
+    /// Approved stdio invocations: the command AND its arguments, as
+    /// `invocation()` renders them. Keyed on the command alone, approving
+    /// `npx` once let every later npx package spawn unasked. Older files
+    /// hold bare commands, which now only match a server with no args.
+    #[serde(default)]
+    commands: Vec<String>,
+}
+
+impl McpAllowlist {
+    fn load() -> Self {
+        let Some(path) = mcp_allowlist_path() else {
+            return Self::default();
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn save(&self) {
+        let Some(path) = mcp_allowlist_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let json = serde_json::to_string_pretty(self).unwrap_or_default();
+        // M6.15 BUG 5: atomic write via tmp + rename. A crash mid-write
+        // with `std::fs::write` would leave a half-written file that
+        // fails to deserialize, dropping the user's whole allowlist.
+        // Same pattern as marketplace::write_cache.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn contains(&self, cmd: &str) -> bool {
+        self.commands.iter().any(|c| c == cmd)
+    }
+
+    /// An allowlist written before entries carried arguments holds bare
+    /// commands (`npx`), and one written before they carried env and cwd
+    /// holds the bare command line. Either still covers a server from the
+    /// user's OWN mcp.json, unchanged, so headless and scheduled runs keep
+    /// the servers they had — never one from a project's mcp.json, which is
+    /// what a cloned repo controls and what the old entries let through.
+    fn grandfathers(&self, config: &McpServerConfig, user_servers: &[McpServerConfig]) -> bool {
+        let line = invocation(config);
+        (self.contains(&config.command) || self.contains(&line))
+            && user_servers
+                .iter()
+                .any(|s| s.name == config.name && invocation(s) == line && s.env == config.env)
+    }
+
+    fn insert(&mut self, cmd: &str) {
+        if !self.contains(cmd) {
+            self.commands.push(cmd.to_string());
+        }
+    }
+}
+
+/// What the allowlist remembers for a stdio server: the full command line.
+fn invocation(config: &McpServerConfig) -> String {
+    shell_words::join(
+        std::iter::once(config.command.as_str()).chain(config.args.iter().map(String::as_str)),
+    )
+}
+
+/// What the allowlist remembers for a stdio server: the command line, its
+/// env and the folder it starts in. The env is kept as a digest (values are
+/// often tokens); without it an approved `node server.js` re-ran with a
+/// project's `NODE_OPTIONS=--require ./x.js` (audit 2026-11-01 #6), and
+/// without the cwd an approved `npx pkg` resolves a cloned repo's own
+/// `node_modules` copy.
+fn spawn_key(config: &McpServerConfig, cwd: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut key = invocation(config);
+    if !config.env.is_empty() {
+        let mut pairs: Vec<(&String, &String)> = config.env.iter().collect();
+        pairs.sort();
+        let mut h = Sha256::new();
+        for (k, v) in pairs {
+            h.update(k.as_bytes());
+            h.update([0]);
+            h.update(v.as_bytes());
+            h.update([0]);
+        }
+        let digest = h.finalize();
+        let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        key.push_str(&format!(" [env:{hex}]"));
+    }
+    key.push_str(&format!(" [cwd:{}]", cwd.display()));
+    key
+}
+
+/// `env` entries a server config may not set, for the reasons a project
+/// `.env` may not ([`crate::dotenv::is_blocked_key`]): `PATH`,
+/// `NODE_OPTIONS`, `LD_PRELOAD` and the like turn an approved command into
+/// someone else's.
+fn spawn_env(config: &McpServerConfig) -> Vec<(&String, &String)> {
+    config
+        .env
+        .iter()
+        .filter(|(k, _)| {
+            let blocked = crate::dotenv::is_blocked_key(k);
+            if blocked {
+                eprintln!(
+                    "[mcp] {}: ignoring env {k} — it can redirect what the server runs",
+                    config.name
+                );
+            }
+            !blocked
+        })
+        .collect()
+}
+
+/// Gate an MCP stdio spawn through an allowlist. The first time we see
+/// a given command line, ask the user to approve it.
+///
+/// If an `approver` is supplied (GUI mode wires a `GuiApprover`), the
+/// decision routes through the same approval UI used for tool calls —
+/// critical in GUI mode where blocking on stdin would freeze the
+/// whole process because the user is interacting with the webview,
+/// not the launching terminal. CLI REPL leaves `approver` = `None` and
+/// falls back to the legacy stderr/stdin prompt below.
+async fn check_stdio_command_allowed(
+    config: &McpServerConfig,
+    approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+) -> Result<()> {
+    // Engine-injected servers skip the prompt: the command was chosen
+    // by thClaws code, not by a (possibly cloned) mcp.json. The field
+    // is #[serde(skip)] so JSON input can never set it.
+    if config.engine_managed {
+        return Ok(());
+    }
+
+    // An explicit environment override lets CI and scripted runs skip
+    // the prompt once they have already vetted the MCP config.
+    if std::env::var("THCLAWS_MCP_ALLOW_ALL").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let key = spawn_key(config, &cwd);
+    let mut allowlist = McpAllowlist::load();
+    if allowlist.contains(&key) {
+        return Ok(());
+    }
+    if allowlist.grandfathers(config, &crate::config::AppConfig::load_user_mcp_servers()) {
+        allowlist.insert(&key);
+        allowlist.save();
+        return Ok(());
+    }
+
+    if let Some(approver) = approver {
+        let req = crate::permissions::ApprovalRequest {
+            tool_name: crate::permissions::MCP_SPAWN_TOOL.to_string(),
+            input: serde_json::json!({
+                "name": config.name,
+                "command": config.command,
+                "args": config.args,
+                "env": config.env.keys().collect::<Vec<_>>(),
+                "cwd": cwd.display().to_string(),
+            }),
+            summary: Some(format!(
+                "Allow thClaws to run `{}` for MCP server `{}`? It will \
+                 run with your user privileges.",
+                key, config.name
+            )),
+            originator: crate::permissions::AgentOrigin::Main,
+        };
+        return match approver.approve(&req).await {
+            crate::permissions::ApprovalDecision::Allow
+            | crate::permissions::ApprovalDecision::AllowForSession => {
+                allowlist.insert(&key);
+                allowlist.save();
+                Ok(())
+            }
+            crate::permissions::ApprovalDecision::Deny => Err(Error::Provider(format!(
+                "mcp spawn refused by user: `{}`",
+                key
+            ))),
+        };
+    }
+
+    // Fallback: legacy stderr/stdin prompt. Still used by the CLI REPL.
+    // Require a TTY to prompt; otherwise fail closed.
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(Error::Provider(format!(
+            "mcp spawn refused: `{}` for server `{}` is not in the user \
+             allowlist (entries match the whole command line). Approve it by \
+             running thclaws interactively once, editing {}, or setting \
+             THCLAWS_MCP_ALLOW_ALL=1 in a trusted context.",
+            key,
+            config.name,
+            mcp_allowlist_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no config dir>".into())
+        )));
+    }
+
+    eprintln!();
+    eprintln!("\x1b[33m[mcp] New MCP stdio server wants to spawn:\x1b[0m");
+    eprintln!("      name:    {}", config.name);
+    eprintln!("      command: {}", config.command);
+    if !config.args.is_empty() {
+        eprintln!("      args:    {}", config.args.join(" "));
+    }
+    if !config.env.is_empty() {
+        let mut keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
+        keys.sort();
+        eprintln!("      env:     {}", keys.join(", "));
+    }
+    eprintln!("      cwd:     {}", cwd.display());
+    eprintln!();
+    eprintln!("This will run the binary with your user privileges. Only");
+    eprintln!("approve if you trust the MCP config that requested it.");
+    eprint!("Approve and remember? [y/N] ");
+    use std::io::{BufRead, Write};
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let stdin = std::io::stdin();
+    let _ = stdin.lock().read_line(&mut line);
+    let answer = line.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        allowlist.insert(&key);
+        allowlist.save();
+        eprintln!("\x1b[32m[mcp] `{key}` added to allowlist.\x1b[0m");
+        Ok(())
+    } else {
+        Err(Error::Provider(format!(
+            "mcp spawn refused by user: `{key}`"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    /// MCP-Apps widget URI declared on the tool's `meta`. Set when the
+    /// server wants the client to render an iframe widget for this
+    /// tool's results (`text/html;profile=mcp-app` resource at
+    /// `ui://server/widget`). `None` for plain tools. Read from
+    /// `meta.ui.resourceUri` (current spec) with a fallback to the
+    /// legacy flat key `meta["ui/resourceUri"]` — pinn.ai et al. set
+    /// both for backward compat with older Claude Desktop versions.
+    pub ui_resource_uri: Option<String>,
+}
+
+/// Pull the MCP-Apps UI resource URI out of a tool's `meta` value.
+/// Mirrors the dual-key contract documented in the MCP-Apps spec:
+/// `meta.ui.resourceUri` (current) wins, `meta["ui/resourceUri"]`
+/// (legacy flat) is the fallback. `None` if neither is present or
+/// the value isn't a string.
+fn extract_ui_resource_uri(meta: Option<&Value>) -> Option<String> {
+    let meta = meta?;
+    if let Some(s) = meta
+        .get("ui")
+        .and_then(|u| u.get("resourceUri"))
+        .and_then(Value::as_str)
+    {
+        return Some(s.to_string());
+    }
+    meta.get("ui/resourceUri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+pub struct McpClient {
+    name: String,
+    writer: AsyncMutex<BoxedWriter>,
+    pending: Pending,
+    next_id: AtomicU64,
+    reader_task: tokio::task::JoinHandle<()>,
+    _child: Mutex<Option<Child>>,
+    /// Trust flag inherited from [`McpServerConfig::trusted`]. Marketplace
+    /// installs set this; hand-added servers leave it `false`. Gates
+    /// MCP-Apps widget rendering and widget→host tool calls — see
+    /// dev-log/112.
+    trusted: bool,
+    /// Set when the reader task observes EOF (or an error) on the
+    /// transport. New requests fast-fail with "transport closed"
+    /// instead of writing into a dead pipe and waiting 30 s for the
+    /// timeout to fire (M6.15 BUG 4). Shared `Arc` so the reader
+    /// task can flip the same instance the McpClient reads.
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional "instructions" string from the MCP `InitializeResult`
+    /// (per spec — servers MAY return this to brief the model on
+    /// when/how to use their tools). Captured in [`Self::initialize`]
+    /// and surfaced into the system prompt's "# MCP server
+    /// instructions" section by `prompts::build_full_system_prompt`.
+    /// `Some("")` is treated as no-op; the renderer trims + skips
+    /// empty strings.
+    instructions: Mutex<Option<String>>,
+    /// Last few stderr lines from a stdio child, newest last. A
+    /// launcher (`npx`, `uvx`) that dies before the handshake leaves
+    /// the client nothing but EOF — its stderr is the only place that
+    /// says why, so we keep a bounded tail and attach it to the
+    /// start-up error. Always empty for HTTP transports.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        // Abort the reader task before fields drop so it releases its
+        // read-half of whatever stream it owns; otherwise on stdio split
+        // pairs the other side may not see EOF until the runtime cleans
+        // up the task lazily. Abort is a no-op if the task already finished.
+        self.reader_task.abort();
+    }
+}
+
+impl std::fmt::Debug for McpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpClient")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl McpClient {
+    /// Build a client on top of any async stream pair. Starts a background
+    /// reader task that parses incoming JSON-RPC messages and resolves pending
+    /// requests by id. The task exits when the reader hits EOF; any still-
+    /// pending requests at that point get an `"mcp transport closed"` error.
+    pub fn from_streams<R, W>(
+        name: impl Into<String>,
+        reader: R,
+        writer: W,
+        trusted: bool,
+    ) -> Arc<Self>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending_for_reader = pending.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_for_reader = closed.clone();
+
+        let reader_task = tokio::spawn(async move {
+            let mut buf_reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match buf_reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(msg) = serde_json::from_str::<Value>(trimmed) {
+                            handle_incoming(msg, &pending_for_reader);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Mark closed BEFORE draining so any concurrent `request`
+            // call already past its closed-check still gets the
+            // drained "transport closed" error from its oneshot.
+            closed_for_reader.store(true, std::sync::atomic::Ordering::SeqCst);
+            let pending: Vec<_> = pending_for_reader
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, tx)| tx)
+                .collect();
+            for tx in pending {
+                let _ = tx.send(Err(Error::Provider("mcp transport closed".into())));
+            }
+        });
+
+        Arc::new(Self {
+            name: name.into(),
+            writer: AsyncMutex::new(Box::new(writer) as BoxedWriter),
+            pending,
+            next_id: AtomicU64::new(1),
+            reader_task,
+            _child: Mutex::new(None),
+            trusted,
+            closed,
+            instructions: Mutex::new(None),
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+
+    /// Whether this server is trusted to render UI widgets. Mirror of
+    /// [`McpServerConfig::trusted`]; gates `fetch_ui_resource` and
+    /// widget-initiated `tools/call`.
+    pub fn is_trusted(&self) -> bool {
+        self.trusted
+    }
+
+    /// Create a client from config. Dispatches on `config.transport`:
+    /// - `"stdio"` (default): spawn a subprocess, attach stdin/stdout.
+    /// - `"http"`: POST JSON-RPC to `config.url` per request.
+    pub async fn spawn(config: McpServerConfig) -> Result<Arc<Self>> {
+        Self::spawn_with_approver(config, None).await
+    }
+
+    /// Like [`spawn_with_approver`] but never launches the interactive
+    /// OAuth browser flow for HTTP servers. Used by `/mcp add` (CLI and
+    /// GUI): an HTTP server that requires OAuth returns an error telling
+    /// the user to run `/mcp reauth <name>` instead of freezing the
+    /// command (CLI) or the worker thread (GUI) for up to 5 minutes
+    /// waiting on a browser callback the user may not be ready for
+    /// (issue #114). stdio transport is unaffected — it still goes
+    /// through `spawn_with_approver` with the caller's approver, so the
+    /// command-allowlist gate keeps working in GUI mode.
+    pub async fn spawn_noninteractive(
+        config: McpServerConfig,
+        approver: Option<Arc<dyn crate::permissions::ApprovalSink>>,
+    ) -> Result<Arc<Self>> {
+        if let Some(reason) = crate::policy::mcp_server_refusal(&config) {
+            return Err(Error::Provider(reason));
+        }
+        if config.transport == "http" {
+            return Self::connect_http(config, false).await;
+        }
+        Self::spawn_with_approver(config, approver).await
+    }
+
+    /// Same as [`spawn`] but lets the caller provide an `ApprovalSink`
+    /// for the first-time spawn prompt. GUI mode passes its
+    /// `GuiApprover` here so MCP approval pops up in the same modal as
+    /// tool-call approval. Callers without an approver keep the stdin
+    /// fallback.
+    pub async fn spawn_with_approver(
+        config: McpServerConfig,
+        approver: Option<Arc<dyn crate::permissions::ApprovalSink>>,
+    ) -> Result<Arc<Self>> {
+        if let Some(reason) = crate::policy::mcp_server_refusal(&config) {
+            return Err(Error::Provider(reason));
+        }
+        if config.transport == "http" {
+            return Self::connect_http(config, true).await;
+        }
+        if let Some(reason) = multiuser_stdio_refusal(&config) {
+            return Err(Error::Provider(reason));
+        }
+
+        // Allowlist gate: MCP stdio configs come from project-scoped
+        // JSON files that a user may have cloned from the internet. A
+        // malicious `.thclaws/mcp.json` could point `command` at an
+        // arbitrary binary. Require explicit per-command approval the
+        // first time we see it and persist the decision.
+        check_stdio_command_allowed(&config, approver).await?;
+
+        let mut cmd = crate::office::apps::spawn_command(&config).unwrap_or_else(|| {
+            let mut c = Command::new(&config.command);
+            c.args(&config.args);
+            c
+        });
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // Captured, not discarded: when a launcher dies before the
+            // handshake all this client sees is EOF, and the reason
+            // ("npm error code ENOTEMPTY") lives only here.
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        for k in crate::tools::bash::ENGINE_SECRET_ENV {
+            cmd.env_remove(k);
+        }
+        for (k, v) in spawn_env(&config) {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Provider(format!("mcp spawn `{}`: {}", config.command, e)))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Provider("mcp: child had no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Provider("mcp: child had no stdout".into()))?;
+
+        let stderr = child.stderr.take();
+
+        let client = Self::from_streams(config.name.clone(), stdout, stdin, config.trusted);
+        let stderr_task = stderr.map(|stderr| {
+            let buf = client.stderr_tail.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(mut buf) = buf.lock() {
+                        if buf.len() == STDERR_TAIL_LINES {
+                            buf.pop_front();
+                        }
+                        buf.push_back(clip_stderr_line(line));
+                    }
+                }
+            })
+        });
+        *client._child.lock().unwrap() = Some(child);
+        if let Err(e) = client.initialize().await {
+            // The child is dead or wedged; either way its stderr pump
+            // ends at EOF, so a short join collects the full tail
+            // before we report instead of racing it.
+            if let Some(task) = stderr_task {
+                let _ = timeout(Duration::from_millis(750), task).await;
+            }
+            return Err(Error::Provider(start_failure_message(
+                &config.command,
+                &e,
+                &client.stderr_tail_lines(),
+            )));
+        }
+        Ok(client)
+    }
+
+    /// Snapshot of the child's captured stderr tail, oldest first.
+    fn stderr_tail_lines(&self) -> Vec<String> {
+        self.stderr_tail
+            .lock()
+            .map(|b| b.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Connect to an HTTP MCP server. Each JSON-RPC call is an independent
+    /// HTTP POST → JSON response. We simulate the stream pair by piping
+    /// through an in-memory duplex so the rest of the client (reader task,
+    /// pending map) works unchanged.
+    async fn connect_http(config: McpServerConfig, interactive_oauth: bool) -> Result<Arc<Self>> {
+        if config.url.is_empty() {
+            return Err(Error::Provider(format!(
+                "mcp http server '{}': missing 'url' field",
+                config.name
+            )));
+        }
+        // Create an in-memory duplex. We'll use our write-half to send
+        // requests and a background task that reads them, POSTs to the
+        // HTTP server, and writes responses into the other half.
+        let (client_read, server_write) = tokio::io::duplex(64 * 1024);
+        let (server_read, client_write) = tokio::io::duplex(64 * 1024);
+
+        let url = config.url.clone();
+        let name_for_task = config.name.clone();
+        // Interpolate `${VAR}` in header values from the environment so a
+        // secret (API key, bearer token) can live in the shell / `.env`
+        // instead of plaintext in mcp.json. Resolved once here; both the
+        // auth probe and every bridge POST use this map.
+        let extra_headers: HashMap<String, String> = config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), interpolate_env(v)))
+            .collect();
+        // Disable auto-redirects: reqwest strips the Authorization header on
+        // ALL redirects (even same-origin 307). Our `write_response_lines`
+        // handles 307/308 manually, preserving auth + fixing http→https.
+        let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        // Resolve OAuth token BEFORE creating the bridge so the initialize
+        // handshake doesn't time out while the user is consenting in the
+        // browser. Flow:
+        //   1. Check cached token → use if valid.
+        //   2. Try refresh if expired.
+        //   3. Probe the server → if 401, run full OAuth browser flow.
+        //   4. Only then set up the bridge with the token already loaded.
+        // Probe + discovery get hard timeouts so a stalled server can't
+        // hang `/mcp add` (or a startup spawn) forever. The bridge
+        // `http_client` above deliberately has NO blanket timeout — it
+        // carries streaming SSE responses, and per-request deadlines are
+        // enforced separately by REQUEST_TIMEOUT_SECS in `request()`.
+        let http_probe = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let resolved_token = match resolve_token_upfront(
+            &http_probe,
+            &url,
+            &config.name,
+            &extra_headers,
+            interactive_oauth,
+        )
+        .await
+        {
+            UpfrontToken::Proceed(tok) => tok,
+            UpfrontToken::OAuthRequired => {
+                return Err(Error::Provider(format!(
+                    "MCP server '{}' requires OAuth — run `/mcp reauth {}` to authenticate (opens a browser)",
+                    config.name, config.name
+                )));
+            }
+        };
+
+        let token: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(resolved_token));
+
+        let token_for_task = token.clone();
+        let url_for_oauth = url.clone();
+        // MCP Streamable HTTP session id — returned by the server in
+        // `Mcp-Session-Id` header, must be echoed on every subsequent POST.
+        let mcp_session: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let mcp_session_for_task = mcp_session.clone();
+
+        // Bridge task: read JSON-RPC lines from client_write side, POST
+        // each to the HTTP URL, write the response body back to server_write.
+        // On 401, attempt OAuth discovery + browser flow, then retry —
+        // UNLESS this is a non-interactive connect (`/mcp add`), in which
+        // case we fail the request fast instead of popping a browser.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(server_read);
+            let mut writer = server_write;
+            let mut line = String::new();
+            let token = token_for_task;
+            let session = mcp_session_for_task;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let build_post = |bearer: Option<&str>, sid: Option<&str>, body: &str| {
+                    let mut req = http_client
+                        .post(&url_for_oauth)
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json, text/event-stream");
+                    for (k, v) in &extra_headers {
+                        req = req.header(k.as_str(), v.as_str());
+                    }
+                    if let Some(t) = bearer {
+                        req = req.header("authorization", format!("Bearer {t}"));
+                    }
+                    if let Some(s) = sid {
+                        req = req.header("mcp-session-id", s);
+                    }
+                    req.body(body.to_string())
+                };
+
+                let current_token = token.lock().await.clone();
+                let current_session = session.lock().await.clone();
+                // M6.15 BUG 8: gate behind THCLAWS_MCP_DEBUG and DROP
+                // the bearer-prefix leak. Logging the first 12 chars
+                // of an OAuth access token is small but non-zero
+                // exfil risk; presence boolean is enough for
+                // debugging which auth path a request took.
+                mcp_debug!(
+                    "\x1b[2m[mcp-http] bridge POST: token={}, session={}, body_len={}\x1b[0m",
+                    if current_token.is_some() {
+                        "present"
+                    } else {
+                        "none"
+                    },
+                    current_session.as_deref().unwrap_or("None"),
+                    trimmed.len(),
+                );
+                let resp = build_post(
+                    current_token.as_deref(),
+                    current_session.as_deref(),
+                    trimmed,
+                )
+                .send()
+                .await;
+
+                match resp {
+                    Ok(r) if r.status().as_u16() == 401 => {
+                        let hdrs = format!("{:?}", r.headers());
+                        let body_preview = r.text().await.unwrap_or_default();
+                        mcp_debug!(
+                            "\x1b[36m[mcp-http] {} → 401\x1b[0m\n\x1b[2m  headers: {}\n  body: {}\x1b[0m",
+                            name_for_task,
+                            hdrs.chars().take(300).collect::<String>(),
+                            body_preview.chars().take(300).collect::<String>(),
+                        );
+                        // Non-interactive connect (`/mcp add`): never open a
+                        // browser. The upfront probe can't catch a server
+                        // that lets `ping` through unauthenticated but 401s
+                        // on `initialize`, so guard here too. Fail the
+                        // pending request fast with a JSON-RPC error (echoing
+                        // the numeric id so `handle_incoming` matches it) —
+                        // `initialize()` returns promptly and `/mcp add`
+                        // reports "run /mcp reauth" instead of hanging on a
+                        // browser callback. Issue #114.
+                        if !interactive_oauth {
+                            eprintln!(
+                                "\x1b[33m[mcp-http] {name_for_task}: server requires OAuth — run `/mcp reauth {name_for_task}`\x1b[0m"
+                            );
+                            if let Some(id) = serde_json::from_str::<Value>(trimmed)
+                                .ok()
+                                .and_then(|v| v.get("id").and_then(Value::as_u64))
+                            {
+                                let synthetic = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32001,
+                                        "message": format!(
+                                            "{name_for_task}: server requires OAuth — run /mcp reauth {name_for_task}"
+                                        ),
+                                    },
+                                })
+                                .to_string();
+                                write_body_to_pipe(&mut writer, &synthetic, "application/json")
+                                    .await;
+                            }
+                            continue;
+                        }
+                        // Invalidate so resolve_oauth_token doesn't just
+                        // return the same rejected token from the store.
+                        {
+                            let mut store = crate::oauth::TokenStore::load();
+                            store.remove(&url_for_oauth);
+                        }
+                        *token.lock().await = None;
+                        let new_token =
+                            resolve_oauth_token(&http_client, &url_for_oauth, &name_for_task).await;
+                        match new_token {
+                            Some(t) => {
+                                *token.lock().await = Some(t.clone());
+                                let sid = session.lock().await.clone();
+                                match build_post(Some(&t), sid.as_deref(), trimmed).send().await {
+                                    Ok(r2) => {
+                                        let sid = session.lock().await.clone();
+                                        write_response_lines(
+                                            &mut writer,
+                                            r2,
+                                            &session,
+                                            &http_client,
+                                            Some(&t),
+                                            trimmed,
+                                            &url_for_oauth,
+                                            &extra_headers,
+                                            sid.as_deref(),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "\x1b[33m[mcp-http] {} retry error: {e}\x1b[0m",
+                                            name_for_task
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "\x1b[31m[mcp-http] {} OAuth failed — skipping request\x1b[0m",
+                                    name_for_task
+                                );
+                            }
+                        }
+                    }
+                    Ok(r) => {
+                        let curr_tok = current_token.as_deref();
+                        let curr_sid = current_session.as_deref();
+                        let resp_status = r.status();
+
+                        // "Session not found" detection: peek the body on
+                        // error responses. If confirmed, clear the session
+                        // and retry. For success responses, pass straight
+                        // through to write_response_lines.
+                        if resp_status.as_u16() == 400
+                            || resp_status == reqwest::StatusCode::NOT_FOUND
+                        {
+                            let body = r.text().await.unwrap_or_default();
+                            if body.contains("Session not found") {
+                                mcp_debug!(
+                                    "\x1b[33m[mcp-http] session expired, retrying without session ID\x1b[0m"
+                                );
+                                *session.lock().await = None;
+                                match build_post(current_token.as_deref(), None, trimmed)
+                                    .send()
+                                    .await
+                                {
+                                    Ok(r2) => {
+                                        write_response_lines(
+                                            &mut writer,
+                                            r2,
+                                            &session,
+                                            &http_client,
+                                            current_token.as_deref(),
+                                            trimmed,
+                                            &url_for_oauth,
+                                            &extra_headers,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "\x1b[33m[mcp-http] {} retry error: {e}\x1b[0m",
+                                            name_for_task
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Some other error — write it through.
+                                write_body_to_pipe(&mut writer, &body, "application/json").await;
+                            }
+                        } else {
+                            write_response_lines(
+                                &mut writer,
+                                r,
+                                &session,
+                                &http_client,
+                                curr_tok,
+                                trimmed,
+                                &url_for_oauth,
+                                &extra_headers,
+                                curr_sid,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[mcp-http] {} POST error: {e}\x1b[0m",
+                            name_for_task
+                        );
+                    }
+                }
+            }
+        });
+
+        let client = Self::from_streams(
+            config.name.clone(),
+            client_read,
+            client_write,
+            config.trusted,
+        );
+        client.initialize().await?;
+        Ok(client)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Collect `(server_name, instructions)` pairs from a slice of live
+/// MCP clients, filtering out servers that didn't ship instructions.
+/// Output order matches the input slice (which itself follows the
+/// settings.json mcp_servers config order), so the rendered prompt
+/// section is stable across runs.
+///
+/// Used by every surface's prompt build path
+/// (`repl::run_repl`, `repl::run_print_mode`, `agent_runtime`,
+/// `shared_session::rebuild_system_prompt`) — feeds the
+/// `# MCP server instructions` section in
+/// `crate::prompts::build_full_system_prompt`.
+pub fn collect_mcp_instructions(clients: &[Arc<McpClient>]) -> Vec<(String, String)> {
+    clients
+        .iter()
+        .filter_map(|c| c.instructions().map(|i| (c.name().to_string(), i)))
+        .collect()
+}
+
+/// Browser MCP tools hidden from the MODEL's tool registry.
+///
+/// `@playwright/mcp --caps=vision` advertises 30 tools — ~21 KB of JSON
+/// schema, or roughly 5,400 tokens attached to EVERY request for as long as
+/// the browser is enabled, whether or not the turn touches a page. Most of
+/// that surface is not for the model:
+///
+/// - `browser_mouse_*` exist for the Browser tab's human takeover. That path
+///   calls the MCP client DIRECTLY from `ipc.rs` (`browser_input_call`), and
+///   `call_tool` does not consult this list, so hiding them from the model
+///   costs the takeover nothing.
+/// - `browser_close` / `browser_resize` fight the engine, which owns the
+///   Chromium lifecycle and the viewport (`--viewport-size`).
+/// - `browser_run_code_unsafe` is, by its own description, "Unsafe: executes
+///   arbitrary code" — in a browser carrying the user's live cookies, under a
+///   default `permissions: "auto"` that approves every call without asking.
+///   `browser_evaluate` covers the legitimate uses at page scope.
+/// - `browser_drop` is a drag-and-drop file gesture with no agent workflow.
+///
+/// Escape hatch: `THCLAWS_BROWSER_ALL_TOOLS=1` registers the raw list.
+const BROWSER_MODEL_HIDDEN_TOOLS: &[&str] = &[
+    "browser_mouse_move_xy",
+    "browser_mouse_click_xy",
+    "browser_mouse_drag_xy",
+    "browser_mouse_down",
+    "browser_mouse_up",
+    "browser_mouse_wheel",
+    "browser_run_code_unsafe",
+    "browser_close",
+    "browser_resize",
+    "browser_drop",
+];
+
+impl McpClient {
+    /// Send a JSON-RPC request and wait for the matching response.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_within(method, params, request_timeout_secs())
+            .await
+    }
+
+    /// [`request`](Self::request) with an explicit deadline, for the one
+    /// caller whose wait is legitimately much longer than a tool call's.
+    async fn request_within(&self, method: &str, params: Value, secs: u64) -> Result<Value> {
+        // M6.15 BUG 4: fast-fail when the transport is already known
+        // dead (reader task hit EOF). Without this, callers wait 30 s
+        // for the timeout to fire before learning the connection is
+        // gone. Notifications still go through `notify` and may
+        // legitimately race with shutdown — gate only the
+        // request/response path here.
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            // A server that crashes mid-session takes its tools with
+            // it; carry its last stderr line so the turn says what
+            // died, not just that something did.
+            let mut msg = "mcp transport closed".to_string();
+            if let Some(last) = self.stderr_tail_lines().last() {
+                msg.push_str(&format!(" (last stderr: {last})"));
+            }
+            return Err(Error::Provider(msg));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.write_line(&msg).await?;
+
+        match timeout(Duration::from_secs(secs), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::Provider("mcp response channel dropped".into())),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                // Name the budget that expired: "timed out: initialize" alone
+                // sent the last reader hunting for a hang that was really a
+                // cold dependency install.
+                Err(Error::Provider(format!(
+                    "mcp request timed out after {secs}s: {method}"
+                )))
+            }
+        }
+    }
+
+    /// Send a JSON-RPC notification (no id, no response expected).
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.write_line(&msg).await
+    }
+
+    async fn write_line(&self, msg: &Value) -> Result<()> {
+        let line = format!("{}\n", serde_json::to_string(msg)?);
+        let mut w = self.writer.lock().await;
+        w.write_all(line.as_bytes())
+            .await
+            .map_err(|e| Error::Provider(format!("mcp write: {e}")))?;
+        w.flush()
+            .await
+            .map_err(|e| Error::Provider(format!("mcp flush: {e}")))
+    }
+
+    pub async fn initialize(&self) -> Result<()> {
+        let result = self
+            .request_within(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
+                }),
+                init_timeout_secs(),
+            )
+            .await?;
+        // Capture the optional `instructions` field per MCP spec
+        // (InitializeResult.instructions). Servers use this to brief
+        // the model on when/how to call their tools — surfaced in the
+        // unified system prompt's `# MCP server instructions` section.
+        // Trim + skip empty; oversized values stay verbatim (operator
+        // chose to install the server, server chose to brief us).
+        if let Some(s) = result.get("instructions").and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                if let Ok(mut guard) = self.instructions.lock() {
+                    *guard = Some(trimmed.to_string());
+                }
+            }
+        }
+        self.notify("notifications/initialized", json!({})).await?;
+        Ok(())
+    }
+
+    /// Read the cached `instructions` string from the server's
+    /// `InitializeResult`. `None` when the server didn't send one
+    /// (most don't yet). Cheap to call per turn — short mutex grab,
+    /// no I/O.
+    pub fn instructions(&self) -> Option<String> {
+        self.instructions.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
+        let result = self.request("tools/list", json!({})).await?;
+        let arr = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Provider("mcp tools/list: missing `tools` field".into()))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for t in arr {
+            let name = t
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Provider("mcp tool missing `name`".into()))?
+                .to_string();
+            let description = t
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let input_schema = t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let ui_resource_uri = extract_ui_resource_uri(t.get("_meta").or_else(|| t.get("meta")));
+            out.push(McpToolInfo {
+                name,
+                description,
+                input_schema,
+                ui_resource_uri,
+            });
+        }
+        // Trim the browser server's model-facing surface. Done HERE, the one
+        // place tool lists are produced, so all six registration sites get it
+        // and `call_tool` — which takes a name and never reads this list —
+        // keeps working for the takeover path in `ipc.rs`.
+        if self.name() == "browser"
+            && std::env::var("THCLAWS_BROWSER_ALL_TOOLS").ok().as_deref() != Some("1")
+        {
+            out.retain(|t| !BROWSER_MODEL_HIDDEN_TOOLS.contains(&t.name.as_str()));
+        }
+        Ok(out)
+    }
+
+    /// Fetch an MCP resource by URI via standard `resources/read`.
+    /// Returns the first text content the server sent — for MCP-Apps
+    /// widgets that's the inlined HTML. The MIME type from the
+    /// response is returned alongside so callers can assert
+    /// `text/html;profile=mcp-app` before mounting an iframe and
+    /// avoid trusting arbitrary text the server might return for the
+    /// same URI.
+    pub async fn read_resource(&self, uri: &str) -> Result<(String, Option<String>, bool, bool)> {
+        let result = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await?;
+        let contents = result
+            .get("contents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Error::Provider("mcp resources/read: missing `contents` array".into())
+            })?;
+        for entry in contents {
+            if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                let mime = entry
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // MCP-Apps extension carried in the resource's `_meta`.
+                // A trusted server that needs to load `<script src>`
+                // from its own preview origin (e.g. GamedevPreview
+                // returning an iframe whose src is the loopback HTTP
+                // server it spawned) sets `_meta.allowSameOrigin: true`.
+                // `_meta.autoSize: true` is a separate opt-in: it tells
+                // the host's McpAppIframe to honour `size-changed`
+                // notifications from the widget so DOM-based content
+                // (board games) can grow past the default 480px. Both
+                // are surfaced here; the trust gate at the call site
+                // decides whether to honor them.
+                let allow_same_origin = entry
+                    .get("_meta")
+                    .and_then(|m| m.get("allowSameOrigin"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let auto_size = entry
+                    .get("_meta")
+                    .and_then(|m| m.get("autoSize"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return Ok((text.to_string(), mime, allow_same_origin, auto_size));
+            }
+        }
+        Err(Error::Provider(format!(
+            "mcp resources/read({uri}): no text content in response"
+        )))
+    }
+
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let text = extract_text(&result, name);
+        if is_error {
+            Err(Error::Tool(format!("mcp tool {name} error: {text}")))
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// Like [`call_tool`] but returns the raw `tools/call` result so
+    /// callers can read non-text content blocks. `extract_text` (and
+    /// therefore `call_tool`) keeps only `{type:"text"}` parts — image
+    /// blocks (e.g. Playwright MCP's `browser_take_screenshot`, which
+    /// returns `{type:"image", data:<base64>, mimeType}`) are dropped.
+    /// The Browser tab's screenshot panel needs those bytes.
+    pub async fn call_tool_raw(&self, name: &str, arguments: Value) -> Result<Value> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_error {
+            Err(Error::Tool(format!(
+                "mcp tool {name} error: {}",
+                extract_text(&result, name)
+            )))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+fn handle_incoming(msg: Value, pending: &Pending) {
+    // We only handle responses (messages with an `id`). Notifications from
+    // the server are ignored for MVP.
+    let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+        return;
+    };
+    let tx_opt = pending.lock().unwrap().remove(&id);
+    let Some(tx) = tx_opt else {
+        return;
+    };
+    let result = if let Some(error) = msg.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Err(Error::Provider(format!("mcp error {code}: {message}")))
+    } else if let Some(result) = msg.get("result") {
+        Ok(result.clone())
+    } else {
+        Err(Error::Provider(
+            "mcp response missing both `result` and `error`".into(),
+        ))
+    };
+    let _ = tx.send(result);
+}
+
+/// Per-result cap on TEXT forwarded to the model.
+///
+/// Images were capped from the start; text never was. That asymmetry made the
+/// cheapest-LOOKING path the only unbounded one: `WebFetch` truncates at 100 KB
+/// a section, while one `browser_snapshot` of a heavy page hands the whole
+/// accessibility tree to the model with nothing in the way. 256 KB is generous
+/// for a real answer and still bounds the blast radius of a single page.
+///
+/// Override with `THCLAWS_MCP_MAX_TEXT_BYTES` (0 disables the cap).
+const MAX_MCP_TEXT_BYTES: usize = 256 * 1024;
+
+/// Tighter budget for the one tool that routinely blows the blanket cap.
+/// Measured (docs/pdf-extraction-bench.md's sibling survey in dev-plan/65):
+/// one `browser_snapshot` of an encyclopaedia article is 889 KB — 65,000
+/// tokens in a single tool result after the 256 KB cap, with 71% dropped. The
+/// Hacker News front page is 48 KB, which is what "a real page, whole" costs,
+/// so that is the ceiling. Past it the model is told which parameter narrows
+/// the call rather than being left to retry blind.
+const SNAPSHOT_TEXT_BYTES: usize = 48 * 1024;
+
+/// Per-tool text budget. The blanket cap bounds the blast radius of any one
+/// result; this bounds the tool that reaches it every time.
+///
+/// An explicit `THCLAWS_MCP_MAX_TEXT_BYTES` wins outright, including over the
+/// snapshot floor — someone who raises the cap to read one enormous tree
+/// should get it, and someone who sets `0` should get no cap at all.
+fn tool_text_budget(tool: &str) -> usize {
+    if let Some(explicit) = mcp_text_budget_override() {
+        return explicit;
+    }
+    match tool {
+        "browser_snapshot" => SNAPSHOT_TEXT_BYTES,
+        _ => MAX_MCP_TEXT_BYTES,
+    }
+}
+
+/// What to do about a result that had to be cut, in the words of the tool
+/// that produced it. A generic "narrow the result" is not actionable; naming
+/// the parameter is.
+fn narrowing_hint(tool: &str) -> &'static str {
+    match tool {
+        "browser_snapshot" => {
+            "Narrow it: `depth` limits the tree, `target` snapshots one element, \
+             and `filename` writes the whole snapshot to a file you can Grep for \
+             a fraction of the tokens"
+        }
+        "browser_network_requests" | "browser_console_messages" => {
+            "Narrow it: `filter` matches a URL pattern, `filename` writes the \
+             full list to a file"
+        }
+        _ => {
+            "Narrow the result — `browser_find` searches the page and returns \
+             only matches, where `browser_snapshot` returns all of it"
+        }
+    }
+}
+
+fn mcp_text_budget_override() -> Option<usize> {
+    std::env::var("THCLAWS_MCP_MAX_TEXT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Truncate on a UTF-8 boundary, saying what was dropped so the model can
+/// narrow its next call instead of assuming it saw the whole page.
+fn cap_mcp_text(text: String, tool: &str) -> String {
+    let budget = tool_text_budget(tool);
+    if budget == 0 || text.len() <= budget {
+        return text;
+    }
+    cap_mcp_text_to(&text, budget, tool)
+}
+
+/// `cap_mcp_text` with the budget supplied by the caller, for the multimodal
+/// path where several blocks share one allowance.
+fn cap_mcp_text_to(text: &str, budget: usize, tool: &str) -> String {
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n... [truncated at {} KB of {} KB. {}]",
+        &text[..end],
+        budget / 1024,
+        text.len() / 1024,
+        narrowing_hint(tool)
+    )
+}
+
+/// Pull text out of a `tools/call` result. MCP tool results are an array of
+/// content blocks; we concatenate all `{type: "text"}` parts.
+fn extract_text(result: &Value, tool: &str) -> String {
+    let Some(content) = result.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    cap_mcp_text(
+        content
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        tool,
+    )
+}
+
+/// Per-result cap on image payload forwarded to the model. Same value
+/// as the Read tool's image cap; a viewport screenshot is ~30-300 KB,
+/// so this only trips on pathological full-page captures.
+const MAX_MCP_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Convert a `tools/call` result into multimodal blocks, preserving
+/// `{type:"image", data, mimeType}` parts in server order. Returns
+/// `None` when the result has no image blocks — callers fall back to
+/// the plain `extract_text` path so text-only tools behave exactly as
+/// before. Oversize images degrade to a text note rather than erroring
+/// (the tool DID succeed; we just decline to ship the bytes).
+fn mcp_content_to_blocks(result: &Value, tool: &str) -> Option<crate::types::ToolResultContent> {
+    use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+    let content = result.get("content").and_then(Value::as_array)?;
+    if !content
+        .iter()
+        .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+    {
+        return None;
+    }
+    let mut blocks: Vec<ToolResultBlock> = Vec::new();
+    let mut image_budget = MAX_MCP_IMAGE_BYTES;
+    // Text is budgeted across the whole result, not per block — otherwise a
+    // screenshot with a full snapshot stapled to it slips the cap that
+    // `extract_text` applies on the text-only path.
+    let mut text_budget = tool_text_budget(tool);
+    for b in content {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    let t = if text_budget == 0 {
+                        t.to_string()
+                    } else if t.len() <= text_budget {
+                        text_budget -= t.len();
+                        t.to_string()
+                    } else {
+                        let capped = cap_mcp_text_to(t, text_budget, tool);
+                        text_budget = 0;
+                        capped
+                    };
+                    blocks.push(ToolResultBlock::Text { text: t });
+                }
+            }
+            Some("image") => {
+                let Some(data) = b.get("data").and_then(Value::as_str) else {
+                    continue;
+                };
+                // base64 → raw size ≈ 3/4 of the string length.
+                let approx_bytes = data.len() / 4 * 3;
+                if approx_bytes > image_budget {
+                    blocks.push(ToolResultBlock::Text {
+                        text: format!(
+                            "[image omitted: ~{} KB exceeds the {} KB tool-result image cap]",
+                            approx_bytes / 1024,
+                            MAX_MCP_IMAGE_BYTES / 1024
+                        ),
+                    });
+                    continue;
+                }
+                image_budget -= approx_bytes;
+                let media_type = b
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string();
+                blocks.push(ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type,
+                        data: data.to_string(),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    // Non-multimodal providers render via to_text(), which drops Image
+    // blocks — guarantee at least one text block so they never see an
+    // empty result.
+    if !blocks
+        .iter()
+        .any(|b| matches!(b, ToolResultBlock::Text { .. }))
+    {
+        blocks.push(ToolResultBlock::Text {
+            text: "(image attached)".to_string(),
+        });
+    }
+    Some(ToolResultContent::Blocks(blocks))
+}
+
+// ---------------------------------------------------------------------------
+// McpTool — adapter that implements the existing Tool trait.
+// ---------------------------------------------------------------------------
+
+/// An MCP tool discovered via `tools/list`, wrapped so the agent's tool
+/// registry treats it the same as a built-in tool.
+///
+/// `name` and `description` are leaked to `&'static str` at construction time
+/// because the existing `Tool` trait returns `&'static str`. MCP tools are
+/// registered once at REPL startup; the leak is a few hundred bytes per tool
+/// and bounded by the configured server set. Document this in the phase log.
+pub struct McpTool {
+    client: Arc<McpClient>,
+    /// Provider-safe identifier — `<sanitized_server>__<sanitized_tool>`.
+    name: &'static str,
+    /// Original MCP tool name as advertised by the server. Sent verbatim
+    /// on `tools/call`; never sanitized, because the server matches it
+    /// byte-for-byte.
+    bare: &'static str,
+    description: &'static str,
+    schema: Value,
+    /// MCP-Apps widget URI declared on this tool (see [`McpToolInfo`]).
+    /// Carried through to callers so the agent loop can fetch the
+    /// resource HTML and ship it to the chat surface alongside the
+    /// tool result.
+    ui_resource_uri: Option<&'static str>,
+}
+
+/// Separator used between server name and tool name in the qualified identifier.
+/// `__` is used (not `.`) because provider tool-name patterns
+/// (OpenAI, Anthropic) require `^[a-zA-Z0-9_-]+$`, which excludes dots.
+pub const MCP_NAME_SEPARATOR: &str = "__";
+
+/// Is `name` acceptable for a hand-added MCP server? Stricter than what
+/// the mcp.json parser tolerates: the qualified tool name is
+/// `<server>__<tool>`, so a name that would be rewritten by
+/// [`sanitize_tool_name_segment`] (or that contains the `__` separator
+/// itself) makes the server's tools ambiguous to route. Enforced where
+/// a name arrives from a UI, not where an existing file is read — an
+/// mcp.json written by hand keeps working.
+/// A shared (multiuser) workspace never starts a member-supplied stdio
+/// server: the process runs outside the confiner with the engine's env and
+/// filesystem view (every member's folder), and its approval prompt goes to
+/// a shared approver. HTTP servers and the engine's own servers still run.
+pub fn multiuser_stdio_refusal(config: &McpServerConfig) -> Option<String> {
+    (crate::workdir::is_multiuser() && config.transport != "http" && !config.engine_managed).then(
+        || {
+            format!(
+                "mcp '{}' refused: stdio MCP servers cannot run in a shared workspace — \
+             use an HTTP MCP server instead",
+                config.name
+            )
+        },
+    )
+}
+
+pub fn is_valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.contains(MCP_NAME_SEPARATOR)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Replace any character outside `[A-Za-z0-9_-]` with `_` so the result
+/// fits the OpenAI / Anthropic tool-name regex `^[a-zA-Z0-9_-]+$`. Applied
+/// independently to each segment of the qualified name; the bare tool
+/// name kept on the McpTool struct stays verbatim so server-side
+/// dispatch (e.g. `tools/call name="version"`) still matches.
+pub fn sanitize_tool_name_segment(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".into()
+    } else {
+        out
+    }
+}
+
+impl McpTool {
+    pub fn new(client: Arc<McpClient>, info: McpToolInfo) -> Self {
+        let qualified_name = format!(
+            "{}{}{}",
+            sanitize_tool_name_segment(client.name()),
+            MCP_NAME_SEPARATOR,
+            sanitize_tool_name_segment(&info.name),
+        );
+        let ui_resource_uri = info
+            .ui_resource_uri
+            .map(|s| &*Box::leak(s.into_boxed_str()));
+        Self {
+            client,
+            name: Box::leak(qualified_name.into_boxed_str()),
+            bare: Box::leak(info.name.into_boxed_str()),
+            description: Box::leak(info.description.into_boxed_str()),
+            schema: info.input_schema,
+            ui_resource_uri,
+        }
+    }
+
+    /// Original MCP tool name as advertised by the server, used when
+    /// dispatching `tools/call`. Kept verbatim — must NOT be sanitized.
+    pub fn bare_name(&self) -> &str {
+        self.bare
+    }
+
+    /// MCP-Apps widget URI for this tool, if the server declared one.
+    /// Callers fetch the actual widget HTML via
+    /// [`McpClient::read_resource`].
+    pub fn ui_resource_uri(&self) -> Option<&str> {
+        self.ui_resource_uri
+    }
+
+    /// Borrow the underlying transport so callers (e.g. the agent
+    /// loop) can issue follow-up MCP requests like `resources/read`
+    /// without a second handshake.
+    pub fn client(&self) -> &Arc<McpClient> {
+        &self.client
+    }
+}
+
+impl McpTool {
+    /// docs/browser slice 3: the engine-owned Chromium launches
+    /// LAZILY — when CDP mode is armed, the browser MCP server was
+    /// spawned with `--cdp-endpoint` pointing at a port nothing
+    /// listens on yet. Raise Chromium before the first browser tool
+    /// call connects. No-op (one atomic load) once launched, and a
+    /// failure here just lets the tool call surface its own error.
+    fn is_browser(&self) -> bool {
+        self.client.name() == "browser"
+    }
+
+    /// playwright-mcp reads `paths` (file upload) and writes `filename`
+    /// (snapshots, screenshots, logs) on the local disk with nothing between
+    /// the model and the file system. Hold them to the rules Read and Write
+    /// obey: inside the workspace, and no upload of a protected path
+    /// (`.env`, `.thclaws/` incl. the browser profile, `.git/config`, …) or
+    /// write into one.
+    fn browser_path_guard(&self, input: &Value) -> Result<()> {
+        if !self.is_browser() {
+            return Ok(());
+        }
+        browser_path_guard_with(
+            input,
+            crate::sandbox::Sandbox::root(),
+            crate::sandbox::Sandbox::check,
+            crate::sandbox::Sandbox::check_write,
+        )
+    }
+
+    async fn lazy_browser_up(&self) {
+        if self.client.name() != "browser" || !crate::browser_cdp::cdp_active() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(crate::browser_cdp::ensure_up).await;
+    }
+}
+
+fn browser_path_guard_with(
+    input: &Value,
+    root: Option<std::path::PathBuf>,
+    check_read: impl Fn(&str) -> Result<std::path::PathBuf>,
+    check_write: impl Fn(&str) -> Result<std::path::PathBuf>,
+) -> Result<()> {
+    if let Some(paths) = input.get("paths").and_then(Value::as_array) {
+        for p in paths {
+            let raw = p.as_str().ok_or_else(|| {
+                crate::error::Error::Tool("browser: every upload path must be a string".into())
+            })?;
+            let resolved = check_read(raw)?;
+            let hit = root.as_deref().and_then(|r| {
+                crate::sandbox::protected_match(r, &resolved)
+                    .filter(|h| h.kind != crate::sandbox::ProtectedKind::Instructions)
+            });
+            if let Some(hit) = hit {
+                return Err(crate::error::Error::Tool(format!(
+                    "access denied: {} is a protected path ({}) and may not be uploaded to a \
+                     web page",
+                    resolved.display(),
+                    hit.rel
+                )));
+            }
+        }
+    }
+    if let Some(name) = input.get("filename").and_then(Value::as_str) {
+        check_write(name)?;
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn audit_kind(&self) -> crate::audit::AuditToolKind {
+        crate::audit::AuditToolKind::Mcp
+    }
+
+    fn audit_mcp_server(&self) -> Option<&str> {
+        self.name.split(MCP_NAME_SEPARATOR).next()
+    }
+
+    fn audit_summary(&self, _input: &Value) -> Option<crate::tools::AuditSummary> {
+        Some(crate::tools::AuditSummary::text(self.bare))
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        self.browser_path_guard(&input)?;
+        self.lazy_browser_up().await;
+        let out = self.client.call_tool(self.bare_name(), input).await?;
+        crate::office::apps::after_call(&self.client, self.bare_name(), &out).await;
+        Ok(out)
+    }
+
+    /// Multimodal variant: preserves `{type:"image"}` content blocks so
+    /// vision models can actually SEE what an MCP tool returns — most
+    /// importantly `browser_take_screenshot`, whose image the plain
+    /// text path (`extract_text`) silently dropped, leaving the agent
+    /// blind to canvases/charts/visual layouts the accessibility
+    /// snapshot can't express. Text-only results keep the exact
+    /// `call()` behavior; non-multimodal providers still get the text
+    /// blocks via `ToolResultContent::to_text()`.
+    async fn call_multimodal(&self, input: Value) -> Result<crate::types::ToolResultContent> {
+        self.browser_path_guard(&input)?;
+        self.lazy_browser_up().await;
+        let result = self.client.call_tool_raw(self.bare_name(), input).await?;
+        if crate::office::apps::is_office_server(self.client.name()) {
+            crate::office::apps::after_call(
+                &self.client,
+                self.bare_name(),
+                &extract_text(&result, self.bare_name()),
+            )
+            .await;
+        }
+        match mcp_content_to_blocks(&result, self.bare_name()) {
+            Some(blocks) => Ok(blocks),
+            None => Ok(crate::types::ToolResultContent::Text(extract_text(
+                &result,
+                self.bare_name(),
+            ))),
+        }
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        // MCP tools can be arbitrary — default to requiring approval until
+        // a per-tool allow-list / annotation mechanism lands.
+        true
+    }
+
+    /// Uploading a local file to a web page sends it off the machine, under
+    /// the browser's logged-in sessions — ask even in auto mode.
+    fn forces_approval(&self, _input: &Value) -> bool {
+        self.is_browser() && self.bare_name() == "browser_file_upload"
+    }
+
+    fn approval_summary(&self, input: &Value) -> Option<String> {
+        if !(self.is_browser() && self.bare_name() == "browser_file_upload") {
+            return None;
+        }
+        let files: Vec<&str> = input
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        Some(format!(
+            "UPLOADS {} to the page open in the browser",
+            if files.is_empty() {
+                "nothing (cancels the file chooser)".to_string()
+            } else {
+                files.join(", ")
+            }
+        ))
+    }
+
+    async fn fetch_ui_resource(&self) -> Option<crate::tools::UiResource> {
+        let uri = self.ui_resource_uri?;
+        // Trust gate: widget HTML is third-party code rendered inside
+        // chat. Only servers that came in via the marketplace install
+        // path (or were manually flagged `trusted: true` in mcp.json)
+        // are allowed to render. Untrusted servers still work as
+        // plain MCPs — the model sees their tool result text — but
+        // no inline iframe. Power-user diagnosis hint logged once.
+        if !self.client.is_trusted() {
+            eprintln!(
+                "\x1b[2m[mcp] {}: ignoring widget resource {uri} (server not trusted; install via marketplace or set `trusted: true` in mcp.json to enable)\x1b[0m",
+                self.client.name()
+            );
+            return None;
+        }
+        match self.client.read_resource(uri).await {
+            Ok((html, mime, allow_same_origin, auto_size)) => Some(crate::tools::UiResource {
+                uri: uri.to_string(),
+                html,
+                mime,
+                // Honor the server's request — already gated by the
+                // trust check above. Untrusted servers never reach this
+                // arm so a third-party widget can never escalate.
+                allow_same_origin,
+                auto_size,
+            }),
+            Err(e) => {
+                eprintln!(
+                    "\x1b[33m[mcp] {}: failed to fetch ui resource {uri}: {e}\x1b[0m",
+                    self.client.name()
+                );
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport helpers
+// ---------------------------------------------------------------------------
+
+/// Write response data into the duplex pipe. Handles both plain JSON and
+/// SSE (`text/event-stream`) responses — MCP Streamable HTTP servers can
+/// return either depending on the request.
+async fn write_body_to_pipe(writer: &mut tokio::io::DuplexStream, body: &str, content_type: &str) {
+    use tokio::io::AsyncWriteExt;
+    if content_type.contains("text/event-stream") {
+        for line in body.lines() {
+            if let Some(data) = line.trim().strip_prefix("data:").map(str::trim) {
+                if data.is_empty() {
+                    continue;
+                }
+                let _ = writer.write_all(data.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+                let _ = writer.flush().await;
+            }
+        }
+    } else {
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let _ = writer.write_all(line.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_response_lines(
+    writer: &mut tokio::io::DuplexStream,
+    resp: reqwest::Response,
+    session_id: &std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    client: &reqwest::Client,
+    bearer: Option<&str>,
+    body_sent: &str,
+    original_url: &str,
+    extra_headers: &HashMap<String, String>,
+    mcp_sid: Option<&str>,
+) {
+    let status = resp.status();
+
+    // Handle 307/308 redirects manually: the server may redirect /mcp →
+    // /mcp/ with an http:// Location (broken scheme behind a TLS proxy).
+    // We fix the scheme to https:// and re-POST with all headers intact
+    // (reqwest's auto-redirect strips Authorization).
+    if status == reqwest::StatusCode::TEMPORARY_REDIRECT
+        || status == reqwest::StatusCode::PERMANENT_REDIRECT
+    {
+        if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
+            // Fix http → https if the original URL was https.
+            let fixed = if loc.starts_with("http://") && original_url.starts_with("https://") {
+                loc.replacen("http://", "https://", 1)
+            } else {
+                loc.to_string()
+            };
+            mcp_debug!("\x1b[2m[mcp-http] following redirect → {fixed}\x1b[0m");
+            let mut req = client
+                .post(&fixed)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(t) = bearer {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            if let Some(s) = mcp_sid {
+                req = req.header("mcp-session-id", s);
+            }
+            for (k, v) in extra_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            match req.body(body_sent.to_string()).send().await {
+                Ok(redirected) => {
+                    let rstatus = redirected.status();
+                    if let Some(sid) = redirected
+                        .headers()
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        *session_id.lock().await = Some(sid.to_string());
+                    }
+                    let ct = redirected
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    mcp_debug!(
+                        "\x1b[2m[mcp-http] redirected response: status={rstatus}, content-type={ct}\x1b[0m"
+                    );
+                    match redirected.text().await {
+                        Ok(rbody) => {
+                            if !rbody.is_empty() {
+                                mcp_debug!(
+                                    "\x1b[2m[mcp-http] redirected body ({}B): {}\x1b[0m",
+                                    rbody.len(),
+                                    rbody.chars().take(300).collect::<String>()
+                                );
+                            }
+                            write_body_to_pipe(writer, &rbody, &ct).await;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "\x1b[31m[mcp-http] failed to read redirected body: {e}\x1b[0m"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31m[mcp-http] redirect POST failed: {e}\x1b[0m");
+                }
+            }
+            return;
+        }
+    }
+
+    // Capture Mcp-Session-Id header from the response.
+    if let Some(sid) = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        *session_id.lock().await = Some(sid.to_string());
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if let Ok(body) = resp.text().await {
+        if !body.is_empty() {
+            mcp_debug!(
+                "\x1b[2m[mcp-http] body ({}B): {}\x1b[0m",
+                body.len(),
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        write_body_to_pipe(writer, &body, &content_type).await;
+    }
+}
+
+/// Pre-resolve an OAuth token before the bridge task starts. Runs the
+/// full discovery + browser flow if needed so the bridge never blocks on
+/// OAuth during the time-sensitive MCP initialize handshake.
+/// Substitute `${VAR}` occurrences in `s` with the corresponding
+/// environment variable. Used on MCP header values so a secret can be
+/// stored as `"X-API-KEY": "${MY_KEY}"` in mcp.json and resolved from
+/// the environment (or `.env`, already loaded into the process env at
+/// startup) at connection time — keeping the literal secret out of the
+/// committed config. An unset variable is left as the literal `${VAR}`
+/// so the misconfiguration is visible (a bogus header → a diagnosable
+/// 401) rather than silently sent as an empty value. `$VAR` without
+/// braces is intentionally NOT expanded — header values legitimately
+/// contain bare `$`.
+fn interpolate_env(s: &str) -> String {
+    interpolate_with(s, |k| std::env::var(k).ok())
+}
+
+/// Core of [`interpolate_env`], parametrized on the variable lookup so
+/// it's testable without mutating process env (which races with the
+/// `posix_spawn` in the scheduler tests under the parallel runner).
+fn interpolate_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let var = &after[..end];
+            match lookup(var) {
+                Some(val) => out.push_str(&val),
+                // Unset → keep the literal `${VAR}` for visibility.
+                None => {
+                    out.push_str("${");
+                    out.push_str(var);
+                    out.push('}');
+                }
+            }
+            rest = &after[end + 1..];
+        } else {
+            // No closing brace — emit the rest verbatim and stop.
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Outcome of the upfront auth probe in [`McpClient::connect_http`].
+enum UpfrontToken {
+    /// Proceed to build the bridge with this optional bearer token.
+    Proceed(Option<String>),
+    /// Server demands OAuth and the caller asked us NOT to run the
+    /// interactive browser flow (`/mcp add`). The caller bails with a
+    /// "run /mcp reauth" message instead of blocking on a browser
+    /// callback. Issue #114.
+    OAuthRequired,
+}
+
+async fn resolve_token_upfront(
+    client: &reqwest::Client,
+    mcp_url: &str,
+    server_name: &str,
+    extra_headers: &HashMap<String, String>,
+    interactive: bool,
+) -> UpfrontToken {
+    let mut store = crate::oauth::TokenStore::load();
+
+    // Try cached token (or refreshed) — but ALWAYS verify against the
+    // server with a probe POST. A token can be "valid" by expiry but
+    // revoked server-side.
+    let mut candidate: Option<String> = None;
+
+    if let Some(entry) = store.get(mcp_url) {
+        if crate::oauth::is_valid(entry) {
+            candidate = Some(entry.access_token.clone());
+        } else if entry.refresh_token.is_some() {
+            mcp_debug!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
+            match crate::oauth::refresh(client, entry).await {
+                Ok(new_entry) => {
+                    candidate = Some(new_entry.access_token.clone());
+                    store.set(mcp_url, new_entry);
+                }
+                Err(e) => {
+                    mcp_debug!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e})\x1b[0m");
+                    store.remove(mcp_url);
+                }
+            }
+        }
+    }
+
+    // Auth probe: send a `ping` (valid JSON-RPC but no side effects, no
+    // session creation). This ensures the server actually validates auth
+    // on the request.
+    let mut req = client
+        .post(mcp_url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#);
+    for (k, v) in extra_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(ref t) = candidate {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+
+    mcp_debug!(
+        "\x1b[2m[mcp-http] {server_name}: probing with ping (token: {})\x1b[0m",
+        if candidate.is_some() { "yes" } else { "none" }
+    );
+    let probe = req.send().await;
+    match probe {
+        Ok(r) if r.status().as_u16() == 401 => {
+            if candidate.is_some() {
+                mcp_debug!("\x1b[33m[mcp-http] {server_name}: token rejected (401)\x1b[0m");
+                store.remove(mcp_url);
+            }
+            if !interactive {
+                // `/mcp add`: don't pop a browser mid-command. Signal the
+                // caller to save the server and defer to `/mcp reauth`.
+                mcp_debug!("\x1b[36m[mcp-http] {server_name}: OAuth required (non-interactive — deferring)\x1b[0m");
+                return UpfrontToken::OAuthRequired;
+            }
+            // KEEP this on by default — a browser window is about to
+            // pop up and the user needs to know why.
+            eprintln!("\x1b[36m[mcp-http] {server_name}: server requires OAuth — starting browser flow…\x1b[0m");
+        }
+        Ok(r) => {
+            let status = r.status();
+            mcp_debug!("\x1b[2m[mcp-http] {server_name}: probe → {status} (auth OK)\x1b[0m");
+            return UpfrontToken::Proceed(candidate);
+        }
+        Err(e) => {
+            eprintln!("\x1b[33m[mcp-http] {server_name}: probe failed ({e})\x1b[0m");
+            return UpfrontToken::Proceed(candidate);
+        }
+    }
+
+    // Full OAuth discovery + browser flow (interactive callers only).
+    UpfrontToken::Proceed(resolve_oauth_token(client, mcp_url, server_name).await)
+}
+
+/// Try to get a valid OAuth token for an MCP URL:
+///   1. Check the token store for a cached token → refresh if expired.
+///   2. If no cached token or refresh fails, run the full browser flow.
+///   3. Save the token to the store and return it.
+async fn resolve_oauth_token(
+    client: &reqwest::Client,
+    mcp_url: &str,
+    server_name: &str,
+) -> Option<String> {
+    let mut store = crate::oauth::TokenStore::load();
+
+    // Full OAuth discovery up front — we need the authorization-server
+    // origin to verify that any cached entry was issued by the SAME AS
+    // currently advertised for this MCP URL. This blocks token-cache
+    // confusion if an attacker swaps the advertised AS under a
+    // previously-trusted MCP URL.
+    let meta = match crate::oauth::discover(client, mcp_url).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("\x1b[31m[mcp-http] {server_name}: OAuth discovery failed: {e}\x1b[0m");
+            return None;
+        }
+    };
+    let expected_as = meta.authorization_server_origin.clone();
+
+    if let Some(entry) = store.get_validated(mcp_url, &expected_as) {
+        if crate::oauth::is_valid(entry) {
+            return Some(entry.access_token.clone());
+        }
+        if entry.refresh_token.is_some() {
+            mcp_debug!("\x1b[36m[mcp-http] {server_name}: refreshing expired token…\x1b[0m");
+            match crate::oauth::refresh(client, entry).await {
+                Ok(new_entry) => {
+                    store.set(mcp_url, new_entry.clone());
+                    return Some(new_entry.access_token);
+                }
+                Err(e) => {
+                    mcp_debug!("\x1b[33m[mcp-http] {server_name}: refresh failed ({e}), re-authorizing…\x1b[0m");
+                    store.remove(mcp_url);
+                }
+            }
+        }
+    } else if store.get(mcp_url).is_some() {
+        // Entry exists but is either legacy (no AS binding) or bound to
+        // a different AS. Treat as untrusted and re-authorize.
+        eprintln!(
+            "\x1b[33m[mcp-http] {server_name}: cached token not bound to current authorization server — re-authorizing\x1b[0m"
+        );
+        store.remove(mcp_url);
+    }
+
+    match crate::oauth::authorize(client, &meta, mcp_url).await {
+        Ok(entry) => {
+            let at = entry.access_token.clone();
+            store.set(mcp_url, entry);
+            Some(at)
+        }
+        Err(e) => {
+            eprintln!("\x1b[31m[mcp-http] {server_name}: OAuth authorization failed: {e}\x1b[0m");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /mcp reauth — slash-command-driven re-authorization
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`reauth_server`] for a slash-command UI surface.
+pub enum ReauthOutcome {
+    /// Laptop loopback flow completed — the user's browser was opened
+    /// and a fresh token has already been written to the store. The
+    /// embedded string is the line to display to the user.
+    Completed(String),
+    /// Pod public-callback flow initiated — `auth_url` is the link the
+    /// owner must click in their laptop browser. After they consent
+    /// the provider's redirect lands on `/v1/oauth/callback` and the
+    /// token writes itself; no further user action in thClaws.
+    Pending {
+        auth_url: String,
+        server_name: String,
+    },
+}
+
+/// Re-authorize the MCP server named `name`. Looks up the URL from
+/// the merged mcp.json (project ∪ user), clears any cached token,
+/// then runs either the laptop loopback flow (when
+/// `THCLAWS_PUBLIC_BASE_URL` is unset) or the pod public-callback
+/// flow.
+///
+/// `base_url_override` lets a caller force the pod path even on a
+/// laptop — useful for testing the headless flow. `None` consults
+/// `THCLAWS_PUBLIC_BASE_URL` from the environment.
+pub async fn reauth_server(
+    name: &str,
+    base_url_override: Option<&str>,
+) -> crate::error::Result<ReauthOutcome> {
+    let config = crate::config::AppConfig::load()?;
+    // Search the same merged set the runtime spawns: mcp.json (project ∪
+    // user) plus plugin-contributed servers. Without the plugin merge a
+    // plugin's HTTP server can't be reauthed even though it's listed and
+    // live. Config wins on a name clash.
+    let mut servers = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !servers.iter().any(|s| s.name == p_mcp.name) {
+            servers.push(p_mcp);
+        }
+    }
+    let server = servers.iter().find(|s| s.name == name).ok_or_else(|| {
+        crate::error::Error::Config(format!("no MCP server named '{name}' (try /mcp to list)"))
+    })?;
+    if !server.transport.eq_ignore_ascii_case("http") {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has transport '{}' — /mcp reauth only applies to HTTP servers (OAuth)",
+            server.transport
+        )));
+    }
+    if server.url.trim().is_empty() {
+        return Err(crate::error::Error::Config(format!(
+            "server '{name}' has no `url` set"
+        )));
+    }
+    let mcp_url = server.url.clone();
+
+    // Drop any cached token so subsequent MCP calls re-discover the
+    // newly-issued one (instead of racing the still-cached entry).
+    {
+        let mut store = crate::oauth::TokenStore::load();
+        store.remove(&mcp_url);
+        store.save();
+    }
+
+    let client = reqwest::Client::new();
+    let meta = crate::oauth::discover(&client, &mcp_url).await?;
+
+    let public_base = base_url_override
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("THCLAWS_PUBLIC_BASE_URL").ok())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(base) = public_base {
+        // Pod / headless flow.
+        let redirect_uri = format!("{base}/v1/oauth/callback");
+        let begin = crate::oauth::begin_authorize(&client, &meta, &redirect_uri).await?;
+        crate::api_v1::oauth_callback::insert_pending(
+            begin.state.clone(),
+            crate::api_v1::oauth_callback::PendingAuth {
+                code_verifier: begin.code_verifier.clone(),
+                redirect_uri: begin.redirect_uri.clone(),
+                client_id: begin.client_id.clone(),
+                client_secret: begin.client_secret.clone(),
+                scope: begin.scope.clone(),
+                token_endpoint: meta.token_endpoint.clone(),
+                authorization_server_origin: meta.authorization_server_origin.clone(),
+                server_url: mcp_url.clone(),
+                expires_at: 0, // overwritten on insert
+            },
+        );
+        return Ok(ReauthOutcome::Pending {
+            auth_url: begin.auth_url,
+            server_name: name.to_string(),
+        });
+    }
+
+    // Laptop loopback flow.
+    let entry = crate::oauth::authorize(&client, &meta, &mcp_url).await?;
+    let mut store = crate::oauth::TokenStore::load();
+    store.set(&mcp_url, entry);
+    store.save();
+    Ok(ReauthOutcome::Completed(format!(
+        "[mcp] reauth complete for '{name}' — token cached for {mcp_url}"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_uploads_stay_in_the_workspace_and_off_protected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("report.pdf"), b"x").unwrap();
+        std::fs::write(root.join(".env"), b"KEY=1").unwrap();
+        std::fs::write(root.join("AGENTS.md"), b"x").unwrap();
+        std::fs::create_dir_all(root.join(".thclaws/state/browser-profile")).unwrap();
+        std::fs::write(
+            root.join(".thclaws/state/browser-profile/thclaws-cookies.json"),
+            b"[]",
+        )
+        .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("id_rsa"), b"k").unwrap();
+
+        let read = |p: &str| crate::sandbox::Sandbox::check_in(&root, p);
+        let write = |p: &str| {
+            let r = crate::sandbox::Sandbox::check_in(&root, p)?;
+            match crate::sandbox::protected_match(&root, &r) {
+                Some(_) => Err(crate::error::Error::Tool("protected".into())),
+                None => Ok(r),
+            }
+        };
+        let guard = |v: Value| browser_path_guard_with(&v, Some(root.clone()), read, write);
+
+        assert!(guard(json!({"paths": ["report.pdf"]})).is_ok());
+        assert!(guard(json!({"paths": ["AGENTS.md"]})).is_ok());
+        assert!(guard(json!({})).is_ok());
+        for bad in [
+            ".env",
+            ".thclaws/state/browser-profile/thclaws-cookies.json",
+            "../etc/passwd",
+        ] {
+            assert!(guard(json!({"paths": [bad]})).is_err(), "{bad}");
+        }
+        let abs = outside.path().join("id_rsa");
+        assert!(guard(json!({"paths": [abs.to_str().unwrap()]})).is_err());
+        assert!(guard(json!({"paths": ["report.pdf", 7]})).is_err());
+        assert!(guard(json!({"filename": "snap.md"})).is_ok());
+        assert!(guard(json!({"filename": ".thclaws/settings.json"})).is_err());
+    }
+
+    /// Approving one npx package must not approve the next one.
+    #[test]
+    fn the_spawn_allowlist_keys_on_the_whole_command_line() {
+        let server = |args: &[&str]| McpServerConfig {
+            name: "x".into(),
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: HashMap::new(),
+            url: String::new(),
+            headers: HashMap::new(),
+            trusted: false,
+            engine_managed: false,
+        };
+        let weather = invocation(&server(&["-y", "open-meteo-mcp-server@2.5.2"]));
+        let clock = invocation(&server(&["-y", "time-mcp@1.0.6"]));
+        assert_ne!(weather, clock);
+        let mut list = McpAllowlist::default();
+        list.insert(&weather);
+        assert!(list.contains(&weather) && !list.contains(&clock));
+        // A pre-fix file holding the bare command no longer covers a package.
+        let legacy = McpAllowlist {
+            commands: vec!["npx".into()],
+        };
+        assert!(!legacy.contains(&clock));
+    }
+
+    #[test]
+    fn a_bare_legacy_entry_covers_only_the_users_own_servers() {
+        let server = |name: &str, args: &[&str]| McpServerConfig {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: HashMap::new(),
+            url: String::new(),
+            headers: HashMap::new(),
+            trusted: false,
+            engine_managed: false,
+        };
+        let mine = server("weather", &["-y", "open-meteo-mcp-server@2.5.2"]);
+        let user_level = vec![mine.clone()];
+        let legacy = McpAllowlist {
+            commands: vec!["npx".into()],
+        };
+        assert!(legacy.grandfathers(&mine, &user_level));
+        // A project's server — not in the user's mcp.json — gets no pass,
+        // nor does one that reuses a user server's name with other args.
+        let cloned = server("evil", &["-y", "evil-pkg"]);
+        assert!(!legacy.grandfathers(&cloned, &user_level));
+        let renamed = server("weather", &["-y", "evil-pkg"]);
+        assert!(!legacy.grandfathers(&renamed, &user_level));
+        // Without the bare entry there is nothing to grandfather.
+        let empty = McpAllowlist::default();
+        assert!(!empty.grandfathers(&mine, &user_level));
+        // A command-line entry from before env/cwd joined the key covers the
+        // user's own unchanged server, not one with a different env.
+        let line = McpAllowlist {
+            commands: vec![invocation(&mine)],
+        };
+        assert!(line.grandfathers(&mine, &user_level));
+        let mut poisoned = mine.clone();
+        poisoned
+            .env
+            .insert("NODE_OPTIONS".into(), "--require ./x.js".into());
+        assert!(!line.grandfathers(&poisoned, &user_level));
+    }
+
+    /// Audit 2026-11-01 #6: an approved command line re-used with another
+    /// env or from another folder is a new spawn, and env keys that redirect
+    /// the program never reach the child.
+    #[test]
+    fn the_spawn_key_covers_env_and_cwd_and_blocked_env_is_dropped() {
+        let base = McpServerConfig {
+            name: "x".into(),
+            transport: "stdio".into(),
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            env: HashMap::new(),
+            url: String::new(),
+            headers: HashMap::new(),
+            trusted: false,
+            engine_managed: false,
+        };
+        let here = std::path::Path::new("/work/a");
+        let k = spawn_key(&base, here);
+        let mut env = base.clone();
+        env.env
+            .insert("NODE_OPTIONS".into(), "--require ./x.js".into());
+        assert_ne!(spawn_key(&env, here), k);
+        assert_ne!(spawn_key(&base, std::path::Path::new("/work/b")), k);
+        assert!(!spawn_key(&env, here).contains("--require"));
+        env.env.insert("API_TOKEN".into(), "t".into());
+        let kept: Vec<&String> = spawn_env(&env).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kept, [&"API_TOKEN".to_string()]);
+    }
+    use tokio::io::duplex;
+
+    /// The handshake gets a far longer budget than a tool call, because a
+    /// cold `uvx`/`npx` server installs its dependencies before it can answer
+    /// `initialize` at all. Collapsing the two back into one constant is the
+    /// regression this guards: it either resurrects the 30 s cold-start
+    /// failure or blunts stall detection on every subsequent call.
+    #[test]
+    fn initialize_gets_a_longer_budget_than_a_tool_call() {
+        assert!(
+            INIT_TIMEOUT_SECS > REQUEST_TIMEOUT_SECS,
+            "the initialize budget must exceed the per-request one"
+        );
+    }
+
+    #[test]
+    fn timeout_overrides_parse_or_fall_back() {
+        assert_eq!(parse_timeout(None, 30), 30, "unset → default");
+        assert_eq!(parse_timeout(Some("120"), 30), 120);
+        assert_eq!(
+            parse_timeout(Some(" 45 "), 30),
+            45,
+            "surrounding space tolerated"
+        );
+
+        // Zero would mean "expire immediately", and a non-number means the
+        // operator mistyped. Neither should silently reshape the deadline.
+        for bad in ["0", "abc", "-5", "", "   "] {
+            assert_eq!(parse_timeout(Some(bad), 30), 30, "{bad:?} should fall back");
+        }
+    }
+
+    #[test]
+    fn mcp_content_to_blocks_preserves_images() {
+        use crate::types::{ToolResultBlock, ToolResultContent};
+        // text-only → None (caller keeps the plain-text path)
+        let text_only = serde_json::json!({"content":[{"type":"text","text":"hi"}]});
+        assert!(mcp_content_to_blocks(&text_only, "t").is_none());
+
+        // image + text → Blocks in server order, mime preserved
+        let mixed = serde_json::json!({"content":[
+            {"type":"image","data":"aGVsbG8=","mimeType":"image/jpeg"},
+            {"type":"text","text":"viewport screenshot"},
+        ]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&mixed, "t") else {
+            panic!("expected blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ToolResultBlock::Image { source: crate::types::ImageSource::Base64 { media_type, .. } }
+                if media_type == "image/jpeg"
+        ));
+        assert!(
+            matches!(&blocks[1], ToolResultBlock::Text { text } if text == "viewport screenshot")
+        );
+
+        // oversize image degrades to a text note + synthetic text block
+        let big = "A".repeat((5 * 1024 * 1024 / 3 * 4) + 8);
+        let oversize =
+            serde_json::json!({"content":[{"type":"image","data": big,"mimeType":"image/png"}]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&oversize, "t") else {
+            panic!("expected blocks");
+        };
+        assert!(blocks
+            .iter()
+            .all(|b| matches!(b, ToolResultBlock::Text { .. })));
+        assert!(
+            matches!(&blocks[0], ToolResultBlock::Text { text } if text.contains("image omitted"))
+        );
+    }
+
+    /// Security property of the allowlist bypass: `engine_managed` is
+    /// `#[serde(skip)]`, so a malicious mcp.json declaring it cannot
+    /// grant itself the no-prompt spawn. Only Rust code can set it.
+    #[test]
+    fn engine_managed_cannot_be_set_from_json() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"evil","command":"rm","args":["-rf","/"],"engine_managed":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !cfg.engine_managed,
+            "serde must ignore engine_managed from JSON"
+        );
+
+        // And the engine's own browser config does carry the flag.
+        let browser = crate::config::AppConfig::browser_mcp_config(Some(true));
+        assert!(browser.engine_managed);
+        assert_eq!(browser.name, "browser");
+        assert_eq!(browser.command, "npx");
+        assert!(browser.args.iter().any(|a| a == "--headless"));
+        let headed = crate::config::AppConfig::browser_mcp_config(Some(false));
+        assert!(!headed.args.iter().any(|a| a == "--headless"));
+    }
+
+    /// A stdio server whose launcher dies before the handshake must
+    /// report the launcher's own stderr and the command that fixes it.
+    /// Before this, every such failure read only "mcp transport
+    /// closed" — the symptom, with the cause thrown away by
+    /// `Stdio::null()`.
+    #[tokio::test]
+    async fn stdio_start_failure_reports_child_stderr_and_fix() {
+        let cfg = McpServerConfig {
+            name: "browser".into(),
+            transport: "stdio".into(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo \"npm error code ENOTEMPTY\" >&2; \
+                 echo \"npm error ENOTEMPTY: directory not empty, rename \
+                 '/home/u/.npm/_npx/9833c18b2d85bc59/node_modules/playwright'\" >&2; \
+                 exit 1"
+                    .into(),
+            ],
+            env: HashMap::new(),
+            url: String::new(),
+            headers: HashMap::new(),
+            trusted: false,
+            // Skips the allowlist prompt, as the injected `browser`
+            // server does in the real failure this reproduces.
+            engine_managed: true,
+        };
+
+        let err = McpClient::spawn(cfg).await.unwrap_err().to_string();
+        // WHICH mcp-layer error surfaces is a race, not a contract: if the
+        // reader notices the dead child first, the handshake fails as "mcp
+        // transport closed"; if the write wins, it fails as "mcp write:
+        // Broken pipe". Linux loses that race nearly always and macOS nearly
+        // never, so pinning the macOS spelling here shipped a CI that could
+        // only ever be red — the test job runs on ubuntu alone, so this never
+        // passed there once. Assert the framing, not the winner.
+        assert!(err.contains("mcp"), "not reported as an mcp failure: {err}");
+        // What the test is actually about, and what holds down either path:
+        // the launcher's own stderr and the command that fixes it reach the
+        // user instead of being swallowed with the child.
+        assert!(err.contains("ENOTEMPTY"), "stderr tail missing: {err}");
+        assert!(
+            err.contains("rm -rf /home/u/.npm/_npx/9833c18b2d85bc59"),
+            "fix hint missing: {err}"
+        );
+    }
+
+    /// The takeover in `ipc.rs` reaches the mouse tools through
+    /// `call_tool`, which takes a name and never consults `list_tools`.
+    /// Hiding them from the model must therefore leave that path intact —
+    /// so the list this filter uses has to stay a SUBSET of what the
+    /// takeover is allowed to call, never the other way round.
+    #[test]
+    fn hidden_browser_tools_do_not_break_the_takeover_path() {
+        // Mirrors ipc.rs `browser_input_call` ALLOWED.
+        const TAKEOVER_ALLOWED: &[&str] = &[
+            "browser_mouse_click_xy",
+            "browser_mouse_move_xy",
+            "browser_mouse_drag_xy",
+            "browser_mouse_down",
+            "browser_mouse_up",
+            "browser_mouse_wheel",
+            "browser_press_key",
+            "browser_navigate",
+            "browser_navigate_back",
+        ];
+        // Every mouse tool the takeover uses is hidden from the model...
+        for t in TAKEOVER_ALLOWED.iter().filter(|t| t.contains("mouse")) {
+            assert!(
+                BROWSER_MODEL_HIDDEN_TOOLS.contains(t),
+                "{t} is a takeover-only tool and should not cost the model schema"
+            );
+        }
+        // ...and nothing the MODEL still needs to drive a page got hidden.
+        for t in [
+            "browser_navigate",
+            "browser_navigate_back",
+            "browser_press_key",
+            "browser_snapshot",
+            "browser_find",
+            "browser_click",
+            "browser_type",
+            "browser_fill_form",
+            "browser_select_option",
+            "browser_take_screenshot",
+            "browser_wait_for",
+        ] {
+            assert!(
+                !BROWSER_MODEL_HIDDEN_TOOLS.contains(&t),
+                "{t} is how the model drives a page — it must stay registered"
+            );
+        }
+    }
+
+    /// Text was the one unbounded thing in a tool result: images were
+    /// capped from the start, so a single `browser_snapshot` of a heavy
+    /// page could hand the model the whole accessibility tree.
+    #[test]
+    fn oversize_mcp_text_is_truncated_on_a_char_boundary() {
+        let _g = crate::kms::test_env_lock();
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "64");
+        // Multi-byte on purpose: a naive slice at 64 would split the Thai
+        // characters and panic.
+        let big = "ก".repeat(200);
+        let out = cap_mcp_text(big.clone(), "t");
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+
+        assert!(out.len() < big.len(), "oversize text must shrink");
+        assert!(out.contains("truncated at"), "must say it truncated: {out}");
+        // Points at the cheaper tool rather than leaving the model to guess.
+        assert!(out.contains("browser_find"), "must name the narrower tool");
+        assert!(
+            out.starts_with('\u{e01}'),
+            "kept prefix must still be valid text"
+        );
+    }
+
+    /// A cap that fires on short results would break every ordinary tool.
+    #[test]
+    fn normal_mcp_text_passes_through_untouched() {
+        let _g = crate::kms::test_env_lock();
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+        let text = "a short tool result".to_string();
+        assert_eq!(cap_mcp_text(text.clone(), "t"), text);
+    }
+
+    /// One 889 KB snapshot cost 65,000 tokens under the blanket cap and still
+    /// dropped 71% of the page. The tool that reaches the cap every time gets
+    /// its own, tighter one — and a truncation notice that names the parameter
+    /// that would have made the call cheap.
+    #[test]
+    fn a_snapshot_is_capped_tighter_than_the_blanket_and_says_how_to_narrow() {
+        let _g = crate::kms::test_env_lock();
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+
+        assert_eq!(tool_text_budget("browser_snapshot"), SNAPSHOT_TEXT_BYTES);
+        assert_eq!(tool_text_budget("browser_click"), MAX_MCP_TEXT_BYTES);
+        assert!(SNAPSHOT_TEXT_BYTES < MAX_MCP_TEXT_BYTES);
+
+        // Over the snapshot budget but under the blanket one: cut here,
+        // untouched for any other tool.
+        let page = "x".repeat(SNAPSHOT_TEXT_BYTES * 2);
+        let out = cap_mcp_text(page.clone(), "browser_snapshot");
+        assert!(out.len() < page.len(), "a big snapshot must shrink");
+        for param in ["depth", "target", "filename"] {
+            assert!(out.contains(param), "the notice must name `{param}`: {out}");
+        }
+        assert_eq!(cap_mcp_text(page.clone(), "browser_click"), page);
+    }
+
+    /// The override is the escape hatch; a per-tool floor that ignored it
+    /// would make raising the cap do nothing for the one tool it exists for.
+    #[test]
+    fn an_explicit_override_beats_the_per_tool_floor() {
+        let _g = crate::kms::test_env_lock();
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "999999");
+        assert_eq!(tool_text_budget("browser_snapshot"), 999_999);
+        std::env::set_var("THCLAWS_MCP_MAX_TEXT_BYTES", "0");
+        assert_eq!(tool_text_budget("browser_snapshot"), 0);
+        let page = "x".repeat(SNAPSHOT_TEXT_BYTES * 2);
+        assert_eq!(cap_mcp_text(page.clone(), "browser_snapshot"), page);
+        std::env::remove_var("THCLAWS_MCP_MAX_TEXT_BYTES");
+    }
+
+    /// A page that misbehaves is read through the network and console lists,
+    /// and those have their own narrowing parameter.
+    #[test]
+    fn the_network_list_is_told_about_filter_not_browser_find() {
+        let hint = narrowing_hint("browser_network_requests");
+        assert!(hint.contains("filter"), "{hint}");
+        assert!(!hint.contains("browser_find"), "{hint}");
+        assert!(narrowing_hint("anything_else").contains("browser_find"));
+    }
+
+    #[test]
+    fn npx_cache_dir_lifted_from_npm_error() {
+        let tail = "npm error ENOTEMPTY: directory not empty, rename \
+                    '/Users/j/.npm/_npx/9833c18b2d85bc59/node_modules/playwright' -> '...'";
+        assert_eq!(
+            npx_cache_dir(tail).as_deref(),
+            Some("/Users/j/.npm/_npx/9833c18b2d85bc59")
+        );
+        assert_eq!(npx_cache_dir("nothing to see here"), None);
+    }
+
+    /// Silence beats a guess: stderr we can't fingerprint gets the raw
+    /// tail and no invented fix.
+    #[test]
+    fn stderr_fix_hint_stays_quiet_on_unknown_shapes() {
+        assert!(stderr_fix_hint("Traceback (most recent call last): KeyError").is_none());
+        assert!(stderr_fix_hint("ENOTEMPTY with no path at all").is_none());
+        assert!(
+            stderr_fix_hint("Error: Executable doesn't exist at /ms-playwright")
+                .unwrap()
+                .contains("playwright install")
+        );
+        assert!(stderr_fix_hint("npm error code ETARGET")
+            .unwrap()
+            .contains("registry has no"));
+    }
+
+    #[test]
+    fn start_failure_message_keeps_error_when_stderr_is_empty() {
+        let err = Error::Provider("mcp transport closed".into());
+        assert_eq!(
+            start_failure_message("npx", &err, &[]),
+            "mcp transport closed"
+        );
+    }
+
+    /// Build a client + a paired server IO that cleanly signals EOF when
+    /// either side drops. Uses TWO duplex pairs — one for each direction —
+    /// so the client's writer and the server's reader aren't coupled via
+    /// `tokio::io::split`, which keeps the underlying stream alive until
+    /// both halves drop.
+    fn paired_streams() -> (
+        Arc<McpClient>,
+        (
+            impl AsyncRead + Send + Unpin + 'static,
+            impl AsyncWrite + Send + Unpin + 'static,
+        ),
+    ) {
+        let (c_write, s_read) = duplex(4096); // client→server
+        let (s_write, c_read) = duplex(4096); // server→client
+        let client = McpClient::from_streams("mock", c_read, c_write, false);
+        (client, (s_read, s_write))
+    }
+
+    /// Run a closure-driven mock MCP server against the server-side streams.
+    async fn run_mock_server<R, W, F>(reader: R, mut writer: W, mut responder: F)
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+        F: FnMut(Value) -> Option<Value> + Send + 'static,
+    {
+        let mut buf = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buf.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let msg: Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if let Some(response) = responder(msg) {
+                        let out = format!("{}\n", serde_json::to_string(&response).unwrap());
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = writer.flush().await;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn jsonrpc_response(id: u64, result: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    fn jsonrpc_error(id: u64, code: i64, message: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message}
+        })
+    }
+
+    #[tokio::test]
+    async fn initialize_handshake_sends_initialize_and_initialized() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let saw_initialize = Arc::new(Mutex::new(false));
+        let saw_initialized = Arc::new(Mutex::new(false));
+        let saw_initialize_cb = saw_initialize.clone();
+        let saw_initialized_cb = saw_initialized.clone();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        *saw_initialize_cb.lock().unwrap() = true;
+                        let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                        Some(jsonrpc_response(
+                            id,
+                            json!({
+                                "protocolVersion": PROTOCOL_VERSION,
+                                "capabilities": {},
+                                "serverInfo": {"name": "mock", "version": "0.0.1"}
+                            }),
+                        ))
+                    }
+                    "notifications/initialized" => {
+                        *saw_initialized_cb.lock().unwrap() = true;
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert!(*saw_initialize.lock().unwrap());
+        assert!(*saw_initialized.lock().unwrap());
+    }
+
+    /// Pins that `McpClient::initialize` captures the optional
+    /// `instructions` field from the InitializeResult per MCP spec.
+    /// Pre-fix the field was silently discarded; the
+    /// `# MCP server instructions` system-prompt section in
+    /// `prompts::build_full_system_prompt` depends on this capture.
+    #[tokio::test]
+    async fn initialize_captures_server_instructions() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"},
+                            "instructions": "  Call list_tasks before todo_add — duplicate detection lives there.  "
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let captured = client.instructions();
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        assert_eq!(
+            captured.as_deref(),
+            Some("Call list_tasks before todo_add — duplicate detection lives there."),
+            "instructions should be captured + trimmed; got {captured:?}",
+        );
+    }
+
+    /// Pins the absent-instructions case — `instructions()` returns
+    /// `None` when the server's InitializeResult didn't include the
+    /// field at all (the common case today; most MCP servers haven't
+    /// adopted the field yet).
+    #[tokio::test]
+    async fn initialize_without_instructions_returns_none() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"}
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            client.instructions().is_none(),
+            "no `instructions` field → None",
+        );
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn list_tools_parses_input_schema() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64);
+                match (method, id) {
+                    ("tools/list", Some(id)) => Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": "echo back the input",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}}
+                                    }
+                                },
+                                {"name": "noop"}
+                            ]
+                        }),
+                    )),
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let tools = client.list_tools().await.expect("list_tools");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "echo back the input");
+        assert_eq!(
+            tools[0].input_schema["properties"]["text"]["type"],
+            "string"
+        );
+        assert_eq!(tools[1].name, "noop");
+        assert_eq!(tools[1].description, "");
+        assert_eq!(tools[1].input_schema["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn list_tools_extracts_ui_resource_uri_from_meta() {
+        // Servers stamp `_meta` (per current MCP spec) on each tool.
+        // We accept both `_meta` and the older `meta` so older
+        // servers that haven't migrated still work.
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64);
+                match (method, id) {
+                    ("tools/list", Some(id)) => Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "tools": [
+                                {
+                                    "name": "text2image",
+                                    "_meta": {
+                                        "ui": {"resourceUri": "ui://pinn/image-viewer"},
+                                        "ui/resourceUri": "ui://pinn/image-viewer"
+                                    }
+                                },
+                                {"name": "version"}
+                            ]
+                        }),
+                    )),
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let tools = client.list_tools().await.expect("list_tools");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert_eq!(tools[0].name, "text2image");
+        assert_eq!(
+            tools[0].ui_resource_uri.as_deref(),
+            Some("ui://pinn/image-viewer"),
+        );
+        assert_eq!(tools[1].name, "version");
+        assert_eq!(tools[1].ui_resource_uri, None);
+    }
+
+    #[tokio::test]
+    async fn read_resource_returns_text_and_mime() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64);
+                match (method, id) {
+                    ("resources/read", Some(id)) => {
+                        let uri = msg
+                            .get("params")
+                            .and_then(|p| p.get("uri"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        assert_eq!(uri, "ui://pinn/image-viewer");
+                        Some(jsonrpc_response(
+                            id,
+                            json!({
+                                "contents": [{
+                                    "uri": uri,
+                                    "mimeType": "text/html;profile=mcp-app",
+                                    "text": "<html>widget</html>"
+                                }]
+                            }),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let (text, mime, allow_same_origin, auto_size) = client
+            .read_resource("ui://pinn/image-viewer")
+            .await
+            .expect("read_resource");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert_eq!(text, "<html>widget</html>");
+        assert_eq!(mime.as_deref(), Some("text/html;profile=mcp-app"));
+        // Defaults — server set neither `_meta.allowSameOrigin` nor
+        // `_meta.autoSize`. The strict sandbox + fixed 480px height
+        // stay on; these are the safety-by-default the opt-in flags
+        // are layered against.
+        assert!(!allow_same_origin);
+        assert!(!auto_size);
+    }
+
+    #[tokio::test]
+    async fn read_resource_propagates_allow_same_origin_when_meta_set() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64);
+                match (method, id) {
+                    ("resources/read", Some(id)) => {
+                        let uri = msg
+                            .get("params")
+                            .and_then(|p| p.get("uri"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        Some(jsonrpc_response(
+                            id,
+                            json!({
+                                "contents": [{
+                                    "uri": uri,
+                                    "mimeType": "text/html;profile=mcp-app",
+                                    "text": "<html>widget</html>",
+                                    "_meta": { "allowSameOrigin": true }
+                                }]
+                            }),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let (_text, _mime, allow_same_origin, _auto_size) = client
+            .read_resource("ui://pinn/preview")
+            .await
+            .expect("read_resource");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert!(allow_same_origin);
+    }
+
+    #[tokio::test]
+    async fn call_tool_returns_joined_text_content() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = msg.get("id").and_then(Value::as_u64)?;
+                match method {
+                    "tools/call" => {
+                        let args = msg
+                            .pointer("/params/arguments")
+                            .cloned()
+                            .unwrap_or(json!({}));
+                        let text = args
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        Some(jsonrpc_response(
+                            id,
+                            json!({
+                                "content": [
+                                    {"type": "text", "text": format!("you said: {text}")},
+                                    {"type": "text", "text": "bye"}
+                                ],
+                                "isError": false
+                            }),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        });
+
+        let out = client
+            .call_tool("echo", json!({"text": "hi"}))
+            .await
+            .expect("call_tool");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert_eq!(out, "you said: hi\nbye");
+    }
+
+    #[tokio::test]
+    async fn call_tool_surfaces_is_error_as_tool_error() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let id = msg.get("id").and_then(Value::as_u64)?;
+                Some(jsonrpc_response(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": "tool exploded"}],
+                        "isError": true
+                    }),
+                ))
+            })
+            .await;
+        });
+
+        let err = client
+            .call_tool("bad", json!({}))
+            .await
+            .expect_err("should error");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        let msg = format!("{err}");
+        assert!(msg.contains("mcp tool bad error"));
+        assert!(msg.contains("tool exploded"));
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_error_response_becomes_provider_error() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let id = msg.get("id").and_then(Value::as_u64)?;
+                Some(jsonrpc_error(id, -32601, "method not found"))
+            })
+            .await;
+        });
+
+        let err = client
+            .request("bogus/method", json!({}))
+            .await
+            .expect_err("should error");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        let msg = format!("{err}");
+        assert!(msg.contains("mcp error"));
+        assert!(msg.contains("method not found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_impls_tool_trait_and_calls_through() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let id = msg.get("id").and_then(Value::as_u64)?;
+                Some(jsonrpc_response(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": "pong"}],
+                        "isError": false
+                    }),
+                ))
+            })
+            .await;
+        });
+
+        // Rename for clarity in the tool test (we need the server name to
+        // be "weatherbot" so the qualified name comes out right).
+        let info = McpToolInfo {
+            name: "ping".into(),
+            description: "say pong".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            ui_resource_uri: None,
+        };
+        let tool = McpTool::new(client.clone(), info);
+
+        // `client.name` is "mock" from paired_streams, so qualified is "mock__ping".
+        assert_eq!(tool.name(), "mock__ping");
+        assert_eq!(tool.bare_name(), "ping");
+        assert_eq!(tool.description(), "say pong");
+        assert!(tool.requires_approval(&json!({})));
+
+        let out = tool.call(json!({})).await.expect("call");
+        drop(tool);
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        assert_eq!(out, "pong");
+    }
+
+    #[test]
+    fn extract_ui_resource_uri_handles_dual_keys() {
+        // Current spec: nested under `ui.resourceUri`. Wins over legacy.
+        let nested = json!({"ui": {"resourceUri": "ui://pinn/image-viewer"}});
+        assert_eq!(
+            extract_ui_resource_uri(Some(&nested)).as_deref(),
+            Some("ui://pinn/image-viewer"),
+        );
+        // Legacy flat key only.
+        let legacy = json!({"ui/resourceUri": "ui://pinn/gallery"});
+        assert_eq!(
+            extract_ui_resource_uri(Some(&legacy)).as_deref(),
+            Some("ui://pinn/gallery"),
+        );
+        // Both set (pinn.ai's case): prefer the current-spec nested form
+        // so future servers that drift the legacy key away from the
+        // canonical value don't silently win.
+        let both = json!({
+            "ui": {"resourceUri": "ui://pinn/image-viewer"},
+            "ui/resourceUri": "ui://pinn/image-viewer-legacy",
+        });
+        assert_eq!(
+            extract_ui_resource_uri(Some(&both)).as_deref(),
+            Some("ui://pinn/image-viewer"),
+        );
+        // Plain tools (no UI) — None.
+        assert_eq!(extract_ui_resource_uri(Some(&json!({}))), None);
+        assert_eq!(extract_ui_resource_uri(None), None);
+        // Wrong shapes don't blow up.
+        assert_eq!(
+            extract_ui_resource_uri(Some(&json!({"ui": "string"}))),
+            None
+        );
+        assert_eq!(
+            extract_ui_resource_uri(Some(&json!({"ui": {"resourceUri": 42}}))),
+            None,
+        );
+    }
+
+    #[test]
+    fn valid_server_name_rejects_what_would_break_tool_routing() {
+        assert!(is_valid_server_name("notion"));
+        assert!(is_valid_server_name("my-server_2"));
+        assert!(!is_valid_server_name(""));
+        // `__` is the qualified-tool-name separator: `a__b__tool` can't
+        // be split back into server + tool unambiguously.
+        assert!(!is_valid_server_name("a__b"));
+        // Anything sanitize_tool_name_segment would rewrite.
+        assert!(!is_valid_server_name("my.server"));
+        assert!(!is_valid_server_name("has space"));
+        assert!(!is_valid_server_name("../etc"));
+        assert!(!is_valid_server_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn sanitize_tool_name_segment_replaces_disallowed_chars() {
+        // Real-world cases: server names with dots, tool names with slashes.
+        assert_eq!(sanitize_tool_name_segment("pinn.ai"), "pinn_ai");
+        assert_eq!(
+            sanitize_tool_name_segment("foo.bar:baz/qux"),
+            "foo_bar_baz_qux"
+        );
+        // Already-safe input is left alone.
+        assert_eq!(sanitize_tool_name_segment("filesystem"), "filesystem");
+        assert_eq!(sanitize_tool_name_segment("read_file-v2"), "read_file-v2");
+        // Empty or all-illegal input still produces a usable identifier.
+        assert_eq!(sanitize_tool_name_segment(""), "_");
+        assert_eq!(sanitize_tool_name_segment("..."), "___");
+    }
+
+    #[tokio::test]
+    async fn qualified_name_sanitizes_server_segment_but_call_uses_raw_bare() {
+        // Reproduces the pinn.ai bug: server name has a dot which leaked
+        // into the qualified name and made OpenAI reject the request.
+        // We don't drive any I/O — only verify the name plumbing.
+        let (c_write, _s_read) = duplex(4096);
+        let (_s_write, c_read) = duplex(4096);
+        let client = McpClient::from_streams("pinn.ai", c_read, c_write, false);
+
+        let info = McpToolInfo {
+            name: "version".into(),
+            description: "get version".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            ui_resource_uri: None,
+        };
+        let tool = McpTool::new(client.clone(), info);
+
+        // Provider-facing identifier must match `^[a-zA-Z0-9_-]+$`.
+        assert_eq!(tool.name(), "pinn_ai__version");
+        // But the bare name dispatched to the MCP server must stay verbatim.
+        assert_eq!(tool.bare_name(), "version");
+    }
+
+    #[tokio::test]
+    async fn transport_closed_fails_pending_requests_cleanly() {
+        let (client, (s_read, s_write)) = paired_streams();
+
+        // Server reads one line and then drops both halves.
+        let server_task = tokio::spawn(async move {
+            let mut buf = BufReader::new(s_read);
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line).await;
+            drop(s_write); // close server→client channel → client reader EOF
+        });
+
+        let err = client
+            .request("tools/list", json!({}))
+            .await
+            .expect_err("should error after pipe closed");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transport closed") || msg.contains("channel dropped"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_after_transport_close_fails_fast_without_30s_timeout() {
+        // M6.15 BUG 4: when the reader task observes EOF it sets the
+        // shared `closed` flag, and subsequent `request` calls
+        // short-circuit with "transport closed" instead of writing to
+        // a dead pipe and waiting REQUEST_TIMEOUT_SECS for the
+        // tokio::time::timeout to fire.
+        let (client, (s_read, s_write)) = paired_streams();
+
+        // Drop server stream halves immediately so the client reader
+        // sees EOF and flips the closed flag.
+        drop(s_read);
+        drop(s_write);
+
+        // Give the reader task a beat to process the EOF and flip the
+        // flag. 50 ms is way under the 30 s timeout we'd otherwise
+        // wait for, but more than enough for the tokio scheduler.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let err = client
+            .request("tools/list", json!({}))
+            .await
+            .expect_err("should fast-fail after close");
+        let elapsed = started.elapsed();
+
+        // Must NOT have waited for REQUEST_TIMEOUT_SECS — anything
+        // close to that would mean we wrote into the dead pipe and
+        // hit the timeout path instead of the closed-flag path.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail expected, took {elapsed:?}",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transport closed"),
+            "expected 'transport closed', got: {msg}",
+        );
+    }
+
+    // ── Fix 4: header ${VAR} interpolation (issue #114) ──────────────
+    // Closure-injected lookup so no process env is mutated (which would
+    // race with the scheduler tests' posix_spawn under the parallel
+    // runner — see config.rs TEST_ENV_LOCK note).
+    #[test]
+    fn interpolate_with_resolves_braced_vars_only() {
+        let env = |k: &str| match k {
+            "FD_KEY" => Some("secret123".to_string()),
+            "A" => Some("aa".to_string()),
+            "B" => Some("bb".to_string()),
+            _ => None,
+        };
+        // Braced var resolves.
+        assert_eq!(interpolate_with("${FD_KEY}", env), "secret123");
+        assert_eq!(
+            interpolate_with("Bearer ${FD_KEY}", env),
+            "Bearer secret123"
+        );
+        // Multiple vars in one value.
+        assert_eq!(interpolate_with("${A}-${B}", env), "aa-bb");
+        // Unset var → literal preserved (visible misconfig, not silent empty).
+        assert_eq!(interpolate_with("${MISSING}", env), "${MISSING}");
+        // Bare $ is NOT expanded (header values legitimately contain `$`).
+        assert_eq!(interpolate_with("$FD_KEY", env), "$FD_KEY");
+        // No interpolation token.
+        assert_eq!(interpolate_with("plain-value", env), "plain-value");
+        // Unterminated brace → emitted verbatim, no panic.
+        assert_eq!(interpolate_with("${oops", env), "${oops");
+    }
+
+    // ── Fix 1 + Fix 3: probe sends configured headers; non-interactive
+    //    401 defers to OAuth instead of blocking. Wiremock — no real API.
+    #[tokio::test]
+    async fn probe_sends_headers_and_defers_oauth_when_noninteractive() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Server A: requires X-API-KEY. Probe ping with the header → 200.
+        let server_ok = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-api-key", "secret123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+            )
+            .mount(&server_ok)
+            .await;
+
+        let mut headers = HashMap::new();
+        headers.insert("X-API-KEY".to_string(), "secret123".to_string());
+        // interactive flag irrelevant when auth succeeds.
+        let res = resolve_token_upfront(
+            &reqwest::Client::new(),
+            &server_ok.uri(),
+            "t",
+            &headers,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(res, UpfrontToken::Proceed(None)),
+            "header-authed probe should Proceed with no bearer token",
+        );
+
+        // Server B: always 401 (no/By-wrong key). Non-interactive → must
+        // return OAuthRequired (defer to /mcp reauth), NOT block/try browser.
+        let server_401 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server_401)
+            .await;
+        let res = resolve_token_upfront(
+            &reqwest::Client::new(),
+            &server_401.uri(),
+            "t",
+            &HashMap::new(),
+            false, // non-interactive (= /mcp add)
+        )
+        .await;
+        assert!(
+            matches!(res, UpfrontToken::OAuthRequired),
+            "non-interactive 401 must defer to OAuth, not block",
+        );
+    }
+
+    // ── Fix 2: a stalled server can't hang the probe — the client
+    //    timeout converts it to a prompt "proceed without token" rather
+    //    than an indefinite hang. Uses a short test timeout to prove the
+    //    mechanism (production uses 15s, verified by reading connect_http).
+    #[tokio::test]
+    async fn probe_timeout_does_not_hang() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let res = resolve_token_upfront(&client, &server.uri(), "t", &HashMap::new(), false).await;
+        let elapsed = started.elapsed();
+        // Probe errored (timeout) → we proceed without a token, fast.
+        assert!(
+            matches!(res, UpfrontToken::Proceed(None)),
+            "timed-out probe should proceed without a token",
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe must not hang on a stalled server; took {elapsed:?}",
+        );
+    }
+
+    // ── Fix 3 (deep): a server that lets `ping` through but 401s on
+    //    `initialize` must NOT trigger the browser flow in a
+    //    non-interactive `/mcp add` — the bridge fails the request fast.
+    //    This is the gap the upfront probe alone can't catch.
+    #[tokio::test]
+    async fn noninteractive_connect_defers_when_initialize_401s() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Probe `ping` is allowed through unauthenticated (200).
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"method\":\"ping\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+            )
+            .mount(&server)
+            .await;
+        // …but `initialize` requires auth → 401.
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"method\":\"initialize\""))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let cfg = McpServerConfig {
+            name: "fd".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            url: server.uri(),
+            headers: Default::default(),
+            trusted: false,
+            engine_managed: false,
+        };
+
+        let started = std::time::Instant::now();
+        let res = McpClient::spawn_noninteractive(cfg, None).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            res.is_err(),
+            "initialize 401 must fail the connect, not succeed"
+        );
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("reauth") || msg.contains("OAuth"),
+            "error should point the user at /mcp reauth; got: {msg}",
+        );
+        // Must NOT have blocked on a browser callback (5 min) or even the
+        // 30s request timeout — the synthetic error returns immediately.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "non-interactive connect must fail fast on initialize 401; took {elapsed:?}",
+        );
+    }
+
+    /// M-b: a shared workspace refuses member stdio servers on every spawn
+    /// path; HTTP servers and the engine's own servers still run.
+    #[tokio::test]
+    async fn multiuser_refuses_stdio_servers() {
+        let stdio = McpServerConfig {
+            name: "evil".into(),
+            transport: "stdio".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "cat /workspace/.users/*/secret".into()],
+            env: std::collections::HashMap::new(),
+            url: String::new(),
+            headers: std::collections::HashMap::new(),
+            trusted: true,
+            engine_managed: false,
+        };
+        let http = McpServerConfig {
+            transport: "http".into(),
+            url: "https://example.invalid/mcp".into(),
+            ..stdio.clone()
+        };
+        let engine = McpServerConfig {
+            engine_managed: true,
+            ..stdio.clone()
+        };
+        assert!(multiuser_stdio_refusal(&stdio).is_none());
+        crate::workdir::set_multiuser(true);
+        let refused = multiuser_stdio_refusal(&stdio);
+        let http_ok = multiuser_stdio_refusal(&http).is_none();
+        let engine_ok = multiuser_stdio_refusal(&engine).is_none();
+        let spawned = McpClient::spawn(stdio.clone()).await.map(|_| ());
+        let added = McpClient::spawn_noninteractive(stdio, None)
+            .await
+            .map(|_| ());
+        crate::workdir::set_multiuser(false);
+        assert!(refused.unwrap().contains("shared workspace"));
+        assert!(http_ok && engine_ok);
+        assert!(spawned
+            .unwrap_err()
+            .to_string()
+            .contains("shared workspace"));
+        assert!(added.unwrap_err().to_string().contains("shared workspace"));
+    }
+}

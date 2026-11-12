@@ -1,0 +1,260 @@
+# บทที่ 14 — MCP servers
+
+MCP — **Model Context Protocol** — คือมาตรฐานเปิดของ Anthropic สำหรับ
+ให้ LLM เข้าถึงเครื่องมือภายนอก โดย MCP server จะรันเป็น
+subprocess (stdio) หรือฟังบน HTTP ก็ได้ จากนั้น thClaws จะค้นหา tools
+ของ server นั้นแล้วลงทะเบียนเข้า tool registry โดยใช้ชื่อ server เป็น namespace
+
+## สอง transport
+
+### Stdio (subprocess)
+
+ไบนารี local ที่สื่อสารด้วย JSON-RPC ผ่าน stdin/stdout เป็นรูปแบบ
+ที่พบบ่อยที่สุด โดย NPM package ทุกตัวในตระกูล `@modelcontextprotocol/server-*`
+ก็ทำงานแบบนี้
+
+```json
+{
+  "mcpServers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@h1deya/mcp-server-weather"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_…" }
+    }
+  }
+}
+```
+
+### HTTP Streamable (remote)
+
+Server ที่เข้าถึงผ่าน HTTPS สำหรับ server ที่ต้องมีการป้องกัน
+thClaws จะจัดการ OAuth 2.1 พร้อม PKCE ให้โดยอัตโนมัติ
+
+```json
+{
+  "mcpServers": {
+    "agentic-cloud": {
+      "transport": "http",
+      "url": "https://mcp.example.com",
+      "headers": { "Authorization": "Bearer …" }
+    }
+  }
+}
+```
+
+สำหรับ server ที่ใช้ Bearer token เพียงตั้งค่า `headers` ก็พอ
+ส่วน server ที่ป้องกันด้วย OAuth ให้เว้น `headers` ไว้ เมื่อใช้งาน
+ครั้งแรก thClaws จะเปิดเบราว์เซอร์ให้ทำ OAuth flow แล้ว cache token ไว้ที่
+`~/.config/thclaws/oauth_tokens.json`
+
+## ไฟล์การตั้งค่า
+
+thClaws อ่าน MCP servers จาก (รวมตามลำดับ ถ้าชื่อชนกัน project ชนะ):
+
+1. Plugin manifests — บล็อก `mcpServers`
+2. `~/.config/thclaws/mcp.json`
+3. `~/.claude/mcp.json` (เข้ากันได้กับ Claude Code)
+4. `.thclaws/mcp.json` (ระดับโปรเจกต์)
+5. `.claude/mcp.json` (เข้ากันได้กับ Claude Code)
+
+## การเพิ่ม server ขณะรันอยู่
+
+แทนที่จะแก้ JSON ด้วยมือ ให้ใช้ `/mcp add`:
+
+```
+❯ /mcp add weather https://mcp.weather-example.com/v1
+[mcp-http] weather: probing with ping...
+mcp 'weather' added (project, 2 tool(s)) → .thclaws/mcp.json
+  - weather__get-forecast
+  - weather__get-alerts
+```
+
+Server จะถูกบันทึกลง `mcp.json` เชื่อมต่อให้ทันที และลงทะเบียน tools
+เข้า session ปัจจุบันโดยไม่ต้อง restart ใช้ได้ทั้ง CLI REPL และ GUI
+ทั้งสองแท็บ หากต้องการเขียนลง `~/.config/thclaws/mcp.json` แทน ให้ใช้
+`--user`
+
+สำหรับ stdio server (binary ใน PATH, npx package, Python module)
+ให้ใส่คำสั่งแทน URL:
+
+```
+❯ /mcp add ldr ldr-mcp
+mcp 'ldr' added (project, stdio, 8 tool(s)) → .thclaws/mcp.json
+
+❯ /mcp add gh-mcp npx -y @modelcontextprotocol/server-github
+mcp 'gh-mcp' added (project, stdio, 20 tool(s)) → .thclaws/mcp.json
+```
+
+token ตัวแรกที่ไม่ใช่ flag คือ binary ส่วน token ที่เหลือจะถูกส่งเป็น
+args การกำหนดเส้นทางทำเองอัตโนมัติ — ถ้าไม่ขึ้นต้นด้วย `http://` /
+`https://` จะถูกถือว่าเป็นคำสั่ง stdio
+
+Server ที่ต้องการ environment variables (`LDR_LLM_*`, `GITHUB_TOKEN`,
+…) จะบันทึกได้สำเร็จ แต่ spawn ครั้งแรกจะล้มเหลว ข้อความ error จะชี้
+ไฟล์ `mcp.json` เปิดแล้วเติม block `env` ด้วยมือ:
+
+```json
+{
+  "mcpServers": {
+    "ldr": {
+      "command": "ldr-mcp",
+      "env": {
+        "LDR_LLM_PROVIDER": "anthropic",
+        "LDR_LLM_ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
+```
+
+จากนั้นรัน `/mcp add ldr ldr-mcp` ซ้ำ (หรือ restart) เพื่อให้ env ถูกโหลด
+
+ลบ:
+
+```
+❯ /mcp remove weather
+mcp 'weather' removed from .thclaws/mcp.json (restart to drop active tools)
+```
+
+## Marketplace
+
+MCP server เป็น 1 ใน 4 ประเภทของ thClaws marketplace รวม (skills · MCP ·
+plugins · subagents — ดู [บทที่ 12](ch12-skills.md)) ใน GUI
+**`/marketplace`** เปิด browser modal ที่มีแท็บ **MCP** ส่วนคำสั่ง text
+ด้านล่างใช้ได้ทุกที่
+
+`/mcp marketplace` เปิดดู MCP servers ที่ทีม thClaws คัดสรรไว้
+รูปแบบเหมือน skill marketplace — สามคำสั่งสำรวจ + install ด้วยชื่อ:
+
+```
+❯ /mcp marketplace
+MCP marketplace (baseline 2026-04-29, 1 server(s))
+── data ──
+  weather-mcp              — Global weather (current + forecast) via Open-Meteo
+install with: /mcp install <name>   |   detail: /mcp info <name>
+```
+
+```
+❯ /mcp info weather-mcp
+name:         weather-mcp
+description:  Global weather MCP server — current conditions and...
+transport:    stdio
+command:      python -m thclaws_weather
+source:       https://github.com/thClaws/marketplace.git#main:mcp/weather-mcp
+note:         Run `pip install -e <clone-path>` to install dependencies...
+install with: /mcp install weather-mcp
+```
+
+```
+❯ /mcp install --user weather-mcp
+  registered 'weather-mcp' in ~/.config/thclaws/mcp.json (user scope, stdio transport)
+  command: uvx --from git+https://github.com/thClaws/marketplace.git#subdirectory=mcp/weather-mcp thclaws-weather
+  note: Requires `uv` (one-time: `pip install uv` or `brew install uv`). First invocation downloads the package and dependencies into an isolated env automatically — no separate pip install needed.
+  restart thClaws to spawn the MCP and load its tools
+```
+
+ต่างจาก skill, MCP install **ไม่ได้ copy source code มาเก็บไว้
+locally** — MCP เป็น process แยกที่ agent ต่อด้วย ไม่ใช่ code ที่
+agent อ่าน `/mcp install` แค่เขียน entry ใน `mcp.json` หนึ่ง entry
+เท่านั้น ตัวจริงที่ fetch และ run server คือ package manager ของ
+upstream (PyPI ผ่าน `uvx` / `pip`, npm ผ่าน `npx`, cargo, หรือ
+binary release)
+
+สำหรับ entry แบบ stdio marketplace จะระบุ `command + args` ที่
+subprocess จะรัน entry สมัยใหม่ใช้ runner ที่ติดตั้งให้อัตโนมัติ
+(`uvx` สำหรับ Python, `npx -y` สำหรับ Node) ทำให้รันครั้งแรก fetch
+package เอง โดยไม่ต้อง install แยก entry แบบเก่าอาจต้อง `pip
+install` / `npm install -g` ก่อน — `post_install_message` อธิบาย
+เรื่องนี้
+
+สำหรับ entry แบบ hosted (transport `sse`) ไม่ต้องติดตั้งอะไรเพิ่ม
+นอกจากเขียน entry ใน `mcp.json` ที่ชี้ไปยัง URL ที่ host ไว้ —
+agent จะ connect ผ่าน HTTP/SSE ในการเปิด session ครั้งต่อไป
+
+## ดูว่ามีอะไรให้ใช้บ้าง
+
+```
+❯ /mcp
+  weather (2 tool(s))
+    - weather__get-forecast
+    - weather__get-alerts
+  github (20 tool(s))
+    - github__list_issues
+    - github__create_issue
+    …
+```
+
+### รายการ subcommand ทั้งหมด
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/mcp` | แสดง server ที่ต่ออยู่พร้อม tool ของแต่ละตัว (ด้านบน) |
+| `/mcp add <name> <url-or-command>` | เพิ่ม server — ดูหัวข้อด้านบน |
+| `/mcp remove <name>` | ลบออก ชื่อพ้อง: `/mcp rm` |
+| `/mcp info <name>` | แสดง config, transport และ tool ที่ resolve ได้ของ server ตัวนั้น |
+| `/mcp search <query>` | ค้น MCP server ใน marketplace |
+| `/mcp install <name>` | ติดตั้งจาก marketplace |
+| `/mcp marketplace` | เปิดดูหมวด MCP ของ marketplace |
+| `/mcp reauth <name>` | **รัน OAuth flow ใหม่** สำหรับ remote server ที่ token หมดอายุหรือถูกเพิกถอน ชื่อพ้อง: `/mcp login` — นี่คือทางแก้เมื่อ HTTP server ที่เคยใช้ได้เริ่มตอบ 401 |
+
+## การตั้งชื่อ tool
+
+ชื่อ tool ของ MCP ทั้งหมดจะถูกเติมนำหน้าด้วยชื่อ server + `__` เช่น
+`weather__get_forecast` ไม่ใช่ `get_forecast` วิธีนี้ช่วยป้องกันการชนกัน
+(server สองตัวสามารถมี tool ชื่อ `list` ได้พร้อมกัน) และยังทำให้ deny
+tools ของ server ตัวเดียวได้โดยไม่กระทบตัวอื่น
+
+```json
+{
+  "permissions": {
+    "deny": ["github__create_issue"]
+  }
+}
+```
+
+รูปแบบ double-underscore นี้เข้ากันได้กับ tool-name regex ของทุก provider
+
+## การอนุมัติ (Approvals)
+
+MCP tools ทั้งหมดเป็นแบบ **prompt-to-approve** โดยไม่มีวิธีตั้งให้เป็น
+auto ยกเว้นจะเปิดแบบ global ผ่าน `/permissions auto` หรือเปิดเป็นรายตัวผ่าน `allow`
+
+## เมื่อสิ่งต่าง ๆ ไม่เป็นไปตามคาด
+
+### Stdio servers ที่เริ่มต้นไม่สำเร็จ
+
+```
+[mcp] weather … spawn failed: command not found: npx
+```
+
+สาเหตุส่วนใหญ่คือเครื่องไม่มี npm / npx ให้ติดตั้ง Node หรือเปลี่ยนไปใช้ server อื่น
+ส่วน thClaws ยังทำงานต่อได้แม้จะไม่มี tools ของ server นั้น
+
+### HTTP servers ที่คืน 200 พร้อม error body
+
+Gateway บางตัวที่เข้ากันได้กับ OpenAI จะห่อ error จาก upstream ไว้ใน
+SSE data frame เดียวพร้อมกับ HTTP 200 ซึ่ง parser ของ thClaws จะตรวจจับ
+แล้วแสดงเป็น hard error เพื่อไม่ให้หลุดไปแบบเงียบ ๆ หากเห็น
+`upstream error: …` ใน output ของ tool แปลว่า remote ทำงานผิดปกติ
+ให้แจ้งบั๊กไปยังผู้ดูแล server
+
+### ปัญหาเกี่ยวกับ OAuth flow
+
+Token ที่ cache ไว้ที่ `~/.config/thclaws/oauth_tokens.json` มีวันหมดอายุ
+ซึ่ง thClaws จะรีเฟรชให้อัตโนมัติด้วย refresh token แต่หากรีเฟรชไม่สำเร็จ
+(เช่น server หมุนเวียน key) ให้ลบรายการของ server นั้นแล้วเชื่อมต่อใหม่
+เพื่อให้เกิด browser flow อีกครั้ง
+
+## การเขียน MCP server ของคุณเอง
+
+เนื้อหานี้อยู่นอกขอบเขตของคู่มือ แต่มีจุดเริ่มต้นให้เลือกสองทาง
+
+- **TypeScript**: `@modelcontextprotocol/sdk` บน npm
+- **Python**: `modelcontextprotocol` บน PyPI
+
+สเปกอยู่ที่ modelcontextprotocol.io เมื่อสร้างเสร็จแล้ว ให้ลงทะเบียนผ่าน `/mcp
+add` (สำหรับ HTTP) หรือแก้ไข `mcp.json` เอง (สำหรับ stdio)

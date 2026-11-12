@@ -1,0 +1,5646 @@
+//! Slash-command dispatcher for the GUI's shared session.
+//!
+//! GUI counterpart to the inline match arms in `repl::run_repl`. Takes
+//! the same `SlashCommand` enum the standalone REPL parses, but writes
+//! its output to a `broadcast::Sender<ViewEvent>` instead of `println!`
+//! — so both the Terminal and Chat tabs render the command's output
+//! identically.
+//!
+//! Commands that mutate runtime state (model / provider / permissions
+//! / thinking budget) take `&mut WorkerState` and rebuild the Agent
+//! in-place when needed.
+
+#![cfg(feature = "gui")]
+
+use crate::repl::{default_model_for_provider, parse_slash, render_help, CloudSlash, SlashCommand};
+use crate::session::Session;
+use crate::shared_session::{
+    build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState,
+};
+use crate::util::{format_bytes, format_tokens, progress_bar};
+use tokio::sync::broadcast;
+
+/// Entry point — dispatch a single slash line against the shared
+/// worker state, writing user-visible output to `events_tx` as
+/// `SlashOutput` events.
+///
+/// `input_tx` is needed for commands that spawn background tasks which
+/// re-feed input back into the worker queue (M6.29: `/loop` start —
+/// the spawned task fires `<body>` every interval via `input_tx.send`).
+/// Most commands ignore it.
+pub async fn dispatch(
+    line: &str,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    input_tx: &std::sync::mpsc::Sender<crate::shared_session::ShellInput>,
+) {
+    let Some(cmd) = parse_slash(line) else {
+        emit(events_tx, format!("Not a slash command: {line}"));
+        return;
+    };
+
+    match cmd {
+        // ─── read-only status ───────────────────────────────────────
+        SlashCommand::Help => emit(events_tx, render_help().to_string()),
+        SlashCommand::Quit => {
+            // CLI handles `/quit` via an early break in the REPL loop
+            // and never reaches this dispatch (repl.rs `SlashCommand::
+            // Quit => break`). What lands here is the GUI's chat-input
+            // path: pop a native confirm dialog, then signal the event
+            // loop on accept. Cancel leaves the session running. #52.
+            #[cfg(feature = "gui")]
+            {
+                let confirmed = tokio::task::spawn_blocking(|| {
+                    crate::gui::native_confirm("Quit thclaws", "Quit?", "OK", "Cancel")
+                })
+                .await
+                .unwrap_or(false);
+                if confirmed {
+                    let _ = events_tx.send(ViewEvent::QuitRequested);
+                }
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                // Defensive — no GUI feature means no chat input route
+                // either, but if a future caller wires this up the
+                // user gets a clear next-step instead of silence.
+                emit(events_tx, "Use Ctrl+C to quit.".into());
+            }
+        }
+        SlashCommand::Version => emit(events_tx, crate::version::one_line()),
+        SlashCommand::Logs { panic, lines } => emit(events_tx, crate::util::tail_log(panic, lines)),
+        SlashCommand::Cwd => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "?".to_string());
+            emit(events_tx, format!("cwd: {cwd}"));
+        }
+        SlashCommand::System { mode } => {
+            let view = crate::repl::render_system_prompt_view(&state.system_prompt, &mode);
+            emit(events_tx, view);
+        }
+        SlashCommand::Context => {
+            let history = state.agent.history_snapshot();
+            let blocks: usize = history.iter().map(|m| m.content.len()).sum();
+            // Token estimate + percentage of the model's real context
+            // window. Same estimator the auto-compact trigger uses, so
+            // the number here and the 80% threshold line up.
+            let history_tokens = crate::compaction::estimate_messages_tokens(&history);
+            // System prompt ~1 token per 4 chars (same rule-of-thumb
+            // the rest of the estimator uses).
+            let system_tokens = state.system_prompt.len() / 4;
+            let total_tokens = history_tokens + system_tokens;
+            let window = state.agent.budget_tokens.max(1);
+            let pct = (total_tokens as f64 / window as f64) * 100.0;
+            // Per-contributor size breakdown. Lets the user spot which
+            // file is bloating the system prompt — e.g. an AGENTS.md
+            // that ballooned past the ch08 soft budget or a
+            // `project_context.md` that grew over weeks of auto-memory
+            // writes. Each budget check appends "⚠" when exceeded.
+            const BUDGET_CLAUDE_MD: u64 = 1024; // 1 KB per file
+            const BUDGET_MEMORY_INDEX: u64 = 512; // 500 B (manual)
+            const BUDGET_MEMORY_ENTRY: u64 = 1024; // 1 KB per topic
+            let claude_files = crate::context::scan_claude_md_sizes(&state.cwd);
+            let claude_total: u64 = claude_files.iter().map(|(_, n)| *n).sum();
+            let claude_over: Vec<String> = claude_files
+                .iter()
+                .filter(|(_, n)| *n > BUDGET_CLAUDE_MD)
+                .map(|(p, n)| {
+                    format!(
+                        "{} ({})",
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string()),
+                        format_bytes(*n),
+                    )
+                })
+                .collect();
+            let (mem_index_bytes, mem_entries) = crate::memory::MemoryStore::default_path()
+                .map(crate::memory::MemoryStore::new)
+                .map(|s| crate::memory::memory_sizes(&s))
+                .unwrap_or((0, Vec::new()));
+            let mem_entries_total: u64 = mem_entries.iter().map(|(_, n)| *n).sum();
+            let mem_entries_over: Vec<String> = mem_entries
+                .iter()
+                .filter(|(_, n)| *n > BUDGET_MEMORY_ENTRY)
+                .map(|(name, n)| format!("{} ({})", name, format_bytes(*n)))
+                .collect();
+
+            let mut out = format!(
+                "context: {} message(s), {} content block(s), system prompt {} chars\n\
+                 model: {} · window: {} tokens · used: ~{} tokens\n\
+                 {} {:.1}%",
+                history.len(),
+                blocks,
+                state.system_prompt.len(),
+                state.config.model,
+                format_tokens(window),
+                format_tokens(total_tokens),
+                progress_bar(pct, 24),
+                pct,
+            );
+            if !claude_files.is_empty() || mem_index_bytes > 0 || !mem_entries.is_empty() {
+                out.push_str("\nsystem-prompt breakdown:");
+                if !claude_files.is_empty() {
+                    out.push_str(&format!(
+                        "\n  CLAUDE.md / AGENTS.md  {}  ({} file{})",
+                        format_bytes(claude_total),
+                        claude_files.len(),
+                        if claude_files.len() == 1 { "" } else { "s" },
+                    ));
+                    if !claude_over.is_empty() {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap: {}",
+                            format_bytes(BUDGET_CLAUDE_MD),
+                            claude_over.join(", "),
+                        ));
+                    }
+                }
+                if mem_index_bytes > 0 {
+                    out.push_str(&format!(
+                        "\n  MEMORY.md              {}",
+                        format_bytes(mem_index_bytes),
+                    ));
+                    if mem_index_bytes > BUDGET_MEMORY_INDEX {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap",
+                            format_bytes(BUDGET_MEMORY_INDEX),
+                        ));
+                    }
+                }
+                if !mem_entries.is_empty() {
+                    out.push_str(&format!(
+                        "\n  memory entries         {}  ({} file{})",
+                        format_bytes(mem_entries_total),
+                        mem_entries.len(),
+                        if mem_entries.len() == 1 { "" } else { "s" },
+                    ));
+                    if !mem_entries_over.is_empty() {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap: {}",
+                            format_bytes(BUDGET_MEMORY_ENTRY),
+                            mem_entries_over.join(", "),
+                        ));
+                    }
+                }
+            }
+            emit(events_tx, out);
+        }
+        SlashCommand::History => {
+            let history = state.agent.history_snapshot();
+            let mut out = format!("{} message(s) in history\n", history.len());
+            for (i, m) in history.iter().enumerate() {
+                out.push_str(&format!(
+                    "  [{i}] {:?} — {} block(s)\n",
+                    m.role,
+                    m.content.len(),
+                ));
+            }
+            emit(events_tx, out);
+        }
+        SlashCommand::Tasks => {
+            // The `Task` tool maintains its state inside the agent's
+            // turn loop; from outside the loop we can only hint.
+            emit(
+                events_tx,
+                "tasks are maintained by the agent's `Task` tool during a turn; ask the agent to list them.".into(),
+            );
+        }
+        SlashCommand::Todo { clear } => {
+            // clear_todos broadcasts the empty list, so the sidebar empties too.
+            let root = std::env::current_dir().unwrap_or_default();
+            let text = if clear {
+                crate::tools::todo::clear_todos(&root);
+                "todos cleared".to_string()
+            } else {
+                crate::tools::todo::render_todos(&crate::tools::todo::read_todos_from_disk(&root))
+            };
+            emit(events_tx, text);
+        }
+        SlashCommand::Usage => {
+            // A multiuser pod books each member's turns under their own
+            // usage dir; the default path is the pod's, which they never
+            // write.
+            let tracker = crate::usage::UsageTracker::new(
+                state
+                    .session_roots
+                    .as_ref()
+                    .map(|r| r.usage_dir.clone())
+                    .unwrap_or_else(crate::usage::UsageTracker::default_path),
+            );
+            emit(events_tx, tracker.summary());
+        }
+        SlashCommand::Doctor { fix } => {
+            let mut out = doctor_report(state);
+            let report = crate::doctor::diagnose();
+            out.push_str(&crate::doctor::render(&report));
+            if fix {
+                out.push_str("\n── installing missing agent dependencies ──\n");
+                out.push_str(&crate::doctor::apply(&report));
+            }
+            emit(events_tx, out);
+        }
+
+        // ─── model / provider / catalogue ───────────────────────────
+        SlashCommand::Providers => {
+            use crate::providers::ProviderTier;
+            let current = state.config.detect_provider_kind().ok();
+            let mut out = String::from("Providers:\n");
+            if crate::shared::gateway_providers_locked() {
+                out.push_str("\nAvailable on this deployment (through its gateway):\n");
+                let hint = crate::providers::locked_sign_in_hint();
+                if let Some(h) = &hint {
+                    out.push_str(&format!("  {h}\n"));
+                }
+                let kinds = if hint.is_some() {
+                    crate::providers::locked_offered_providers()
+                } else {
+                    crate::providers::locked_install_providers(&state.config)
+                };
+                for kind in kinds {
+                    let marker = if Some(kind) == current { "*" } else { " " };
+                    out.push_str(&format!(
+                        "  {marker} {:<12} → {}\n",
+                        kind.name(),
+                        kind.default_model(),
+                    ));
+                }
+                emit(events_tx, out);
+                return;
+            }
+            let mut last_tier: Option<ProviderTier> = None;
+            for kind in crate::providers::ProviderKind::display_ordered() {
+                let tier = kind.tier();
+                if Some(tier) != last_tier {
+                    out.push_str(match tier {
+                        ProviderTier::Featured => "\nFeatured (gateway-routable):\n",
+                        ProviderTier::Additional => "\nAdditional (bring your own key):\n",
+                    });
+                    last_tier = Some(tier);
+                }
+                let marker = if Some(kind) == current { "*" } else { " " };
+                out.push_str(&format!(
+                    "  {marker} {:<12} → {}\n",
+                    kind.name(),
+                    kind.default_model(),
+                ));
+            }
+            emit(events_tx, out);
+        }
+        SlashCommand::ModelsSetContext { key, size, project } => {
+            let scope = if project {
+                crate::model_catalogue::OverrideScope::Project
+            } else {
+                crate::model_catalogue::OverrideScope::User
+            };
+            let entry = crate::model_catalogue::ModelEntry {
+                context: Some(size),
+                max_output: None,
+                source: Some("override".into()),
+                verified_at: None,
+                free: None,
+                chat: None,
+                ..Default::default()
+            };
+            let cat = crate::model_catalogue::EffectiveCatalogue::load();
+            let warn = cat.lookup_exact(&key).map(|n| size > n).unwrap_or(false);
+            match crate::model_catalogue::save_override(&key, Some(entry), scope) {
+                Ok(path) => {
+                    emit(
+                        events_tx,
+                        format!(
+                            "override → {key}: {size} tokens (saved to {})",
+                            path.display()
+                        ),
+                    );
+                    if warn {
+                        emit(
+                            events_tx,
+                            "warning: override exceeds catalogue value — provider may reject"
+                                .into(),
+                        );
+                    }
+                }
+                Err(e) => emit(events_tx, format!("set-context failed: {e}")),
+            }
+        }
+        SlashCommand::ModelsUnsetContext { key, project } => {
+            let scope = if project {
+                crate::model_catalogue::OverrideScope::Project
+            } else {
+                crate::model_catalogue::OverrideScope::User
+            };
+            match crate::model_catalogue::save_override(&key, None, scope) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("override removed for {key} (in {})", path.display()),
+                ),
+                Err(e) => emit(events_tx, format!("unset-context failed: {e}")),
+            }
+        }
+        SlashCommand::ModelsRefresh => {
+            emit(events_tx, "refreshing model catalogue…".into());
+            match crate::model_catalogue::refresh_from_remote().await {
+                Ok(out) => emit(
+                    events_tx,
+                    format!(
+                        "catalogue refreshed: {} models (source: {})",
+                        out.model_count,
+                        if out.source.is_empty() {
+                            "unspecified".into()
+                        } else {
+                            out.source
+                        }
+                    ),
+                ),
+                Err(e) => emit(
+                    events_tx,
+                    format!(
+                        "catalogue refresh failed: {e} (keeping existing {})",
+                        if crate::model_catalogue::cache_path()
+                            .map(|p| p.exists())
+                            .unwrap_or(false)
+                        {
+                            "cache"
+                        } else {
+                            "embedded baseline"
+                        }
+                    ),
+                ),
+            }
+        }
+        SlashCommand::Models => {
+            fn format_tokens(n: u32) -> String {
+                if n >= 1_000_000 {
+                    let m = n as f64 / 1_000_000.0;
+                    if (m - m.round()).abs() < 0.05 {
+                        format!("{:.0}M", m)
+                    } else {
+                        format!("{:.1}M", m)
+                    }
+                } else if n >= 1_000 {
+                    format!("{}K", n / 1_000)
+                } else {
+                    n.to_string()
+                }
+            }
+            let kind = match state.config.detect_provider_kind() {
+                Ok(k) => k,
+                Err(e) => {
+                    emit(events_tx, format!("provider error: {e}"));
+                    return;
+                }
+            };
+            let cat = crate::model_catalogue::EffectiveCatalogue::load();
+            let provider_name = crate::model_catalogue::provider_kind_name(kind);
+
+            // Collect ids from the catalogue (baseline ∪ user cache, with
+            // cache winning on metadata). This is the list we render for
+            // every non-Ollama provider.
+            let mut rows = cat.list_models_for_provider(provider_name);
+
+            // Always drop rows the catalogue flagged as non-chat (e.g.
+            // Lyria → audio, Imagen → image). Rows with `chat: None`
+            // pass through — that's the legacy default for catalogue
+            // sources that don't publish modality info.
+            rows.retain(|(_, e)| e.chat != Some(false));
+
+            // "Free only" toggle: when the user opted in via Settings,
+            // the OpenRouter row list collapses to entries marked
+            // `free: true` (zero prompt + zero completion price). Only
+            // OpenRouter ships the `free` flag — every other provider
+            // is unaffected.
+            let free_only = provider_name == "openrouter" && state.config.openrouter_free_only;
+            if free_only {
+                rows.retain(|(_, e)| e.free == Some(true));
+            }
+
+            // Gateway routing is strictly metered: unpriced models 400
+            // upstream, so don't offer them. No-op on desktop (overlay
+            // off — the user's own keys are not metered by us).
+            if crate::providers::thclaws_gateway::hides_unpriced_models(
+                &state.config,
+                provider_name,
+            ) {
+                rows.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
+            }
+
+            // Providers whose endpoint the USER points at can't be known
+            // from a shipped catalogue: Ollama is per-machine (`/api/tags`
+            // lists what's pulled), and `openai-compat` is whatever sits at
+            // `OPENAI_COMPAT_BASE_URL` — a vLLM box, LiteLLM, an internal
+            // proxy. Ask the endpoint itself and render exactly what it
+            // reports; the CLI has always done this, the GUI listed the
+            // catalogue alone and so showed openai-compat users nothing.
+            let is_ollama = matches!(
+                kind,
+                crate::providers::ProviderKind::Ollama
+                    | crate::providers::ProviderKind::OllamaAnthropic,
+            );
+            // LiteLLM / vLLM / llama.cpp / LMStudio / openai-compat are the
+            // same case: the routable ids are the operator's own aliases, so
+            // the catalogue can never carry them.
+            let asks_endpoint = kind.lists_from_endpoint();
+            let mut live_note: Option<String> = None;
+            let mut live_count = 0usize;
+            if asks_endpoint {
+                if let Ok(p) = crate::repl::build_provider(&state.config) {
+                    match p.list_models().await {
+                        Ok(live) => {
+                            // The endpoint owns the list: what it reports IS
+                            // the set. Catalogue rows only join back in as
+                            // metadata for the ids it confirms — otherwise a
+                            // context window cached by an earlier `/model`
+                            // switch (`upsert_cache_entry`) keeps advertising
+                            // a model the proxy has since stopped serving.
+                            let meta: std::collections::HashMap<String, _> =
+                                rows.drain(..).collect();
+                            live_count = live.len();
+                            for m in live {
+                                let entry = meta.get(&m.id).cloned().unwrap_or_default();
+                                rows.push((m.id, entry));
+                            }
+                            rows.sort_by(|a, b| a.0.cmp(&b.0));
+                        }
+                        Err(e) => {
+                            // An endpoint that isn't OpenAI-shaped answers
+                            // with an HTML error page; pasting the whole
+                            // thing into the chat buries the one line that
+                            // matters.
+                            let why = one_line(&e.to_string(), 160);
+                            live_note = Some(if is_ollama {
+                                format!("(could not reach Ollama /api/tags: {why}; showing catalogue only)")
+                            } else {
+                                format!("(could not list models from your endpoint: {why}; showing catalogue only)")
+                            });
+                        }
+                    }
+                }
+            }
+
+            if rows.is_empty() {
+                if free_only {
+                    emit(
+                        events_tx,
+                        "no free OpenRouter models in the catalogue. Turn off 'Free only' in Settings or run /models refresh."
+                            .to_string(),
+                    );
+                } else if asks_endpoint {
+                    // Nothing catalogued AND the endpoint gave us nothing —
+                    // for a user-pointed provider that's an endpoint problem,
+                    // not a stale catalogue, so don't send them to `refresh`.
+                    let base = crate::providers::endpoint_hint(kind);
+                    emit(
+                        events_tx,
+                        format!(
+                            "no models available from {}{}. {}",
+                            base,
+                            live_note
+                                .as_deref()
+                                .map(|n| format!(" {n}"))
+                                .unwrap_or_default(),
+                            "Check the endpoint is up and serves GET /models."
+                        ),
+                    );
+                } else {
+                    emit(
+                        events_tx,
+                        format!("no models catalogued for '{provider_name}'. Run /models refresh."),
+                    );
+                }
+                return;
+            }
+
+            // Name the source honestly: openai-compat has no catalogue rows
+            // at all, so "from catalogue + N live" would credit a list that
+            // contributed nothing.
+            let catalogued = rows.len().saturating_sub(live_count);
+            let source = match (catalogued, live_count) {
+                (0, n) if n > 0 && is_ollama => "from /api/tags".to_string(),
+                (0, n) if n > 0 => "live from your endpoint".to_string(),
+                (_, n) if n > 0 && is_ollama => "from catalogue + /api/tags".to_string(),
+                (_, n) if n > 0 => format!("from catalogue + {n} live from your endpoint"),
+                _ => "from catalogue".to_string(),
+            };
+            let mut out = format!(
+                "models — {provider_name} ({} entries, {}{})\n",
+                rows.len(),
+                source,
+                if free_only { ", free only" } else { "" },
+            );
+            for (id, entry) in &rows {
+                // Print the canonical (routable) id so users can copy a
+                // row verbatim into `/model <id>`. See
+                // `model_catalogue::canonical_model_id` for the rules
+                // (handles already-prefixed catalogue ids and
+                // bare-routable provider ids without double-prefixing).
+                let canonical = crate::model_catalogue::canonical_model_id(provider_name, id);
+                let ctx = entry
+                    .context
+                    .map(format_tokens)
+                    .unwrap_or_else(|| "—".to_string());
+                out.push_str(&format!("  {:<50} {:>6}\n", canonical, ctx));
+            }
+            if let Some(note) = live_note {
+                out.push_str(&format!("\n{note}\n"));
+            }
+            // `refresh` re-downloads the shipped catalogue — pointless advice
+            // for a provider whose list came from the user's own endpoint.
+            if asks_endpoint && catalogued == 0 {
+                out.push_str(&format!(
+                    "\nlisted live from {} — /models refresh won't change this\n",
+                    crate::providers::endpoint_hint(kind)
+                ));
+            } else {
+                out.push_str("\ntype /models refresh to re-seed from openrouter/vendor lists\n");
+            }
+            emit(events_tx, out);
+        }
+        SlashCommand::Model(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                let prov = state.config.detect_provider().unwrap_or("unknown");
+                // Always print the current model — keeps `/model` useful
+                // as an introspection command and degrades gracefully on
+                // CLI where the picker isn't (yet) rendered.
+                emit(
+                    events_tx,
+                    format!("model: {} (provider: {})", state.config.model, prov),
+                );
+                // GUI side: also broadcast a model_picker_open event so
+                // the existing ModelPickerModal opens with the active
+                // provider's list. Skipped only when there's nothing to
+                // choose (<2 entries). (Was <3, which wrongly hid the picker
+                // for 2-model providers like DeepSeek — flash/pro is a real
+                // choice.) Closes #25.
+                //
+                // Runtime-loaded backends (Ollama / LMStudio / LiteLLM / …)
+                // used to be excluded outright because the catalogue can't
+                // know their models. It doesn't have to: the shared builder
+                // lists them from the endpoint itself.
+                if let Some(payload) =
+                    crate::providers::build_model_picker_payload(&state.config, 2).await
+                {
+                    let _ = events_tx.send(ViewEvent::ModelPickerOpen(payload));
+                }
+            } else {
+                // Strict mode: user named a specific model. A typo
+                // should abort so they don't end up on the wrong one.
+                switch_model(state, arg, events_tx, /* fallback_to_first */ false).await;
+            }
+        }
+        SlashCommand::Provider(arg) => {
+            let arg = arg.trim();
+            if arg.is_empty() {
+                let prov = state.config.detect_provider().unwrap_or("unknown");
+                emit(
+                    events_tx,
+                    format!("current provider: {prov} (model: {})", state.config.model),
+                );
+            } else {
+                match default_model_for_provider(arg) {
+                    // Permissive mode: user picked a provider, not a
+                    // specific model. If the hardcoded default isn't
+                    // in the live catalogue (which drifts as providers
+                    // ship/retire models), fall back to the first
+                    // available model rather than aborting.
+                    Some(m) => {
+                        switch_model(state, m, events_tx, /* fallback_to_first */ true).await
+                    }
+                    None => emit(
+                        events_tx,
+                        format!("unknown provider: {arg} (try: anthropic, openai, gemini, ollama)"),
+                    ),
+                }
+            }
+        }
+
+        // ─── session ─────────────────────────────────────────────────
+        SlashCommand::Clear => {
+            state.agent.clear_history();
+            state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
+            // Reset session-scoped trust + plan state too. ChangeCwd's
+            // hygiene block (shared_session.rs ~2820) is the reference;
+            // /clear used to skip these, so the previous conversation's
+            // yolo flag and plan persisted into the cleared session.
+            state.approver.reset_session_flag();
+            crate::tools::plan_state::clear();
+            let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+            emit(events_tx, "(history cleared)".into());
+        }
+        SlashCommand::Save => match &state.session_store {
+            Some(store) => {
+                let history = state.agent.history_snapshot();
+                if history.is_empty() {
+                    emit(events_tx, "(nothing to save — empty history)".into());
+                } else {
+                    state.session.sync(history);
+                    match store.save(&mut state.session) {
+                        Ok(p) => emit(events_tx, format!("session saved → {}", p.display())),
+                        Err(e) => emit(events_tx, format!("save failed: {e}")),
+                    }
+                }
+            }
+            None => emit(events_tx, "no session store available".into()),
+        },
+        SlashCommand::Load(id_or_name) => match &state.session_store {
+            Some(store) => {
+                let id = id_or_name.trim();
+                let resolved = if id.eq_ignore_ascii_case("last")
+                    || id.eq_ignore_ascii_case("latest")
+                    || id.is_empty()
+                {
+                    store.list().ok().and_then(|mut list| {
+                        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                        list.into_iter().next().map(|m| m.id)
+                    })
+                } else {
+                    Some(id.to_string())
+                };
+                let Some(target) = resolved else {
+                    emit(events_tx, "no sessions to load".into());
+                    return;
+                };
+                let result = store
+                    .load_by_name_or_id(&target)
+                    .or_else(|_| store.load(&target));
+                match result {
+                    Ok(loaded) => {
+                        state.agent.set_history(loaded.messages.clone());
+                        state.session = loaded;
+                        let display = DisplayMessage::from_session(&state.session);
+                        let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
+                        emit(events_tx, format!("loaded session: {}", state.session.id));
+                    }
+                    Err(e) => emit(events_tx, format!("load failed: {e}")),
+                }
+            }
+            None => emit(events_tx, "no session store available".into()),
+        },
+        SlashCommand::Sessions => match &state.session_store {
+            Some(store) => match store.list() {
+                Ok(mut list) => {
+                    list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    if list.is_empty() {
+                        emit(events_tx, "(no saved sessions)".into());
+                    } else {
+                        let mut out = String::from("Sessions:\n");
+                        for m in list.iter().take(20) {
+                            let title = m.title.as_deref().unwrap_or(&m.id);
+                            out.push_str(&format!(
+                                "  {} — {} ({} msgs, model={})\n",
+                                m.id, title, m.message_count, m.model
+                            ));
+                        }
+                        emit(events_tx, out);
+                    }
+                }
+                Err(e) => emit(events_tx, format!("list failed: {e}")),
+            },
+            None => emit(events_tx, "no session store available".into()),
+        },
+        SlashCommand::Rename(title) => {
+            let title = title.trim();
+            if title.is_empty() {
+                emit(events_tx, "usage: /rename <title>".into());
+            } else if let Some(store) = &state.session_store {
+                // A title lives only as a `rename` line in the file, which
+                // `save` never writes — the sidebar and /sessions read it from
+                // there. Same order as the CLI: land the file, then rename.
+                let history = state.agent.history_snapshot();
+                if !history.is_empty() {
+                    state.session.sync(history);
+                }
+                match store
+                    .save(&mut state.session)
+                    .and_then(|_| store.rename(&state.session.id, title))
+                {
+                    Ok(updated) => {
+                        state.session.title = updated.title;
+                        emit(events_tx, format!("session renamed → {title}"));
+                        let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                            &state.session_store,
+                            &state.session.id,
+                        )));
+                    }
+                    Err(e) => emit(events_tx, format!("rename failed: {e}")),
+                }
+            } else {
+                emit(events_tx, "no session store available".into());
+            }
+        }
+
+        // ─── runtime knobs ──────────────────────────────────────────
+        SlashCommand::Permissions(mode) => {
+            if mode.trim().is_empty() {
+                let cur = match crate::permissions::current_mode() {
+                    crate::permissions::PermissionMode::Auto => "auto",
+                    crate::permissions::PermissionMode::Ask => "ask",
+                    crate::permissions::PermissionMode::Plan => "plan",
+                    crate::permissions::PermissionMode::LineGated => "linegated",
+                    crate::permissions::PermissionMode::TelegramGated => "telegramgated",
+                    crate::permissions::PermissionMode::MessengerGated => "messengergated",
+                };
+                emit(
+                    events_tx,
+                    format!(
+                        "permissions: {cur} (auto = never prompt, ask = prompt on mutating tools, \
+                         plan = read-only exploration; mutating tools blocked, \
+                         linegated = approval routed to LINE chat — auto-active while LINE is paired, \
+                         see chapter 21)"
+                    ),
+                );
+            } else if let Some(msg) = permissions_change_refusal(&mode) {
+                emit(events_tx, msg);
+            } else {
+                // Three settable modes here:
+                // - auto / ask → persisted to settings.json; survive restart.
+                // - linegated → transient, only valid while LINE bridge is
+                //   live (otherwise the approver has nowhere to route to);
+                //   not persisted because next session may not have LINE.
+                //
+                // Auto/ask MUST also restore the desktop approver when LINE
+                // is currently bridged. Otherwise `state.approver` stays as
+                // the LineApprover and Ask-mode prompts still route to LINE
+                // — the very thing the user just opted out of by typing
+                // `/permissions ask`. (Bug surfaced when a user ran
+                // `/permissions ask` mid-LINE-session and Write kept getting
+                // denied because LINE never answered.)
+                match mode.as_str() {
+                    "auto" | "yolo" => {
+                        state.agent.permission_mode = crate::permissions::PermissionMode::Auto;
+                        crate::permissions::set_current_mode_and_broadcast(
+                            crate::permissions::PermissionMode::Auto,
+                        );
+                        state.config.permissions = "auto".into();
+                        restore_desktop_approver_if_line_bridged(state);
+                        persist_permission_mode("auto", events_tx);
+                    }
+                    "ask" | "default" => {
+                        state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
+                        crate::permissions::set_current_mode_and_broadcast(
+                            crate::permissions::PermissionMode::Ask,
+                        );
+                        state.config.permissions = "ask".into();
+                        restore_desktop_approver_if_line_bridged(state);
+                        persist_permission_mode("ask", events_tx);
+                    }
+                    "linegated" | "line" => {
+                        // Only valid while the LINE bridge is connected.
+                        // `state.line_session.is_some()` is the canonical
+                        // signal — and it also gives us the LINE approver
+                        // handle (line_session.approver) so we can swap it
+                        // back in even after a prior `/permissions ask`
+                        // pulled state.approver back to the desktop.
+                        if let Some(handle) = state.line_session.as_ref() {
+                            state.agent.permission_mode =
+                                crate::permissions::PermissionMode::LineGated;
+                            crate::permissions::set_current_mode_and_broadcast(
+                                crate::permissions::PermissionMode::LineGated,
+                            );
+                            state.approver = handle.approver.clone()
+                                as std::sync::Arc<dyn crate::permissions::ApprovalSink>;
+                            // Don't touch state.config.permissions or
+                            // settings.json — `linegated` is a runtime
+                            // state, not a persisted policy.
+                            emit(
+                                events_tx,
+                                "permissions → linegated (approvals route to LINE; not persisted)"
+                                    .into(),
+                            );
+                        } else {
+                            emit(
+                                events_tx,
+                                "linegated requires the LINE bridge to be connected first \
+                                 (Settings → LINE Connect, see chapter 21)"
+                                    .into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        emit(events_tx, "usage: /permissions auto|ask|linegated".into());
+                    }
+                }
+            }
+        }
+        SlashCommand::Plan(arg) => {
+            // /plan        → enter plan mode (mutating tools blocked)
+            // /plan exit   → restore the prior mode (clears any plan)
+            // /plan cancel → alias for /plan exit
+            // /plan status → just print current mode + plan summary
+            let cur = crate::permissions::current_mode();
+            let arg = arg.trim().to_lowercase();
+            match arg.as_str() {
+                "" | "on" | "enter" | "start" => {
+                    if matches!(cur, crate::permissions::PermissionMode::Plan) {
+                        emit(events_tx, "Already in plan mode.".into());
+                    } else {
+                        crate::permissions::stash_pre_plan_mode(cur);
+                        crate::permissions::set_current_mode_and_broadcast(
+                            crate::permissions::PermissionMode::Plan,
+                        );
+                        emit(
+                            events_tx,
+                            "Plan mode active. Mutating tools are blocked — \
+                             use Read / Grep / Glob / Ls to explore. When ready, \
+                             ask the model to call SubmitPlan."
+                                .into(),
+                        );
+                    }
+                }
+                "exit" | "off" | "cancel" | "stop" | "abort" => {
+                    let restored = crate::permissions::take_pre_plan_mode()
+                        .unwrap_or(crate::permissions::PermissionMode::Ask);
+                    crate::permissions::set_current_mode_and_broadcast(restored);
+                    crate::tools::plan_state::clear();
+                    emit(
+                        events_tx,
+                        format!("Plan mode cleared. Permission mode restored to {restored:?}."),
+                    );
+                }
+                "status" | "show" => {
+                    let plan = crate::tools::plan_state::get();
+                    let plan_summary = match plan {
+                        Some(p) => format!(" — active plan {} ({} step(s))", p.id, p.steps.len()),
+                        None => String::new(),
+                    };
+                    emit(events_tx, format!("permission mode: {cur:?}{plan_summary}"));
+                }
+                _ => {
+                    emit(events_tx, "usage: /plan [enter | exit | status]".into());
+                }
+            }
+        }
+        SlashCommand::Thinking(arg) => {
+            use crate::providers::ThinkingLevel;
+            let arg = arg.trim();
+            if arg.is_empty() {
+                emit(
+                    events_tx,
+                    format!(
+                        "thinking: {}\n  levels: 0 off · 1 low · 2 medium · 3 high · 4 xhigh · 5 max · auto",
+                        ThinkingLevel::describe(state.agent.thinking_budget)
+                    ),
+                );
+            } else {
+                match ThinkingLevel::parse(arg) {
+                    Some(b) => {
+                        state.agent.thinking_budget = b;
+                        state.config.thinking_budget = b;
+                        let _ = crate::config::ProjectConfig::persist_thinking_budget(b);
+                        emit(
+                            events_tx,
+                            format!("thinking → {}", ThinkingLevel::describe(b)),
+                        );
+                        let _ = events_tx.send(ViewEvent::KmsUpdate(
+                            ThinkingLevel::update_payload(b).to_string(),
+                        ));
+                    }
+                    None => emit(
+                        events_tx,
+                        "usage: /thinking 0-5 | off|low|medium|high|xhigh|max | auto | <tokens>"
+                            .into(),
+                    ),
+                }
+            }
+        }
+        SlashCommand::Config { key, value } => {
+            emit(
+                events_tx,
+                format!("(session-only) {key} = {value} — applied to runtime only; edit .thclaws/settings.json for persistence"),
+            );
+        }
+        SlashCommand::Cost { reset } => {
+            crate::shared_session::sync_session_cost(state);
+            if reset {
+                state.session_cost_usd = 0.0;
+                #[cfg(feature = "cost_bridge")]
+                if let Some(ref bridge) = state.cost_bridge {
+                    let _ = bridge.tx_cost.send(0.0);
+                }
+                emit(events_tx, "session cost reset".into());
+            } else if state.session_cost_usd > 0.0 {
+                emit(
+                    events_tx,
+                    format!("session cost: ${:.4}", state.session_cost_usd),
+                );
+            } else {
+                emit(
+                    events_tx,
+                    "session cost: $0.0000 (no priced turns yet)".into(),
+                );
+            }
+        }
+        SlashCommand::Compact => {
+            let history = state.agent.history_snapshot();
+            let compacted = crate::compaction::compact(&history, state.agent.budget_tokens / 2);
+            state.agent.set_history(compacted.clone());
+            // Persist a checkpoint so the next `/load` starts from the
+            // compacted view instead of replaying the full history.
+            let persist_note = match (&state.session_store, compacted.len() < history.len()) {
+                (Some(store), true) => {
+                    let path = store.path_for(&state.session.id);
+                    match state.session.append_compaction_to(&path, &compacted) {
+                        Ok(()) => " (checkpoint saved)".to_string(),
+                        Err(e) => format!(" (checkpoint save failed: {e})"),
+                    }
+                }
+                _ => String::new(),
+            };
+            // Insurance: if any mid-session mutation (folder instructions
+            // edit, ad-hoc memory file write, etc.) bypassed its own
+            // rebuild, /compact is a natural moment to resync. Cheap —
+            // just re-runs build_full_system_prompt and calls set_system.
+            state.rebuild_system_prompt();
+            emit(
+                events_tx,
+                format!(
+                    "compacted: {} → {} messages{persist_note}",
+                    history.len(),
+                    compacted.len()
+                ),
+            );
+        }
+        SlashCommand::ReloadPrompt => {
+            // GUI mirror of the CLI `/reload-prompt`. Rebuilds
+            // state.system_prompt from current state (skills / MCP /
+            // KMS / memory / AGENTS.md) and pushes it into the agent
+            // via set_system — no process re-exec, no history loss.
+            state.rebuild_system_prompt();
+            emit(events_tx, "[reload-prompt] system prompt rebuilt".into());
+        }
+        SlashCommand::Reload => {
+            emit(
+                events_tx,
+                "[reload] re-executing thclaws — in-memory state will be reset, on-disk sessions survive…".into(),
+            );
+            // Route through the tao event loop (ViewEvent::ReloadRequested →
+            // UserEvent::ReloadRequested) so it persists the LIVE window size
+            // before re-execing. The size lives in the loop, not here, so a
+            // direct exec() from this thread would restore the last size saved
+            // on a normal close instead of the current one.
+            let _ = events_tx.send(ViewEvent::ReloadRequested);
+            return;
+        }
+        SlashCommand::Fork => {
+            // Flush the current session to disk so the archive reflects
+            // everything up to this moment, then build an LLM-summary
+            // of the history and seed a fresh session with it so the
+            // next turn starts in a clean file with compact context.
+            save_history(&state.agent, &mut state.session, &state.session_store);
+            let history = state.agent.history_snapshot();
+            if history.is_empty() {
+                emit(
+                    events_tx,
+                    "/fork: nothing to summarize — history is empty".into(),
+                );
+                return;
+            }
+            let provider = match crate::repl::build_provider(&state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(events_tx, format!("/fork: can't build provider: {e}"));
+                    return;
+                }
+            };
+            // Aim for roughly half of budget_tokens so the new session
+            // has room to grow before the next auto-compact kicks in.
+            let target = state.agent.budget_tokens / 2;
+            let summary_history = crate::compaction::compact_with_summary(
+                &history,
+                target,
+                provider.as_ref(),
+                &state.config.model,
+            )
+            .await;
+            let fallback_note = if summary_history.len() < history.len()
+                && summary_history
+                    .first()
+                    .map(|m| match m.content.first() {
+                        Some(crate::types::ContentBlock::Text { text }) => {
+                            text.starts_with("[Conversation summary")
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            {
+                ""
+            } else {
+                " (summary unavailable — used drop-oldest)"
+            };
+            // New session, seeded with the summary + recent turns.
+            let old_id = state.session.id.clone();
+            state.session =
+                crate::session::Session::new(&state.config.model, state.session.cwd.clone());
+            state.warned_file_size = false;
+            state.agent.clear_history();
+            state.agent.set_history(summary_history.clone());
+            state.session.messages = summary_history.clone();
+            // Persist the new session with its seeded history.
+            if let Some(store) = &state.session_store {
+                let _ = store.save(&mut state.session);
+            }
+            // Insurance — same rationale as /compact above. Any mid-session
+            // mutation that bypassed its own rebuild gets resynced here.
+            state.rebuild_system_prompt();
+            let display = crate::shared_session::DisplayMessage::from_messages(&summary_history);
+            let _ = events_tx.send(crate::shared_session::ViewEvent::HistoryReplaced(display));
+            let _ = events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(
+                build_session_list(&state.session_store, &state.session.id),
+            ));
+            emit(
+                events_tx,
+                format!(
+                    "/fork: forked {old_id} → {} ({} → {} messages){fallback_note}",
+                    state.session.id,
+                    history.len(),
+                    summary_history.len()
+                ),
+            );
+        }
+
+        // ─── memory ─────────────────────────────────────────────────
+        SlashCommand::MemoryList => {
+            let store = match crate::memory::MemoryStore::default_path()
+                .map(crate::memory::MemoryStore::new)
+            {
+                Some(s) => s,
+                None => {
+                    emit(events_tx, "no memory store".into());
+                    return;
+                }
+            };
+            match store.list() {
+                Ok(entries) if entries.is_empty() => {
+                    emit(events_tx, "(no memory entries)".into());
+                }
+                Ok(entries) => {
+                    let mut out = String::from("Memory:\n");
+                    for e in entries {
+                        let kind = e.memory_type.unwrap_or_default();
+                        let kind_label = if kind.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({kind})")
+                        };
+                        out.push_str(&format!("  {}{kind_label} — {}\n", e.name, e.description));
+                    }
+                    emit(events_tx, out);
+                }
+                Err(e) => emit(events_tx, format!("memory list failed: {e}")),
+            }
+        }
+        SlashCommand::MemoryRead(name) => {
+            let store = match crate::memory::MemoryStore::default_path()
+                .map(crate::memory::MemoryStore::new)
+            {
+                Some(s) => s,
+                None => {
+                    emit(events_tx, "no memory store".into());
+                    return;
+                }
+            };
+            match store.get(&name) {
+                Some(entry) => emit(events_tx, entry.body),
+                None => emit(events_tx, format!("memory entry '{name}' not found")),
+            }
+        }
+        // M6.26 BUG #2: GUI-side write/append/edit/delete dispatch.
+        // Editor flow isn't supported in the GUI (no terminal); user
+        // must pass --body. The agent-side MemoryWrite tool covers
+        // the "ask the model to author" use case.
+        SlashCommand::MemoryWrite {
+            name,
+            body,
+            type_,
+            description,
+        } => {
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            let Some(body_str) = body else {
+                emit(
+                    events_tx,
+                    "GUI /memory write requires --body \"...\". (Editor flow is CLI-only — \
+                     ask the agent to write a memory via the chat for free-form authoring.)"
+                        .into(),
+                );
+                return;
+            };
+            let final_content =
+                if (type_.is_some() || description.is_some()) && !body_str.starts_with("---") {
+                    let mut fm = std::collections::HashMap::new();
+                    if let Some(t) = type_ {
+                        fm.insert("type".to_string(), t);
+                    }
+                    if let Some(d) = description {
+                        fm.insert("description".to_string(), d);
+                    }
+                    crate::memory::write_frontmatter_map(&fm, &body_str)
+                } else {
+                    body_str
+                };
+            match crate::memory::write_entry(&store, &name, &final_content) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("wrote {} ({} bytes)", path.display(), final_content.len()),
+                ),
+                Err(e) => emit(events_tx, format!("write failed: {e}")),
+            }
+        }
+        SlashCommand::MemoryAppend { name, body } => {
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            match crate::memory::append_to_entry(&store, &name, &body) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!("appended {} bytes → {}", body.len(), path.display()),
+                ),
+                Err(e) => emit(events_tx, format!("append failed: {e}")),
+            }
+        }
+        SlashCommand::MemoryEdit(_name) => {
+            // GUI doesn't have an editor surface yet; punt to a
+            // helpful error rather than silently no-op.
+            emit(
+                events_tx,
+                "GUI /memory edit isn't implemented yet (CLI-only). \
+                 Use /memory write <name> --body \"...\" to overwrite \
+                 with new content, or ask the agent to update via chat."
+                    .into(),
+            );
+        }
+        SlashCommand::MemoryDelete { name, yes: _yes } => {
+            // GUI: no interactive confirm — the slash command itself
+            // is treated as the confirm gesture (user typed it). If
+            // we want a modal later, route through ViewEvent.
+            let Some(store) =
+                crate::memory::MemoryStore::default_path().map(crate::memory::MemoryStore::new)
+            else {
+                emit(events_tx, "no memory store".into());
+                return;
+            };
+            match crate::memory::delete_entry(&store, &name) {
+                Ok(path) => emit(events_tx, format!("deleted {}", path.display())),
+                Err(e) => emit(events_tx, format!("delete failed: {e}")),
+            }
+        }
+
+        // ─── /loop + /goal (M6.29) ──────────────────────────────────
+        SlashCommand::Loop {
+            interval_secs,
+            body,
+        } => {
+            if state.active_loop.is_some() {
+                emit(
+                    events_tx,
+                    "loop already running — `/loop stop` first, then start a new one".into(),
+                );
+                return;
+            }
+            let interval = std::time::Duration::from_secs(interval_secs.unwrap_or(300));
+            let body_for_task = body.clone();
+            let input_tx_for_task = input_tx.clone();
+            let label_interval = interval_secs
+                .map(|s| format!("every {s}s"))
+                .unwrap_or_else(|| "self-paced (default 5min)".to_string());
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if input_tx_for_task
+                        .send(crate::shared_session::ShellInput::Line(
+                            body_for_task.clone(),
+                        ))
+                        .is_err()
+                    {
+                        // Channel closed (worker shut down); exit task.
+                        break;
+                    }
+                }
+            });
+            state.active_loop = Some(crate::shared_session::ActiveLoop {
+                interval_secs,
+                body: body.clone(),
+                started_at: now_secs(),
+                iterations_fired: 0,
+                abort: handle.abort_handle(),
+            });
+            emit(
+                events_tx,
+                format!("loop started ({label_interval}): {body}"),
+            );
+        }
+        SlashCommand::LoopStop => match state.active_loop.take() {
+            Some(loop_state) => {
+                loop_state.abort.abort();
+                emit(
+                    events_tx,
+                    format!(
+                        "loop stopped (ran {} iteration(s) firing `{}`)",
+                        loop_state.iterations_fired, loop_state.body,
+                    ),
+                );
+            }
+            None => emit(events_tx, "no active loop".into()),
+        },
+        SlashCommand::LoopStatus => match &state.active_loop {
+            Some(l) => emit(
+                events_tx,
+                format!(
+                    "loop active: body=`{}` interval={} iterations_fired={} started_at={}s ago",
+                    l.body,
+                    l.interval_secs
+                        .map(|s| format!("{s}s"))
+                        .unwrap_or_else(|| "self-paced".into()),
+                    l.iterations_fired,
+                    now_secs().saturating_sub(l.started_at),
+                ),
+            ),
+            None => emit(events_tx, "no active loop".into()),
+        },
+        SlashCommand::GoalStart {
+            objective,
+            budget_tokens,
+            budget_time_secs,
+            auto_continue,
+            require_paths,
+        } => {
+            let new_goal = crate::goal_state::GoalState::new(
+                objective.clone(),
+                budget_tokens,
+                budget_time_secs,
+                auto_continue,
+            )
+            .with_require_paths(require_paths);
+            crate::goal_state::set(Some(new_goal));
+            // Live-register the three goal-lifecycle tools (Phase C1):
+            //   RecordGoalProgress  — mid-loop audit checkpoint, status stays Active
+            //   MarkGoalComplete    — terminal Complete (audit required)
+            //   MarkGoalBlocked     — terminal Blocked (reason required)
+            // Authority is split so the model can't slip into "mark
+            // complete to escape the loop" — terminal transitions are
+            // distinct tools with required justification fields.
+            state
+                .tool_registry
+                .register(std::sync::Arc::new(crate::tools::RecordGoalProgressTool));
+            state
+                .tool_registry
+                .register(std::sync::Arc::new(crate::tools::MarkGoalCompleteTool));
+            state
+                .tool_registry
+                .register(std::sync::Arc::new(crate::tools::MarkGoalBlockedTool));
+            state.rebuild_system_prompt();
+            if let Err(e) = state.rebuild_agent(true) {
+                emit(events_tx, format!("rebuild failed: {e}"));
+                return;
+            }
+            emit(
+                events_tx,
+                format!(
+                    "goal started: \"{}\" (budget_tokens={}, budget_time={}s, auto={})",
+                    objective,
+                    budget_tokens
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unlimited".into()),
+                    budget_time_secs
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unlimited".into()),
+                    auto_continue,
+                ),
+            );
+            // Phase D1: when --auto is set, kick off the first /goal
+            // continue immediately so users don't have to type it
+            // themselves. Subsequent iterations chain via the post-turn
+            // logic in handle_line. Without this, --auto would only
+            // affect what happens AFTER the first manual /goal continue.
+            if auto_continue {
+                let _ = input_tx.send(crate::shared_session::ShellInput::Line(
+                    "/goal continue".into(),
+                ));
+            }
+        }
+        SlashCommand::GoalStatus => match crate::goal_state::current() {
+            Some(g) => emit(events_tx, format_goal_status(&g)),
+            None => emit(
+                events_tx,
+                "no active goal — try /goal start \"<objective>\"".into(),
+            ),
+        },
+        SlashCommand::GoalShow => match crate::goal_state::current() {
+            Some(g) => emit(events_tx, format_goal_show(&g)),
+            None => emit(events_tx, "no active goal".into()),
+        },
+        // ─── /research (M6.39.2) ────────────────────────────────────
+        // Research jobs run as background tokio tasks via
+        // `crate::research::start`. The GUI sees status updates by
+        // polling `crate::research::manager().list()` (M6.39.3 will
+        // wire a sidebar panel + ViewEvent broadcast). Until then,
+        // these arms emit a one-line acknowledgement and the user
+        // queries status via `/research list / status / show`.
+        SlashCommand::ResearchStart {
+            query,
+            kms_target,
+            min_iter,
+            max_iter,
+            score_threshold_pct,
+            max_pages,
+            budget_time_secs,
+            max_notes,
+            novelty_pct,
+            append,
+            dry_run,
+            legacy,
+            digest_model,
+            language,
+        } => {
+            let cfg = crate::research::JobConfig::from_flags(crate::research::StartFlags {
+                kms_target,
+                min_iter,
+                max_iter,
+                score_threshold_pct,
+                max_pages,
+                budget_time_secs,
+                max_notes,
+                novelty_pct,
+                append,
+                dry_run,
+                legacy,
+                digest_model,
+                // Disk is what the sidebar checkbox writes; memory is what
+                // `/kms use` updates. Prefer disk so a checkbox tick counts.
+                language,
+                attached_kms: crate::config::ProjectConfig::load()
+                    .and_then(|c| c.kms.map(|k| k.active))
+                    .unwrap_or_else(|| state.config.kms_active.clone()),
+            });
+            let target_desc = match &cfg.kms_target {
+                Some(k) => format!("into KMS '{k}'"),
+                None => "into a new KMS named from the query (attach one or pass --kms to build on an existing graph)".to_string(),
+            };
+            let target_desc = format!(
+                "{target_desc} · worker model: {}",
+                cfg.digest_model
+                    .as_deref()
+                    .unwrap_or("(your current model)")
+            );
+            let digest_provider = cfg.digest_model.as_ref().and_then(|dm| {
+                let mut c2 = state.config.clone();
+                c2.model = dm.clone();
+                crate::repl::build_provider(&c2).ok()
+            });
+            let provider = match crate::repl::build_provider(&state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(events_tx, format!("/research: provider unavailable: {e}"));
+                    return;
+                }
+            };
+            let model = state.config.model.clone();
+            match crate::research::start(query.clone(), cfg, provider, model, digest_provider).await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "[research started: id={id}] query: {query}\n  {target_desc}\n  \
+                         /research status {id}     check progress\n  \
+                         /research show {id}       stream result\n  \
+                         /research cancel {id}     cancel"
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/research start failed: {e}")),
+            }
+        }
+        SlashCommand::ResearchRefresh {
+            kms,
+            slugs,
+            all,
+            older_than_days,
+            digest_model,
+            language,
+        } => {
+            let attached: Vec<String> = crate::config::ProjectConfig::load()
+                .and_then(|c| c.kms.map(|k| k.active))
+                .unwrap_or_else(|| state.config.kms_active.clone());
+            let Some(kms) = kms.or_else(|| attached.last().cloned()) else {
+                emit(
+                    events_tx,
+                    "/research refresh: no KMS given and none attached — /research refresh <kms> <slug>".into(),
+                );
+                return;
+            };
+            let cfg = crate::research::JobConfig::from_flags(crate::research::StartFlags {
+                kms_target: Some(kms.clone()),
+                digest_model,
+                language,
+                ..Default::default()
+            });
+            let digest_provider = cfg.digest_model.as_ref().and_then(|dm| {
+                let mut c2 = state.config.clone();
+                c2.model = dm.clone();
+                crate::repl::build_provider(&c2).ok()
+            });
+            let provider = match crate::repl::build_provider(&state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(
+                        events_tx,
+                        format!("/research refresh: provider unavailable: {e}"),
+                    );
+                    return;
+                }
+            };
+            let _ = all;
+            match crate::research::start_refresh(
+                kms.clone(),
+                slugs,
+                older_than_days.unwrap_or(30),
+                cfg,
+                provider,
+                state.config.model.clone(),
+                digest_provider,
+                None,
+            )
+            .await
+            {
+                Ok(ids) => {
+                    let list: Vec<String> =
+                        ids.iter().map(|(id, s)| format!("{id} → {s}")).collect();
+                    emit(
+                        events_tx,
+                        format!(
+                            "[research refresh queued: {} note(s) in KMS '{kms}']\n  {}\n  runs one after another; the Research panel follows each job",
+                            ids.len(),
+                            list.join("\n  ")
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("/research refresh failed: {e}")),
+            }
+        }
+        SlashCommand::ResearchList => {
+            let _ = crate::config::ProjectConfig::sync_kms_active(&mut state.config);
+            let jobs = crate::research::manager().list();
+            if jobs.is_empty() {
+                emit(events_tx, "no research jobs (try /research <query>)".into());
+            } else {
+                let mut out = String::new();
+                for j in jobs {
+                    out.push_str(&format!(
+                        "{}  {}  ⏱{}  iter={}  src={}  score={}  query={}\n",
+                        j.id,
+                        j.status.as_str(),
+                        j.elapsed_str(),
+                        j.iterations_done,
+                        j.source_count,
+                        j.last_score
+                            .map(|s| format!("{s:.2}"))
+                            .unwrap_or_else(|| "—".into()),
+                        truncate_chars(&j.query, 60),
+                    ));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::ResearchStatus { id } => match crate::research::manager().get(&id) {
+            Some(j) => emit(events_tx, format!("{:#?}", j)),
+            None => emit(events_tx, format!("no research job '{id}'")),
+        },
+        SlashCommand::ResearchShow { id } => match crate::research::manager().get(&id) {
+            Some(j) => {
+                // Re-open / focus the right-edge Research panel on this job
+                // (the panel forwards any `research_*` payload verbatim).
+                let _ = events_tx.send(crate::shared_session::ViewEvent::ResearchUpdate(
+                    serde_json::json!({"type": "research_focus", "id": j.id}).to_string(),
+                ));
+                match (j.status, &j.result_page) {
+                    (crate::research::JobStatus::Done, Some(path)) => {
+                        let parts: Vec<&str> = path.splitn(2, '/').collect();
+                        if parts.len() == 2 {
+                            if let Some(kref) = crate::kms::resolve(parts[0]) {
+                                // v2 `--dry-run` reports `runs/<file>` (KMS root),
+                                // everything else is a page under `pages/`.
+                                let p = if parts[1].starts_with("runs/") {
+                                    kref.root.join(parts[1])
+                                } else {
+                                    kref.pages_dir().join(parts[1])
+                                };
+                                match std::fs::read_to_string(&p) {
+                                    Ok(body) => emit(events_tx, body),
+                                    Err(e) => {
+                                        emit(events_tx, format!("cannot read {}: {e}", p.display()))
+                                    }
+                                }
+                            } else {
+                                emit(events_tx, format!("KMS '{}' not found", parts[0]));
+                            }
+                        } else {
+                            emit(events_tx, format!("malformed result_page: {path}"));
+                        }
+                    }
+                    (status, _) => emit(
+                        events_tx,
+                        format!(
+                            "status: {} — phase: {} (iter {}, src {}, score {})",
+                            status.as_str(),
+                            j.phase,
+                            j.iterations_done,
+                            j.source_count,
+                            j.last_score
+                                .map(|s| format!("{s:.2}"))
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                    ),
+                }
+            }
+            None => emit(events_tx, format!("no research job '{id}'")),
+        },
+        SlashCommand::ResearchCancel { id } => {
+            if crate::research::manager().cancel(&id) {
+                emit(events_tx, format!("[research cancel signaled: {id}]"));
+            } else {
+                emit(
+                    events_tx,
+                    format!("cannot cancel '{id}' (unknown id or already terminal)"),
+                );
+            }
+        }
+        SlashCommand::ResearchWait { id } => {
+            // GUI doesn't block — emit a one-line note so the user
+            // knows to check status. CLI's `/research wait` polls; GUI
+            // surfaces the same info via the future sidebar panel
+            // (M6.39.3) + auto-notification on completion.
+            emit(
+                events_tx,
+                format!("/research wait is CLI-only — use /research show {id} from chat to poll"),
+            );
+        }
+        SlashCommand::GoalContinue => {
+            // Handled in shared_session.rs::handle_line as a turn-rewrite
+            // BEFORE this dispatch is called (mirrors the
+            // KmsIngestSession pattern). If we reach here, the
+            // intercept missed for some reason — surface a clear error.
+            emit(
+                events_tx,
+                "/goal continue requires the agent loop — invoke from chat / CLI, \
+                 not via shell_dispatch directly."
+                    .into(),
+            );
+        }
+        SlashCommand::GoalComplete { reason } => {
+            if crate::goal_state::current().is_none() {
+                emit(events_tx, "no active goal".into());
+                return;
+            }
+            let r = reason.clone();
+            crate::goal_state::apply(|g| {
+                g.status = crate::goal_state::GoalStatus::Complete;
+                if let Some(r) = &r {
+                    g.last_message = Some(r.clone());
+                }
+                g.completed_at = Some(now_secs());
+                true
+            });
+            emit(events_tx, "goal marked complete".into());
+        }
+        SlashCommand::GoalAbandon { reason } => {
+            if crate::goal_state::current().is_none() {
+                emit(events_tx, "no active goal".into());
+                return;
+            }
+            let r = reason.clone();
+            crate::goal_state::apply(|g| {
+                g.status = crate::goal_state::GoalStatus::Abandoned;
+                if let Some(r) = &r {
+                    g.last_message = Some(r.clone());
+                }
+                g.completed_at = Some(now_secs());
+                true
+            });
+            emit(events_tx, "goal abandoned".into());
+        }
+
+        // ─── sso (EE Phase 4) ───────────────────────────────────────
+        SlashCommand::PolicyStatus => {
+            emit(events_tx, crate::policy::status_text());
+        }
+        SlashCommand::Sso { sub } => {
+            let policy = crate::policy::active()
+                .and_then(|a| a.policy.policies.sso.as_ref())
+                .cloned();
+            let policy = match policy {
+                Some(p) if p.enabled => p,
+                Some(_) => {
+                    emit(
+                        events_tx,
+                        "policies.sso.enabled is false — nothing to do".into(),
+                    );
+                    return;
+                }
+                None => {
+                    emit(
+                        events_tx,
+                        "no SSO policy active — /sso requires policies.sso.enabled in the org policy".into(),
+                    );
+                    return;
+                }
+            };
+            match sub {
+                crate::repl::SsoSubcommand::Status => {
+                    emit(events_tx, crate::sso::status(&policy));
+                }
+                crate::repl::SsoSubcommand::Login => match crate::sso::login(&policy).await {
+                    Ok(s) => {
+                        let who = s
+                            .email
+                            .clone()
+                            .or(s.name.clone())
+                            .or(s.sub.clone())
+                            .unwrap_or_else(|| "(no identity claim)".into());
+                        emit(
+                            events_tx,
+                            format!("✓ signed in as {who} (issuer: {})", s.issuer),
+                        );
+                    }
+                    Err(e) => emit(events_tx, format!("/sso login failed: {e}")),
+                },
+                crate::repl::SsoSubcommand::Logout => match crate::sso::logout(&policy) {
+                    Ok(()) => emit(events_tx, "signed out (cached tokens cleared)".into()),
+                    Err(e) => emit(events_tx, format!("/sso logout failed: {e}")),
+                },
+            }
+        }
+
+        // ─── skills ─────────────────────────────────────────────────
+        SlashCommand::Skills => {
+            let s = crate::skills::SkillStore::discover();
+            if s.skills.is_empty() {
+                emit(events_tx, "(no skills installed)".into());
+            } else {
+                let mut entries: Vec<&crate::skills::SkillDef> = s.skills.values().collect();
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                let mut out = String::from("Skills:\n");
+                for s in entries {
+                    out.push_str(&format!("  {} — {}\n", s.name, s.description));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::SkillShow(name) => {
+            let store = crate::skills::SkillStore::discover();
+            match store.get(&name) {
+                Some(skill) => {
+                    let mut out = format!("{} — {}\n", skill.name, skill.description);
+                    if !skill.when_to_use.is_empty() {
+                        out.push_str(&format!("when to use: {}\n", skill.when_to_use));
+                    }
+                    out.push_str(&format!("path: {}\n", skill.dir.display()));
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("unknown skill: '{name}' — /skills to list"),
+                ),
+            }
+        }
+        SlashCommand::SkillInstall {
+            git_url,
+            name,
+            project,
+        } => {
+            // Resolve marketplace name → install_url (or fall through
+            // for a URL). See `repl::resolve_skill_install_target` for
+            // the same logic in the CLI surface.
+            crate::marketplace::refresh_private().await;
+            let (effective_url, effective_name, abort_msg) =
+                resolve_skill_install_target_gui(&git_url, name.as_deref());
+            if let Some(msg) = abort_msg {
+                emit(events_tx, msg);
+                return;
+            }
+            match crate::skills::install_from_url(
+                &effective_url,
+                effective_name.as_deref(),
+                project,
+            )
+            .await
+            {
+                Ok(report) => {
+                    // Live refresh: replace the SkillTool's store
+                    // contents + recompute the system prompt so the
+                    // new skill is listed in `# Available skills`.
+                    let refreshed = crate::skills::SkillStore::discover();
+                    if let Ok(mut store) = state.skill_store.lock() {
+                        *store = refreshed;
+                    }
+                    state.rebuild_system_prompt();
+                    if let Err(e) = state.rebuild_agent(true) {
+                        emit(events_tx, format!("rebuild failed: {e}"));
+                        return;
+                    }
+                    let mut out = report.join("\n");
+                    out.push_str("\n(skill available in this session — no restart needed)");
+                    emit(events_tx, out);
+                }
+                Err(e) => emit(events_tx, format!("skill install failed: {e}")),
+            }
+        }
+        SlashCommand::SkillUpdate { name, project } => {
+            crate::marketplace::refresh_private().await;
+            let (url, _, abort_msg) = resolve_skill_install_target_gui(&name, None);
+            if let Some(msg) = abort_msg {
+                emit(events_tx, msg);
+                return;
+            }
+            match crate::skills::update_from_url(&url, &name, project).await {
+                Ok(report) => {
+                    let refreshed = crate::skills::SkillStore::discover();
+                    if let Ok(mut store) = state.skill_store.lock() {
+                        *store = refreshed;
+                    }
+                    state.rebuild_system_prompt();
+                    if let Err(e) = state.rebuild_agent(true) {
+                        emit(events_tx, format!("rebuild failed: {e}"));
+                        return;
+                    }
+                    let mut out = report.join("\n");
+                    out.push_str("\n(the new version is live in this session — no restart needed)");
+                    emit(events_tx, out);
+                }
+                Err(e) => emit(events_tx, format!("skill update failed: {e}")),
+            }
+        }
+        SlashCommand::SkillMarketplace { refresh } => {
+            if refresh {
+                match crate::marketplace::refresh_from_remote().await {
+                    Ok(out) => emit(
+                        events_tx,
+                        format!(
+                            "refreshed marketplace from {} — {} skill(s)",
+                            crate::marketplace::REMOTE_URL,
+                            out.skill_count
+                        ),
+                    ),
+                    Err(e) => emit(
+                        events_tx,
+                        format!("refresh failed ({e}); using cached/baseline catalogue"),
+                    ),
+                }
+            }
+            crate::marketplace::refresh_private().await;
+            let mp = crate::marketplace::load();
+            // M6.11 (H2): include cache freshness in the header so
+            // users see how old their snapshot is at a glance.
+            let age_suffix = match crate::marketplace::cache_age_label() {
+                Some(label) => format!(", {label}"),
+                None => String::new(),
+            };
+            let mut out = format!(
+                "marketplace ({}, {} skill(s){age_suffix})\n",
+                mp.source,
+                mp.skills.len(),
+            );
+            let mut by_cat: std::collections::BTreeMap<
+                String,
+                Vec<&crate::marketplace::MarketplaceSkill>,
+            > = std::collections::BTreeMap::new();
+            for s in &mp.skills {
+                let cat = if s.category.is_empty() {
+                    "other".to_string()
+                } else {
+                    s.category.clone()
+                };
+                by_cat.entry(cat).or_default().push(s);
+            }
+            for (cat, skills) in by_cat {
+                out.push_str(&format!("── {cat} ──\n"));
+                for s in skills {
+                    let tags = crate::marketplace::entry_tags(s);
+                    out.push_str(&format!("  {:<24}{tags} — {}\n", s.name, s.short_line()));
+                }
+            }
+            out.push_str("install with: /skill install <name>   |   detail: /skill info <name>");
+            emit(events_tx, out);
+        }
+        SlashCommand::SkillSearch(query) => {
+            let mp = crate::marketplace::load();
+            let hits = mp.search(&query);
+            if hits.is_empty() {
+                emit(
+                    events_tx,
+                    format!("no matches for '{query}' — try /skill marketplace"),
+                );
+            } else {
+                let mut out = format!("{} match(es) for '{query}':\n", hits.len());
+                for s in hits {
+                    out.push_str(&format!("  {:<24} — {}\n", s.name, s.short_line()));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::SkillInfo(name) => {
+            let mp = crate::marketplace::load();
+            match mp.find(&name) {
+                Some(s) => {
+                    let mut out = format!("name:        {}\n", s.name);
+                    out.push_str(&format!("description: {}\n", s.description));
+                    if !s.category.is_empty() {
+                        out.push_str(&format!("category:    {}\n", s.category));
+                    }
+                    out.push_str(&format!(
+                        "license:     {} ({})\n",
+                        s.license, s.license_tier
+                    ));
+                    if !s.homepage.is_empty() {
+                        out.push_str(&format!("homepage:    {}\n", s.homepage));
+                    }
+                    match (s.license_tier.as_str(), s.install_url.as_ref()) {
+                        ("linked-only", _) => out.push_str(&format!(
+                            "install:     not redistributable — install from {}",
+                            if s.homepage.is_empty() {
+                                "the upstream repo"
+                            } else {
+                                &s.homepage
+                            }
+                        )),
+                        (_, Some(url)) => out.push_str(&format!(
+                            "install:     /skill install {} (resolves to {url})",
+                            s.name
+                        )),
+                        (_, None) => out.push_str("install:     no install_url in catalogue"),
+                    }
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("no skill named '{name}' in marketplace — try /skill search <query>"),
+                ),
+            }
+        }
+        SlashCommand::SubagentMarketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            crate::marketplace::refresh_private().await;
+            let mp = crate::marketplace::load();
+            let age_suffix = match crate::marketplace::cache_age_label() {
+                Some(label) => format!(", {label}"),
+                None => String::new(),
+            };
+            let mut out = format!(
+                "marketplace ({}, {} subagent(s){age_suffix})\n",
+                mp.source,
+                mp.subagents.len(),
+            );
+            for s in &mp.subagents {
+                let tags = crate::marketplace::entry_tags(s);
+                out.push_str(&format!("  {:<24}{tags} — {}\n", s.name, s.short_line()));
+            }
+            out.push_str("install with: /subagent install <name>   |   browse all: /marketplace");
+            emit(events_tx, out);
+        }
+        SlashCommand::SubagentSearch(query) => {
+            let mp = crate::marketplace::load();
+            let hits = mp.search_subagent(&query);
+            if hits.is_empty() {
+                emit(
+                    events_tx,
+                    format!("no matches for '{query}' — try /subagent marketplace"),
+                );
+            } else {
+                let mut out = format!("{} match(es) for '{query}':\n", hits.len());
+                for s in hits {
+                    out.push_str(&format!("  {:<24} — {}\n", s.name, s.short_line()));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::SubagentInfo(name) => {
+            let mp = crate::marketplace::load();
+            match mp.find_subagent(&name) {
+                Some(s) => {
+                    let mut out = format!("name:        {}\n", s.name);
+                    out.push_str(&format!("description: {}\n", s.description));
+                    if !s.category.is_empty() {
+                        out.push_str(&format!("category:    {}\n", s.category));
+                    }
+                    out.push_str(&format!(
+                        "license:     {} ({})\n",
+                        s.license, s.license_tier
+                    ));
+                    if !s.homepage.is_empty() {
+                        out.push_str(&format!("homepage:    {}\n", s.homepage));
+                    }
+                    match (s.license_tier.as_str(), s.install_url.as_ref()) {
+                        ("linked-only", _) => out.push_str(&format!(
+                            "install:     not redistributable — install from {}",
+                            if s.homepage.is_empty() {
+                                "the upstream repo"
+                            } else {
+                                &s.homepage
+                            }
+                        )),
+                        (_, Some(url)) => out.push_str(&format!(
+                            "install:     /subagent install {} (resolves to {url})",
+                            s.name
+                        )),
+                        (_, None) => out.push_str("install:     no install_url in catalogue"),
+                    }
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("no subagent named '{name}' in marketplace — try /subagent search"),
+                ),
+            }
+        }
+        SlashCommand::SubagentInstall { arg, name, project } => {
+            crate::marketplace::refresh_private().await;
+            let (effective_url, abort_msg) =
+                crate::agent_defs::resolve_subagent_install_target(&arg);
+            if let Some(msg) = abort_msg {
+                emit(events_tx, msg);
+                return;
+            }
+            match crate::agent_defs::install_subagent_from_url(
+                &effective_url,
+                name.as_deref(),
+                project,
+            )
+            .await
+            {
+                Ok(report) => {
+                    // Reload the worker's def snapshot so a `/subagent
+                    // <name>` side-channel can spawn it right away (matches
+                    // the `AgentDefsChanged` handler). Model-driven Task
+                    // picks up the new def on the next session.
+                    let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
+                    let mut reloaded =
+                        crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+                    reloaded.apply_builtin_subagent_overrides(&state.config);
+                    state.agent_defs = reloaded;
+                    let mut out = report.join("\n");
+                    out.push_str(
+                        "\n(spawn now via /subagent <name>; model-driven Task sees it next session)",
+                    );
+                    emit(events_tx, out);
+                }
+                Err(e) => emit(events_tx, format!("subagent install failed: {e}")),
+            }
+        }
+        SlashCommand::Marketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            crate::marketplace::refresh_private().await;
+            let mp = crate::marketplace::load();
+            // Installed-name sets for the [installed ✓] badges. Skills
+            // from the live SkillStore; subagents from the loaded defs
+            // (built-in or disk). MCP / plugin badges are a follow-up.
+            let installed_skills: Vec<String> = state
+                .skill_store
+                .lock()
+                .map(|s| s.skills.keys().cloned().collect())
+                .unwrap_or_default();
+            let installed_subagents: Vec<String> = state
+                .agent_defs
+                .names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let payload = serde_json::json!({
+                "type": "marketplace_open",
+                "source": mp.source,
+                "cacheAge": crate::marketplace::cache_age_label(),
+                "catalog": mp,
+                "installed": {
+                    "skills": installed_skills,
+                    "subagents": installed_subagents,
+                },
+            });
+            let _ = events_tx.send(ViewEvent::MarketplaceOpen(payload.to_string()));
+        }
+        SlashCommand::McpMarketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            crate::marketplace::refresh_private().await;
+            let mp = crate::marketplace::load();
+            let age_suffix = match crate::marketplace::cache_age_label() {
+                Some(label) => format!(", {label}"),
+                None => String::new(),
+            };
+            let mut out = format!(
+                "MCP marketplace ({}, {} server(s){age_suffix})\n",
+                mp.source,
+                mp.mcp_servers.len(),
+            );
+            let mut by_cat: std::collections::BTreeMap<
+                String,
+                Vec<&crate::marketplace::MarketplaceMcpServer>,
+            > = std::collections::BTreeMap::new();
+            for s in &mp.mcp_servers {
+                let cat = if s.category.is_empty() {
+                    "other".into()
+                } else {
+                    s.category.clone()
+                };
+                by_cat.entry(cat).or_default().push(s);
+            }
+            for (cat, servers) in by_cat {
+                out.push_str(&format!("── {cat} ──\n"));
+                for s in servers {
+                    let tport = if s.transport == "sse" {
+                        " [hosted]"
+                    } else {
+                        ""
+                    };
+                    let tags = crate::marketplace::entry_tags(s);
+                    out.push_str(&format!(
+                        "  {:<24}{tport}{tags} — {}\n",
+                        s.name,
+                        s.short_line()
+                    ));
+                }
+            }
+            out.push_str("install with: /mcp install <name>   |   detail: /mcp info <name>");
+            emit(events_tx, out);
+        }
+        SlashCommand::McpSearch(query) => {
+            let mp = crate::marketplace::load();
+            let hits = mp.search_mcp(&query);
+            if hits.is_empty() {
+                emit(
+                    events_tx,
+                    format!("no matches for '{query}' — try /mcp marketplace"),
+                );
+            } else {
+                let mut out = format!("{} match(es) for '{query}':\n", hits.len());
+                for s in hits {
+                    out.push_str(&format!("  {:<24} — {}\n", s.name, s.short_line()));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::McpInfo(name) => {
+            let mp = crate::marketplace::load();
+            match mp.find_mcp(&name) {
+                Some(s) => {
+                    let mut out = format!("name:         {}\n", s.name);
+                    out.push_str(&format!("description:  {}\n", s.description));
+                    if !s.category.is_empty() {
+                        out.push_str(&format!("category:     {}\n", s.category));
+                    }
+                    out.push_str(&format!(
+                        "license:      {} ({})\n",
+                        s.license, s.license_tier
+                    ));
+                    out.push_str(&format!("transport:    {}\n", s.transport));
+                    if s.transport == "stdio" && !s.command.is_empty() {
+                        let argv = if s.args.is_empty() {
+                            s.command.clone()
+                        } else {
+                            format!("{} {}", s.command, s.args.join(" "))
+                        };
+                        out.push_str(&format!("command:      {argv}\n"));
+                    }
+                    if s.transport == "sse" && !s.url.is_empty() {
+                        out.push_str(&format!("url:          {}\n", s.url));
+                    }
+                    if let Some(src) = &s.install_url {
+                        out.push_str(&format!("source:       {src}\n"));
+                    }
+                    if !s.homepage.is_empty() {
+                        out.push_str(&format!("homepage:     {}\n", s.homepage));
+                    }
+                    if let Some(msg) = &s.post_install_message {
+                        out.push_str(&format!("note:         {msg}\n"));
+                    }
+                    out.push_str(&format!("install with: /mcp install {}", s.name));
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("no MCP named '{name}' in marketplace — try /mcp search <query>"),
+                ),
+            }
+        }
+        SlashCommand::McpInstall { name, user } => {
+            match crate::repl::install_mcp_from_marketplace(&name, user).await {
+                Ok(report) => {
+                    emit(events_tx, report.join("\n"));
+                    broadcast_mcp_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("mcp install failed: {e}")),
+            }
+        }
+        SlashCommand::PluginMarketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            crate::marketplace::refresh_private().await;
+            let mp = crate::marketplace::load();
+            let age_suffix = match crate::marketplace::cache_age_label() {
+                Some(label) => format!(", {label}"),
+                None => String::new(),
+            };
+            let mut out = format!(
+                "plugin marketplace ({}, {} plugin(s){age_suffix})\n",
+                mp.source,
+                mp.plugins.len(),
+            );
+            let mut by_cat: std::collections::BTreeMap<
+                String,
+                Vec<&crate::marketplace::MarketplacePlugin>,
+            > = std::collections::BTreeMap::new();
+            for p in &mp.plugins {
+                let cat = if p.category.is_empty() {
+                    "other".into()
+                } else {
+                    p.category.clone()
+                };
+                by_cat.entry(cat).or_default().push(p);
+            }
+            for (cat, plugins) in by_cat {
+                out.push_str(&format!("── {cat} ──\n"));
+                for p in plugins {
+                    let tags = crate::marketplace::entry_tags(p);
+                    out.push_str(&format!("  {:<24}{tags} — {}\n", p.name, p.short_line()));
+                }
+            }
+            out.push_str("install with: /plugin install <name>   |   detail: /plugin info <name>");
+            emit(events_tx, out);
+        }
+        SlashCommand::PluginSearch(query) => {
+            let mp = crate::marketplace::load();
+            let hits = mp.search_plugin(&query);
+            if hits.is_empty() {
+                emit(
+                    events_tx,
+                    format!("no matches for '{query}' — try /plugin marketplace"),
+                );
+            } else {
+                let mut out = format!("{} match(es) for '{query}':\n", hits.len());
+                for p in hits {
+                    out.push_str(&format!("  {:<24} — {}\n", p.name, p.short_line()));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::PluginInfo(name) => {
+            let mp = crate::marketplace::load();
+            match mp.find_plugin(&name) {
+                Some(p) => {
+                    let mut out = format!("name:         {}\n", p.name);
+                    out.push_str(&format!("description:  {}\n", p.description));
+                    if !p.category.is_empty() {
+                        out.push_str(&format!("category:     {}\n", p.category));
+                    }
+                    out.push_str(&format!(
+                        "license:      {} ({})\n",
+                        p.license, p.license_tier
+                    ));
+                    if !p.homepage.is_empty() {
+                        out.push_str(&format!("homepage:     {}\n", p.homepage));
+                    }
+                    out.push_str(&format!(
+                        "install with: /plugin install {} (resolves to {})",
+                        p.name, p.install_url
+                    ));
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("no plugin named '{name}' in marketplace — try /plugin search <query>"),
+                ),
+            }
+        }
+
+        // ─── knowledge bases ────────────────────────────────────────
+        SlashCommand::Kms => {
+            let all = crate::kms::list_all();
+            if all.is_empty() {
+                emit(
+                    events_tx,
+                    "no knowledge bases yet — try: /kms new default".into(),
+                );
+            } else {
+                let active: std::collections::HashSet<&String> =
+                    state.config.kms_active.iter().collect();
+                let mut out = String::from("Knowledge bases:\n");
+                for k in &all {
+                    let marker = if active.contains(&k.name) { "*" } else { " " };
+                    out.push_str(&format!(
+                        "  {marker} {:<16} ({})\n",
+                        k.name,
+                        k.scope.as_str()
+                    ));
+                }
+                out.push_str("(* = attached to this project; toggle with /kms use | /kms off)");
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::KmsNew { name, project } => {
+            // Default (project) reuses any existing same-named KMS across
+            // scopes via `ensure_default` so `/kms new foo` can't duplicate a
+            // base that already lives in user scope. `--user` stays explicit.
+            let res = if project {
+                crate::kms::ensure_default(&name)
+            } else {
+                crate::kms::create(&name, crate::kms::KmsScope::User)
+            };
+            match res {
+                Ok(k) => {
+                    emit(
+                        events_tx,
+                        format!(
+                            "created KMS '{}' ({}) → {}",
+                            k.name,
+                            k.scope.as_str(),
+                            k.root.display()
+                        ),
+                    );
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("create failed: {e}")),
+            }
+        }
+        SlashCommand::KmsUse(name) => {
+            // Settle on the base's real name before anything is compared or
+            // saved: `resolve` also finds a base by slug, and recording the
+            // spelling that found it would attach one base under two names.
+            let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
+            if crate::kms::resolve(&name).is_none() {
+                emit(
+                    events_tx,
+                    format!("no KMS named '{name}' (try /kms list or /kms new {name})"),
+                );
+            } else if state.config.kms_active.iter().any(|n| n == &name) {
+                emit(events_tx, format!("KMS '{name}' already attached"));
+            } else {
+                state.config.kms_active.push(name.clone());
+                if let Err(e) =
+                    crate::config::ProjectConfig::set_active_kms(state.config.kms_active.clone())
+                {
+                    emit(events_tx, format!("save failed: {e}"));
+                    return;
+                }
+                // Live register: ensure KMS tools are in the registry
+                // (first KMS activation; repeated ones are idempotent
+                // since register() is insert-overwrite).
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsReadTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsSearchTool));
+                // M6.25 BUG #1: write tools alongside read tools.
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsWriteTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsWriteSourceTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsAppendTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsEditTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
+                state.rebuild_system_prompt();
+                if let Err(e) = state.rebuild_agent(true) {
+                    emit(events_tx, format!("rebuild failed: {e}"));
+                    return;
+                }
+                emit(
+                    events_tx,
+                    format!("KMS '{name}' attached (tools registered; available this turn)"),
+                );
+                broadcast_kms_update(events_tx);
+            }
+        }
+        SlashCommand::KmsOff(name) => {
+            // Settle on the base's real name before anything is compared or
+            // saved: `resolve` also finds a base by slug, and recording the
+            // spelling that found it would attach one base under two names.
+            let name = crate::kms::resolve(&name).map(|k| k.name).unwrap_or(name);
+            let before = state.config.kms_active.len();
+            state.config.kms_active.retain(|n| n != &name);
+            if state.config.kms_active.len() == before {
+                emit(events_tx, format!("KMS '{name}' was not attached"));
+            } else {
+                if let Err(e) =
+                    crate::config::ProjectConfig::set_active_kms(state.config.kms_active.clone())
+                {
+                    emit(events_tx, format!("save failed: {e}"));
+                    return;
+                }
+                // If no KMS is attached anymore, drop the tools so
+                // the model doesn't see stale affordances.
+                if state.config.kms_active.is_empty() {
+                    state.tool_registry.remove("KmsRead");
+                    state.tool_registry.remove("KmsSearch");
+                    state.tool_registry.remove("KmsWrite");
+                    state.tool_registry.remove("KmsAppend");
+                    state.tool_registry.remove("KmsEdit");
+                    // M6.38.2 audit fix (Bug A): KmsDelete was added in
+                    // M6.27 (`/dream` work) but never paired with a remove
+                    // here. After the last /kms off it lingered in the
+                    // registry — model saw the affordance but every call
+                    // failed because no KMS was active.
+                    state.tool_registry.remove("KmsDelete");
+                }
+                state.rebuild_system_prompt();
+                if let Err(e) = state.rebuild_agent(true) {
+                    emit(events_tx, format!("rebuild failed: {e}"));
+                    return;
+                }
+                emit(
+                    events_tx,
+                    format!("KMS '{name}' detached (system prompt updated)"),
+                );
+                broadcast_kms_update(events_tx);
+            }
+        }
+        SlashCommand::KmsShow(name) => match crate::kms::resolve(&name) {
+            Some(k) => {
+                let active = state.config.kms_active.iter().any(|n| n == &k.name);
+                let mark = if active { "attached" } else { "not attached" };
+                emit(
+                    events_tx,
+                    format!(
+                        "{} ({}) — {mark}\npath: {}",
+                        k.name,
+                        k.scope.as_str(),
+                        k.root.display()
+                    ),
+                );
+            }
+            None => emit(events_tx, format!("no KMS named '{name}'")),
+        },
+        SlashCommand::KmsIngest {
+            name,
+            file,
+            alias,
+            force,
+        } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(
+                    events_tx,
+                    format!("no KMS named '{name}' (try /kms list or /kms new {name})"),
+                );
+                return;
+            };
+            let source = std::path::PathBuf::from(&file);
+            let source = if source.is_absolute() {
+                source
+            } else {
+                // state.cwd is the agent's own folder under a workspace host;
+                // the user's files are at the workspace root (dev-plan/61).
+                crate::workdir::current_workdir().join(&source)
+            };
+            // A directory ingests every supported file under it. Seeding
+            // a KMS from a notes folder or a docs tree was otherwise a
+            // shell loop over single-file ingests.
+            if source.is_dir() {
+                match crate::kms::ingest_dir(&k, &source, force) {
+                    Ok(r) => {
+                        let mut msg = format!("ingested {} → {}", source.display(), r.summary());
+                        for (path, why) in r.skipped.iter().take(10) {
+                            msg.push_str(&format!("\n  skipped {path}: {why}"));
+                        }
+                        if r.skipped.len() > 10 {
+                            msg.push_str(&format!("\n  … and {} more", r.skipped.len() - 10));
+                        }
+                        emit(events_tx, msg);
+                    }
+                    Err(e) => emit(events_tx, format!("directory ingest failed: {e}")),
+                }
+                return;
+            }
+            match crate::kms::ingest(&k, &source, alias.as_deref(), force) {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
+                    let images = if r.images_copied > 0 {
+                        format!(" (+{} local image(s))", r.images_copied)
+                    } else {
+                        String::new()
+                    };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} → {} — {}{images}{cascade}{}",
+                            r.target.display(),
+                            r.summary,
+                            r.notes()
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestUrl {
+            name,
+            url,
+            alias,
+            force,
+        } => {
+            // M6.25 BUG #8: URL ingest dispatches via async ingest_url.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::ingest_url(&k, &url, alias.as_deref(), force).await {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} {url} → {} — {}{cascade}{}",
+                            r.target.display(),
+                            r.summary,
+                            r.notes()
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("url ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestPdf {
+            name,
+            file,
+            alias,
+            force,
+            // `--vision` is intercepted as an agent turn-rewrite in
+            // shared_session::handle_line before dispatch, so this arm only
+            // ever runs the deterministic text-extraction path.
+            vision: _,
+        } => {
+            // M6.25 BUG #8: PDF ingest via pdftotext.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let source = std::path::PathBuf::from(&file);
+            let source = if source.is_absolute() {
+                source
+            } else {
+                // state.cwd is the agent's own folder under a workspace host;
+                // the user's files are at the workspace root (dev-plan/61).
+                crate::workdir::current_workdir().join(&source)
+            };
+            match crate::kms::ingest_pdf(&k, &source, alias.as_deref(), force, None).await {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    let cascade = if r.cascaded > 0 {
+                        format!(" (marked {} dependent page(s) stale)", r.cascaded)
+                    } else {
+                        String::new()
+                    };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} {} → {} — {}{cascade}{}",
+                            source.display(),
+                            r.target.display(),
+                            r.summary,
+                            r.notes()
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("pdf ingest failed: {e}")),
+            }
+        }
+        SlashCommand::KmsIngestSession { name, .. } => {
+            // M6.28: handled in shared_session.rs::handle_line as a
+            // turn-rewrite BEFORE this dispatch is called, so this
+            // arm should be unreachable in normal flow. If it fires
+            // (e.g. somebody calls dispatch directly bypassing
+            // handle_line), surface a clear error rather than
+            // silently no-opping.
+            emit(
+                events_tx,
+                format!(
+                    "/kms ingest {name} $ requires the agent loop — invoke from chat / CLI, \
+                     not via shell_dispatch::dispatch directly."
+                ),
+            );
+        }
+        SlashCommand::KmsDump { name, .. } => {
+            // Same shape as KmsIngestSession: handled by the
+            // handle_line turn-rewrite. This arm only fires for
+            // direct dispatch, or when the KMS doesn't resolve.
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms dump {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
+            }
+        }
+        SlashCommand::KmsChallenge { name, .. } => {
+            // Same shape as KmsDump — handled in shared_session.rs's
+            // turn-rewrite. This arm fires only when the KMS doesn't
+            // resolve, or when dispatch is called directly.
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms challenge {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
+            }
+        }
+        SlashCommand::KmsReconcile { name, focus, apply } => {
+            let Some(_k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if state.config.kms_active.is_empty() {
+                // Subagent inherits parent's tool registry; KMS tools
+                // register only when kms_active is non-empty.
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms reconcile {name}: no KMS attached to this session. \
+                         Run `/kms use {name}` first so KMS tools are registered."
+                    ),
+                );
+                return;
+            }
+            let prompt = compose_kms_reconcile_prompt(&name, focus.as_deref(), apply);
+            match crate::side_channel::spawn_side_channel(
+                "kms-reconcile".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "✓ kms-reconcile dispatched (id: {id}, {})",
+                        if apply { "--apply" } else { "dry-run" }
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms reconcile: {e}")),
+            }
+        }
+        SlashCommand::KmsLink {
+            name,
+            apply,
+            min_len,
+            llm,
+        } => {
+            let names: Vec<String> = match name {
+                Some(n) => vec![n],
+                None => {
+                    if state.config.kms_active.is_empty() {
+                        emit(
+                            events_tx,
+                            "/kms link: no KMS attached to this session. Run `/kms use <name>` first, or pass a name: `/kms link <name>`.".into(),
+                        );
+                        return;
+                    }
+                    state.config.kms_active.clone()
+                }
+            };
+            let provider_opt = if llm {
+                match crate::repl::build_provider(&state.config) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        emit(
+                            events_tx,
+                            format!("/kms link --llm: provider unavailable: {e}"),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let model_name = state.config.model.clone();
+            for kname in &names {
+                let Some(k) = crate::kms::resolve(kname) else {
+                    emit(
+                        events_tx,
+                        format!("/kms link {kname}: not found, skipping."),
+                    );
+                    continue;
+                };
+                let opts = crate::kms::AutoLinkOptions { min_len, apply };
+                let result = if let Some(ref prov) = provider_opt {
+                    emit(
+                        events_tx,
+                        format!(
+                            "/kms link {kname} --llm: starting per-page LLM pass with `{model_name}` (this may take a while)…"
+                        ),
+                    );
+                    crate::kms::auto_link_llm(&k, opts, prov.as_ref(), &model_name, &state.cancel)
+                        .await
+                } else {
+                    crate::kms::auto_link(&k, opts)
+                };
+                match result {
+                    Ok(report) => {
+                        let mode_tag = if llm { "llm" } else { "deterministic" };
+                        let mode = if apply { "applied" } else { "dry-run" };
+                        let mut msg = format!(
+                            "/kms link {kname} ({mode_tag}, {mode}): scanned {} page(s), {} would gain link(s), {} link insertion(s) total.",
+                            report.pages_scanned,
+                            report.pages_modified,
+                            report.links_added,
+                        );
+                        for hit in report.hits.iter().take(20) {
+                            msg.push_str(&format!(
+                                "\n    {}: \"{}\" → [[{}]]",
+                                hit.page_stem, hit.matched, hit.target_slug,
+                            ));
+                        }
+                        if report.hits.len() > 20 {
+                            msg.push_str(&format!("\n    … and {} more.", report.hits.len() - 20));
+                        }
+                        if !apply && report.links_added > 0 {
+                            msg.push_str("\n  re-run with --apply to write the changes.");
+                        }
+                        emit(events_tx, msg);
+                    }
+                    Err(e) => emit(events_tx, format!("/kms link {kname} failed: {e}")),
+                }
+            }
+        }
+        SlashCommand::KmsRename { old, new } => match crate::kms::rename(&old, &new) {
+            Ok(r) => {
+                let was_attached = state.config.kms_active.iter().any(|n| n == &old);
+                for n in state.config.kms_active.iter_mut() {
+                    if *n == old {
+                        *n = new.clone();
+                    }
+                }
+                emit(
+                    events_tx,
+                    format!("renamed KMS '{old}' → '{new}' ({})", r.root.display()),
+                );
+                if was_attached {
+                    // The system prompt names attached KMSes.
+                    if let Err(e) = state.rebuild_agent(true) {
+                        emit(events_tx, format!("warning: agent rebuild failed: {e}"));
+                    }
+                }
+                broadcast_kms_update(events_tx);
+            }
+            Err(e) => emit(events_tx, format!("/kms rename failed: {e}")),
+        },
+        SlashCommand::KmsDrop { name, force } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if !force {
+                let pages = std::fs::read_dir(k.pages_dir())
+                    .map(|it| it.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0);
+                let sources = std::fs::read_dir(k.root.join("sources"))
+                    .map(|it| it.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0);
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms drop {name}: dry-run (would remove {pages} page(s), {sources} source(s) from {}).\n  re-run with --force to delete.",
+                        k.root.display()
+                    ),
+                );
+                return;
+            }
+            match crate::kms::remove(&name) {
+                Ok(report) => {
+                    // Detach from the session's active list if it was
+                    // there, otherwise the kms_active config keeps a
+                    // dangling name that will fail to resolve on the
+                    // next system-prompt rebuild.
+                    if let Some(pos) = state.config.kms_active.iter().position(|n| n == &name) {
+                        state.config.kms_active.remove(pos);
+                    }
+                    emit(
+                        events_tx,
+                        format!(
+                            "dropped KMS '{name}' ({} page(s), {} source(s)). It is kept for {} days — `/kms restore {}` brings it back.",
+                            report.pages_removed,
+                            report.sources_removed,
+                            crate::kms_trash::KEEP_DAYS,
+                            crate::repl::quote_slash_arg(&name)
+                        ),
+                    );
+                    // Refresh the GUI sidebar so the dropped KMS
+                    // disappears from the list immediately.
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms drop failed: {e}")),
+            }
+        }
+        SlashCommand::KmsMerge { src, dst } => match crate::kms::merge_into(&src, &dst) {
+            Ok(report) => {
+                let mut msg = format!(
+                        "merged '{src}' → '{dst}': {} page(s) copied ({} renamed, {} combined), {} source(s) copied ({} renamed), {} index entr(ies) added.",
+                        report.pages_copied,
+                        report.pages_renamed,
+                        report.pages_combined,
+                        report.sources_copied,
+                        report.sources_renamed,
+                        report.index_entries_added,
+                    );
+                if !report.combined.is_empty() {
+                    msg.push_str(
+                        "\n  aggregator pages combined (src body appended under dst body):",
+                    );
+                    for stem in &report.combined {
+                        msg.push_str(&format!("\n    {stem}.md"));
+                    }
+                }
+                if !report.renames.is_empty() {
+                    msg.push_str(
+                        "\n  collision renames (kept original on dst, incoming was renamed):",
+                    );
+                    for (kind, old, new) in &report.renames {
+                        msg.push_str(&format!("\n    {kind}: {old}.md → {new}.md"));
+                    }
+                }
+                msg.push_str(&format!(
+                    "\n  '{src}' is left intact; run `/kms drop {src}` once you've verified."
+                ));
+                msg.push_str("\n\nsuggested workflow now:");
+                msg.push_str(&format!(
+                    "\n  /kms wrap-up {dst} --fix       # fix broken links + STALE markers\
+                     \n  /kms link {dst}                # dry-run preview of auto-links\
+                     \n  /kms link {dst} --apply        # write the wikilinks\
+                     \n  /kms reconcile {dst} --apply   # resolve contradictions across pages\
+                     \n  /kms drop {src} --force        # remove the source KMS once happy"
+                ));
+                emit(events_tx, msg);
+            }
+            Err(e) => emit(events_tx, format!("/kms merge failed: {e}")),
+        },
+        SlashCommand::KmsConsolidate { dst, scope, drop } => {
+            match crate::kms::consolidate(&dst, scope, drop) {
+                Ok(report) => {
+                    emit(events_tx, report.summary_lines().join("\n"));
+                    // dst created and/or sources dropped → refresh the sidebar.
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms consolidate failed: {e}")),
+            }
+        }
+        SlashCommand::KmsExportOkf { name, output_dir } => {
+            let out = output_dir.unwrap_or_else(|| format!("{name}-okf"));
+            match crate::kms::export_okf(&name, std::path::Path::new(&out)) {
+                Ok(report) => emit(
+                    events_tx,
+                    format!(
+                        "exported '{name}' as OKF bundle → {} ({} page(s), {} reference(s)).",
+                        report.out_dir.display(),
+                        report.pages,
+                        report.sources,
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms export-okf failed: {e}")),
+            }
+        }
+        SlashCommand::KmsImportOkf {
+            bundle,
+            name,
+            scope,
+        } => match crate::kms::import_okf(std::path::Path::new(&bundle), &name, scope) {
+            Ok(report) => {
+                emit(
+                    events_tx,
+                    format!(
+                        "imported OKF bundle '{bundle}' → KMS '{name}' ({} scope): {} page(s), {} source(s). \
+                         Attach it with `/kms use {name}`.",
+                        scope.as_str(),
+                        report.pages,
+                        report.sources,
+                    ),
+                );
+                broadcast_kms_update(events_tx);
+            }
+            Err(e) => emit(events_tx, format!("/kms import-okf failed: {e}")),
+        },
+        SlashCommand::KmsSearch {
+            name,
+            query,
+            is_pattern,
+        } => {
+            // dev-plan/36 follow-up: `/kms search <name|*> <query>`.
+            // Same shared helper the CLI uses so GUI + CLI behave
+            // identically.
+            let out = crate::tools::kms::run_slash_search(&name, &query, is_pattern);
+            emit(events_tx, out);
+        }
+        SlashCommand::KmsReindex(name) => {
+            // Rebuilds all three derived artefacts (source catalogue,
+            // index.md, BM25 index). Mirrors the CLI handler in repl.rs.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            emit(events_tx, format!("/kms reindex {name} — rebuilding…"));
+            match crate::kms::reindex(&k) {
+                Ok(r) => emit(events_tx, format!("/kms reindex {name} — {}", r.summary())),
+                Err(e) => emit(events_tx, format!("/kms reindex {name} failed: {e}")),
+            }
+        }
+        SlashCommand::KmsTrash(name) => match crate::kms_trash::apply_list(&name) {
+            Ok(msg) => emit(events_tx, msg),
+            Err(e) => emit(events_tx, format!("/kms trash: {e}")),
+        },
+        SlashCommand::KmsRestore { name, page } => {
+            match crate::kms_trash::apply_restore(&name, page.as_deref()) {
+                Ok(msg) => {
+                    emit(events_tx, msg);
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms restore: {e}")),
+            }
+        }
+        SlashCommand::KmsEntry { name, set, clear } => {
+            let Some(kname) = name.or_else(|| state.config.kms_active.last().cloned()) else {
+                emit(
+                    events_tx,
+                    "/kms entry: no KMS attached to this session. Run `/kms use <name>` first, or pass a name."
+                        .into(),
+                );
+                return;
+            };
+            match crate::kms::apply_entry(&kname, set.as_deref(), clear) {
+                Ok(msg) => {
+                    emit(events_tx, msg);
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms entry: {e}")),
+            }
+        }
+        SlashCommand::KmsVerify {
+            name,
+            llm,
+            stale_days,
+            page,
+            fix,
+            ground,
+        } => {
+            let Some(kname) = name.or_else(|| state.config.kms_active.last().cloned()) else {
+                emit(
+                    events_tx,
+                    "/kms verify: no KMS attached to this session. Run `/kms use <name>` first, or pass a name."
+                        .into(),
+                );
+                return;
+            };
+            let opts = crate::kms_verify::VerifyOptions {
+                stale_days: stale_days.unwrap_or(crate::kms_verify::DEFAULT_STALE_DAYS),
+                page,
+                llm,
+                fix,
+                ground,
+            };
+            let provider = if llm {
+                match crate::repl::build_provider(&state.config) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        emit(
+                            events_tx,
+                            format!("/kms verify --llm: provider unavailable: {e}"),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if llm {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms verify {kname} --llm: auditing each cited page with `{}` (8 at a time)…",
+                        state.config.model
+                    ),
+                );
+            }
+            match crate::kms_verify::run(
+                &kname,
+                &opts,
+                provider,
+                &state.config.model,
+                std::time::Duration::from_secs(180),
+                &state.cancel,
+            )
+            .await
+            {
+                Ok(msg) => emit(events_tx, msg),
+                Err(e) => emit(events_tx, format!("/kms verify failed: {e}")),
+            }
+        }
+        SlashCommand::KmsLint(name) => {
+            // M6.25 BUG #3: pure-read health check.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::lint(&k) {
+                Ok(report) => {
+                    emit(events_tx, crate::kms::format_lint_report(&name, &report));
+                }
+                Err(e) => emit(events_tx, format!("lint failed: {e}")),
+            }
+        }
+        SlashCommand::KmsWrapUp { name, fix } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let lint = match crate::kms::lint(&k) {
+                Ok(r) => r,
+                Err(e) => {
+                    emit(events_tx, format!("wrap-up failed (lint): {e}"));
+                    return;
+                }
+            };
+            let stale = match crate::kms::scan_stale_markers(&k) {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(events_tx, format!("wrap-up failed (stale scan): {e}"));
+                    return;
+                }
+            };
+            emit(
+                events_tx,
+                crate::kms::format_wrap_up_report(&name, &lint, &stale),
+            );
+            if fix {
+                if !has_actionable_issues(&lint, &stale) {
+                    emit(
+                        events_tx,
+                        "/kms wrap-up --fix: nothing actionable for kms-linker; skipping dispatch."
+                            .into(),
+                    );
+                } else if state.config.kms_active.is_empty() {
+                    // Subagent inherits the parent's tool registry (see
+                    // ProductionAgentFactory::build). KMS tools register
+                    // only when kms_active is non-empty — without that,
+                    // the subagent spawns with no usable tools.
+                    emit(
+                        events_tx,
+                        format!(
+                            "/kms wrap-up {name} --fix: no KMS attached to this session. \
+                             Run `/kms use {name}` first so KMS tools are registered."
+                        ),
+                    );
+                } else {
+                    let prompt = compose_kms_linker_prompt(&name, &lint, &stale);
+                    match crate::side_channel::spawn_side_channel(
+                        "kms-linker".to_string(),
+                        prompt,
+                        state.agent_factory.clone(),
+                        state.agent_defs.clone(),
+                        events_tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(id) => emit(events_tx, format!("✓ kms-linker dispatched (id: {id})")),
+                        Err(e) => emit(events_tx, format!("/kms wrap-up --fix: {e}")),
+                    }
+                }
+            }
+        }
+        SlashCommand::KmsMaintain { name, apply } => {
+            // Umbrella maintenance: compute the structural report in Rust
+            // (same inputs the linker gets), then dispatch one kms-maintain
+            // agent to run the staged pipeline (structural → source-reconcile
+            // → stale → contradictions). Dry-run by default.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if state.config.kms_active.is_empty() {
+                // Subagent inherits the parent's tool registry; KMS tools
+                // register only when kms_active is non-empty.
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms maintain {name}: no KMS attached to this session. \
+                         Run `/kms use {name}` first so KMS tools are registered."
+                    ),
+                );
+                return;
+            }
+            let lint = match crate::kms::lint(&k) {
+                Ok(r) => r,
+                Err(e) => {
+                    emit(events_tx, format!("maintain failed (lint): {e}"));
+                    return;
+                }
+            };
+            let stale = match crate::kms::scan_stale_markers(&k) {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(events_tx, format!("maintain failed (stale scan): {e}"));
+                    return;
+                }
+            };
+            let prompt = compose_kms_maintain_prompt(&name, &lint, &stale, apply);
+            match crate::side_channel::spawn_side_channel(
+                "kms-maintain".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "✓ kms-maintain dispatched (id: {id}, {})",
+                        if apply { "--apply" } else { "dry-run" }
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms maintain: {e}")),
+            }
+        }
+        SlashCommand::KmsHtml { name, .. } => {
+            // Same shape as KmsDump / KmsChallenge — handled by the
+            // turn-rewrite in shared_session.rs. This arm only fires
+            // when the KMS doesn't resolve, or when dispatch is
+            // called directly (which it shouldn't be).
+            if crate::kms::resolve(&name).is_none() {
+                emit(events_tx, format!("no KMS named '{name}'"));
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms html {name} requires the agent loop — invoke from chat / CLI, \
+                         not via shell_dispatch::dispatch directly."
+                    ),
+                );
+            }
+        }
+        SlashCommand::KmsMigrate { name, apply } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            match crate::kms::migrate(&k, !apply) {
+                Ok(report) => {
+                    emit(
+                        events_tx,
+                        crate::kms::format_migration_report(&name, &report),
+                    );
+                    if apply {
+                        broadcast_kms_update(events_tx);
+                    }
+                }
+                Err(e) => emit(events_tx, format!("migrate failed: {e}")),
+            }
+        }
+        SlashCommand::KmsFileAnswer { name, title } => {
+            // M6.25 BUG #4: file the latest assistant message into a KMS
+            // as a new page. Reads from the live session.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            let answer = state
+                .session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, crate::types::Role::Assistant))
+                .and_then(|m| {
+                    Some(
+                        m.content
+                            .iter()
+                            .filter_map(|b| match b {
+                                crate::types::ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    )
+                });
+            let Some(answer_text) = answer.filter(|s| !s.trim().is_empty()) else {
+                emit(
+                    events_tx,
+                    "no assistant message in session yet — nothing to file".into(),
+                );
+                return;
+            };
+            let stem = sanitize_alias_for_dispatch(&title);
+            if stem.is_empty() {
+                emit(events_tx, "title sanitises to empty — pick another".into());
+                return;
+            }
+            let body = format!("# {title}\n\n{answer_text}\n");
+            let mut fm = std::collections::BTreeMap::new();
+            fm.insert("category".into(), "answer".into());
+            fm.insert("filed_from".into(), "chat".into());
+            let serialized = crate::kms::write_frontmatter(&fm, &body);
+            match crate::kms::write_page(&k, &stem, &serialized) {
+                Ok(path) => emit(
+                    events_tx,
+                    format!(
+                        "filed answer → {} ({} bytes)",
+                        path.display(),
+                        serialized.len()
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("file-answer failed: {e}")),
+            }
+        }
+
+        // ─── MCP servers ────────────────────────────────────────────
+        SlashCommand::Tools => {
+            // Ground truth: what the model actually sees this turn (gate/env
+            // filtered, sorted) — not an LLM prose enumeration.
+            let defs = state.tool_registry.tool_defs();
+            let mut out = format!("{} tools available:\n", defs.len());
+            for d in &defs {
+                let desc = d.description.lines().next().unwrap_or("").trim();
+                let desc: String = if desc.chars().count() > 90 {
+                    format!("{}…", desc.chars().take(89).collect::<String>())
+                } else {
+                    desc.to_string()
+                };
+                out.push_str(&format!("  {} — {}\n", d.name, desc));
+            }
+            emit(events_tx, out);
+        }
+        SlashCommand::Mcp => {
+            let mut servers = crate::config::AppConfig::load()
+                .map(|c| c.mcp_servers)
+                .unwrap_or_default();
+            // Fold in plugin-contributed servers — the same merge the
+            // runtime does at spawn (agent_runtime.rs) — so the list
+            // reflects what actually loads. Without this a plugin's MCP
+            // is invisible here even though its tools are live. Config
+            // wins on a name clash.
+            let mut plugin_names = std::collections::HashSet::new();
+            for p_mcp in crate::plugins::plugin_mcp_servers() {
+                if !servers.iter().any(|s| s.name == p_mcp.name) {
+                    plugin_names.insert(p_mcp.name.clone());
+                    servers.push(p_mcp);
+                }
+            }
+            if servers.is_empty() {
+                emit(events_tx, "no MCP servers configured".into());
+            } else {
+                let mut out = String::from("MCP servers:\n");
+                for s in servers {
+                    let kind = if s.transport == "http" {
+                        "http"
+                    } else {
+                        "stdio"
+                    };
+                    let origin = if plugin_names.contains(&s.name) {
+                        " [plugin]"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("  {} ({kind}){origin}\n", s.name));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::McpAdd {
+            name,
+            url,
+            user,
+            headers,
+        } => {
+            // Hand-add is untrusted by default; enabling widget UI
+            // requires the user to edit mcp.json and set
+            // `"trusted": true` explicitly.
+            let cfg = crate::mcp::McpServerConfig {
+                name: name.clone(),
+                transport: "http".into(),
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+                url,
+                // Stored verbatim; `${VAR}` resolved from env at connect
+                // time (mcp::connect_http) so secrets stay out of mcp.json.
+                headers: headers.into_iter().collect(),
+                trusted: false,
+                engine_managed: false,
+            };
+            persist_and_register_mcp(state, events_tx, cfg, user).await;
+        }
+        SlashCommand::McpAddStdio {
+            name,
+            command,
+            args,
+            user,
+        } => {
+            // Stdio sibling of McpAdd. Same persist + spawn + register
+            // flow — the only differences are transport and where the
+            // address lives in the struct (command/args vs url). Env
+            // vars are not settable from the slash command in v1; if a
+            // server needs them (LDR_*, GITHUB_TOKEN, ...) the user
+            // edits mcp.json after the add. The first spawn happens
+            // here, so missing-env failures surface immediately
+            // through the existing error path.
+            let cfg = crate::mcp::McpServerConfig {
+                name: name.clone(),
+                transport: "stdio".into(),
+                command,
+                args,
+                env: Default::default(),
+                url: String::new(),
+                headers: Default::default(),
+                trusted: false,
+                engine_managed: false,
+            };
+            if let Some(reason) = crate::mcp::multiuser_stdio_refusal(&cfg) {
+                emit(events_tx, reason);
+                return;
+            }
+            persist_and_register_mcp(state, events_tx, cfg, user).await;
+        }
+        SlashCommand::McpReauth { name } => {
+            let events_tx_clone = events_tx.clone();
+            // OAuth discovery + DCR are HTTP calls — run off the
+            // dispatcher thread so the UI stays responsive while the
+            // user consents in their browser (laptop) or follows the
+            // public callback link (pod).
+            tokio::spawn(async move {
+                let sink = |line: String| {
+                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                };
+                match crate::mcp::reauth_server(&name, None).await {
+                    Ok(crate::mcp::ReauthOutcome::Completed(msg)) => sink(msg),
+                    Ok(crate::mcp::ReauthOutcome::Pending {
+                        auth_url,
+                        server_name,
+                    }) => {
+                        sink(format!(
+                            "[mcp] click to authorize '{server_name}':\n{auth_url}"
+                        ));
+                        sink(
+                            "[mcp] the redirect lands on the pod; this slash command exits as soon as the link is open. Watch the chat for `[mcp] reauth complete` after you consent."
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => sink(format!("[mcp] reauth failed: {e}")),
+                }
+            });
+        }
+        SlashCommand::McpRemove { name, user } => {
+            match crate::config::remove_mcp_server(&name, user) {
+                Ok((true, p, removed_url)) => {
+                    // Also drop the cached OAuth token for the removed
+                    // server's URL. Leaving it behind would let a
+                    // future re-`/mcp add` of the same URL silently
+                    // reuse a token the user thought they'd cleared.
+                    let token_msg = if let Some(url) = removed_url {
+                        let mut store = crate::oauth::TokenStore::load();
+                        let had_token = store.get(&url).is_some();
+                        store.remove(&url);
+                        store.save();
+                        if had_token {
+                            " + cached OAuth token cleared"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        ""
+                    };
+                    // We can't cleanly remove just this server's tools
+                    // from the live registry (they're interleaved with
+                    // other MCP tools by name and we don't track the
+                    // mapping). Persist + advise restart; the config
+                    // will be clean on next launch.
+                    emit(
+                        events_tx,
+                        format!(
+                            "mcp '{name}' removed from {}{token_msg} (tools active in this session will be dropped on restart)",
+                            p.display()
+                        ),
+                    );
+                    // Sidebar shows the new (shorter) list immediately —
+                    // the dropped tools won't disappear until restart but
+                    // at least the entry doesn't linger after the user
+                    // explicitly removed it.
+                    broadcast_mcp_update(events_tx);
+                }
+                Ok((false, p, _)) => emit(
+                    events_tx,
+                    format!("no server named '{name}' in {}", p.display()),
+                ),
+                Err(e) => emit(events_tx, format!("remove failed: {e}")),
+            }
+        }
+
+        // ─── plugins ────────────────────────────────────────────────
+        SlashCommand::Plugins => {
+            let plugins = crate::plugins::all_plugins_all_scopes();
+            if plugins.is_empty() {
+                emit(
+                    events_tx,
+                    "no plugins installed (try /plugin install <url>)".into(),
+                );
+            } else {
+                let mut out = String::from("Plugins:\n");
+                for p in plugins {
+                    let status = if p.enabled { "enabled" } else { "disabled" };
+                    let version = if p.version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" v{}", p.version)
+                    };
+                    out.push_str(&format!(
+                        "  {}{version} ({status}) → {}\n",
+                        p.name,
+                        p.path.display(),
+                    ));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::PluginInstall { url, user, force } => {
+            // Resolve marketplace slug → install_url (no-op for URLs).
+            crate::marketplace::refresh_private().await;
+            let (effective_url, abort_msg) = crate::repl::resolve_plugin_install_target(&url);
+            if let Some(msg) = abort_msg {
+                emit(events_tx, msg);
+                return;
+            }
+            match crate::plugins::install(&effective_url, user, force).await {
+                Ok(plugin) => {
+                    // Refresh the SkillTool store so plugin-contributed
+                    // skills are callable in this session. Plugin-
+                    // contributed MCP servers still need a restart
+                    // (auto-spawning them here would need to detect
+                    // which ones are new vs. already running).
+                    let refreshed = crate::skills::SkillStore::discover();
+                    if let Ok(mut store) = state.skill_store.lock() {
+                        *store = refreshed;
+                    }
+                    state.rebuild_system_prompt();
+                    if let Err(e) = state.rebuild_agent(true) {
+                        emit(events_tx, format!("rebuild failed: {e}"));
+                        return;
+                    }
+                    // Skills + commands are live in this session
+                    // (skill store refreshed; commands re-discover per
+                    // /-resolution). MCP servers still need a restart
+                    // — explain prominently with the server names so
+                    // the user knows exactly what's coming after
+                    // relaunch. M6.16.1 follow-up.
+                    let mut note = format!(
+                        "plugin '{}' installed ({}) → {}\nSkills + commands callable this session.",
+                        plugin.name,
+                        if user { "user" } else { "project" },
+                        plugin.path.display(),
+                    );
+                    if let Ok(m) = plugin.manifest() {
+                        if !m.mcp_servers.is_empty() {
+                            let mut names: Vec<&str> =
+                                m.mcp_servers.keys().map(String::as_str).collect();
+                            names.sort();
+                            note.push_str(&format!(
+                                "\n\n⚠  restart thClaws (/quit then relaunch) to spawn {} new MCP server(s): {}",
+                                names.len(),
+                                names.join(", ")
+                            ));
+                        }
+                    }
+                    emit(events_tx, note);
+                }
+                Err(e) => emit(events_tx, format!("plugin install failed: {e}")),
+            }
+        }
+        SlashCommand::PluginRemove { name, user } => {
+            // Capture MCP names BEFORE remove() — once the manifest
+            // file is gone, find_installed returns None.
+            let mcp_to_drop = mcp_server_names(&name);
+            match crate::plugins::remove(&name, user) {
+                Ok(true) => {
+                    // M6.16 BUG H1: refresh skill store + rebuild agent
+                    // so the removed plugin's skill contributions stop
+                    // being callable in this session. Without this, the
+                    // model could still invoke a removed skill and get
+                    // an empty body (the lazy read fails after the file
+                    // is gone, OnceLock caches the empty result). MCP
+                    // subprocess teardown is still restart-bound — see
+                    // the trailing note in the message.
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' removed");
+                    if let Some(names) = mcp_to_drop {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to fully drop {} MCP server(s) it was running: {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
+                Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
+                Err(e) => emit(events_tx, format!("remove failed: {e}")),
+            }
+        }
+        SlashCommand::PluginEnable { name, user } => {
+            match crate::plugins::set_enabled(&name, user, true) {
+                Ok(true) => {
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' enabled");
+                    if let Some(names) = mcp_server_names(&name) {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to spawn {} MCP server(s): {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
+                Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
+                Err(e) => emit(events_tx, format!("enable failed: {e}")),
+            }
+        }
+        SlashCommand::PluginDisable { name, user } => {
+            // Capture MCP names BEFORE disabling so the message can
+            // list them; set_enabled doesn't delete the manifest, but
+            // keeping the lookup symmetric with PluginRemove makes
+            // the helper reusable.
+            let mcp_to_drop = mcp_server_names(&name);
+            match crate::plugins::set_enabled(&name, user, false) {
+                Ok(true) => {
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' disabled");
+                    if let Some(names) = mcp_to_drop {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to drop {} MCP server(s) it contributed: {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
+                Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
+                Err(e) => emit(events_tx, format!("disable failed: {e}")),
+            }
+        }
+        SlashCommand::PluginShow { name } => match crate::plugins::find_installed_with_scope(&name)
+        {
+            Some((p, is_user)) => {
+                let status = if p.enabled { "enabled" } else { "disabled" };
+                let scope = if is_user { "user" } else { "project" };
+                let version = if p.version.is_empty() {
+                    "-"
+                } else {
+                    &p.version
+                };
+                // M6.16.1 BUG L3: include scope in the output so the
+                // user knows which `--user` flag to pass to subsequent
+                // /plugin disable / enable / remove. Pre-fix the user
+                // had to inspect the path string to figure it out.
+                let mut out = format!(
+                    "{} v{version} ({status}, {scope})\npath: {}\n",
+                    p.name,
+                    p.path.display()
+                );
+                if !p.source.is_empty() {
+                    out.push_str(&format!("source: {}\n", p.source));
+                }
+                emit(events_tx, out);
+            }
+            None => emit(events_tx, format!("no plugin named '{name}'")),
+        },
+        SlashCommand::PluginGc => match crate::plugins::gc() {
+            Ok((proj, user)) => {
+                if proj.is_empty() && user.is_empty() {
+                    emit(events_tx, "no zombie entries — registry is clean".into());
+                } else {
+                    let mut out = String::from("removed zombie entries:\n");
+                    for n in &proj {
+                        out.push_str(&format!("  - {n} (project)\n"));
+                    }
+                    for n in &user {
+                        out.push_str(&format!("  - {n} (user)\n"));
+                    }
+                    // Refresh in case any zombie was contributing
+                    // skills cached in the worker.
+                    refresh_after_plugin_change(state, events_tx);
+                    emit(events_tx, out);
+                }
+            }
+            Err(e) => emit(events_tx, format!("gc failed: {e}")),
+        },
+
+        // ─── team ───────────────────────────────────────────────────
+        SlashCommand::Team => {
+            let team_dir = crate::team::Mailbox::default_dir();
+            let mailbox = crate::team::Mailbox::new(team_dir);
+            match mailbox.all_status() {
+                Ok(agents) if agents.is_empty() => {
+                    emit(events_tx, "no team agents found".into());
+                }
+                Ok(agents) => {
+                    let mut out = String::from("Team:\n");
+                    for a in &agents {
+                        let task = a.current_task.as_deref().unwrap_or("-");
+                        // A stale heartbeat means the teammate crashed / never
+                        // booted — show that instead of a frozen "idle".
+                        let shown = if a.status != "stopped" && a.is_stale() {
+                            "unresponsive".to_string()
+                        } else {
+                            a.status.clone()
+                        };
+                        out.push_str(&format!("  {} — {} (task: {})\n", a.agent, shown, task));
+                    }
+                    emit(events_tx, out);
+                }
+                Err(_) => emit(events_tx, "no team configured".into()),
+            }
+        }
+
+        SlashCommand::Schedule => match crate::schedule::ScheduleStore::load() {
+            Ok(store) if store.schedules.is_empty() => {
+                emit(
+                    events_tx,
+                    "no schedules — add one with: thclaws schedule add <id> --cron \"...\" --prompt \"...\"".into(),
+                );
+            }
+            Ok(store) => {
+                let mut out = String::new();
+                for s in &store.schedules {
+                    let status = if s.enabled { "on " } else { "off" };
+                    let watch = if s.watch_workspace {
+                        "+watch"
+                    } else {
+                        "      "
+                    };
+                    let last = crate::schedule::display_last_run(s.last_run.as_deref());
+                    let exit = match s.last_exit {
+                        Some(0) => "ok ",
+                        Some(_) => "err",
+                        None => "—  ",
+                    };
+                    out.push_str(&format!(
+                        "{status} {exit} {watch}  {:24}  {:20}  {}\n",
+                        s.id, s.cron, last,
+                    ));
+                }
+                emit(events_tx, out.trim_end().to_string());
+            }
+            Err(e) => emit(events_tx, format!("/schedule: {e}")),
+        },
+        SlashCommand::ScheduleShow(id) => match crate::schedule::ScheduleStore::load() {
+            Ok(store) => match store.get(&id) {
+                Some(s) => match serde_json::to_string_pretty(s) {
+                    Ok(json) => emit(events_tx, json),
+                    Err(e) => emit(events_tx, format!("/schedule show: serialize: {e}")),
+                },
+                None => emit(
+                    events_tx,
+                    format!("/schedule show: no schedule with id '{id}'"),
+                ),
+            },
+            Err(e) => emit(events_tx, format!("/schedule show: {e}")),
+        },
+        SlashCommand::ScheduleRun(id) => {
+            let binary = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(
+                        events_tx,
+                        format!("/schedule run: cannot resolve current_exe: {e}"),
+                    );
+                    return;
+                }
+            };
+            emit(events_tx, format!("/schedule run '{id}': firing…"));
+            let id_for_task = id.clone();
+            let id_for_msg = id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::schedule::run_once(&id_for_task, &binary)
+            })
+            .await;
+            match result {
+                Ok(Ok(outcome)) => {
+                    let exit = outcome
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "(timeout)".into());
+                    emit(
+                        events_tx,
+                        format!(
+                            "/schedule run '{id_for_msg}': exit={exit} duration={}.{:03}s → result={} (log={})",
+                            outcome.duration.as_secs(),
+                            outcome.duration.subsec_millis(),
+                            outcome.result_path.display(),
+                            outcome.log_path.display(),
+                        ),
+                    );
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule run '{id_for_msg}': {e}")),
+                Err(e) => emit(
+                    events_tx,
+                    format!("/schedule run '{id_for_msg}': join error: {e}"),
+                ),
+            }
+        }
+        SlashCommand::ScheduleStatus => {
+            let mut out = String::new();
+            match crate::schedule::daemon_status() {
+                crate::schedule::DaemonStatus::Running(pid) => {
+                    out.push_str(&format!("daemon: running (pid {pid})\n"));
+                }
+                crate::schedule::DaemonStatus::Stale(pid) => {
+                    out.push_str(&format!(
+                        "daemon: stale PID file (last pid {pid} not alive)\n"
+                    ));
+                }
+                crate::schedule::DaemonStatus::NotRunning => {
+                    out.push_str("daemon: not running (`thclaws schedule install` to enable)\n");
+                }
+            }
+            if let Ok(store) = crate::schedule::ScheduleStore::load() {
+                if !store.schedules.is_empty() {
+                    out.push_str("recent fires:\n");
+                    for s in &store.schedules {
+                        let last = s.last_run.as_deref().unwrap_or("never");
+                        let exit = match s.last_exit {
+                            Some(0) => "ok ",
+                            Some(_) => "err",
+                            None => "—  ",
+                        };
+                        out.push_str(&format!("  {exit}  {:24}  {}\n", s.id, last));
+                        if !matches!(s.last_exit, Some(0)) {
+                            if let Some(log) = crate::schedule::latest_log(&s.id) {
+                                out.push_str(&format!("       \u{21b3} log: {}\n", log.display()));
+                            }
+                        }
+                    }
+                }
+            }
+            emit(events_tx, out.trim_end().to_string());
+        }
+        SlashCommand::SchedulePause(id) => match toggle_schedule_enabled_dispatch(&id, false) {
+            Ok(()) => emit(events_tx, format!("/schedule pause '{id}': paused")),
+            Err(e) => emit(events_tx, format!("/schedule pause '{id}': {e}")),
+        },
+        SlashCommand::ScheduleResume(id) => match toggle_schedule_enabled_dispatch(&id, true) {
+            Ok(()) => emit(events_tx, format!("/schedule resume '{id}': resumed")),
+            Err(e) => emit(events_tx, format!("/schedule resume '{id}': {e}")),
+        },
+        SlashCommand::ScheduleAdd => {
+            // Pre-fill the modal with sensible defaults. `cwd` is the
+            // process cwd so a fresh schedule lands in the project the
+            // user is already in; timeoutSecs mirrors the CLI default
+            // (10 min); cron is a Mon-Fri 08:30 example.
+            let cwd_default = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let payload = serde_json::json!({
+                "type": "schedule_add_open",
+                "defaults": {
+                    "cwd": cwd_default,
+                    "timeoutSecs": 600,
+                    "cron": "30 8 * * MON-FRI",
+                },
+            });
+            let _ = events_tx.send(ViewEvent::ScheduleAddOpen(payload.to_string()));
+        }
+        SlashCommand::ScheduleRm(id) => match crate::schedule::ScheduleStore::load() {
+            Ok(mut store) => {
+                if !store.remove(&id) {
+                    emit(events_tx, format!("/schedule rm '{id}': no such schedule"));
+                } else if let Err(e) = store.save() {
+                    emit(events_tx, format!("/schedule rm '{id}': save: {e}"));
+                } else {
+                    emit(events_tx, format!("/schedule rm '{id}': removed"));
+                }
+            }
+            Err(e) => emit(events_tx, format!("/schedule rm '{id}': {e}")),
+        },
+        SlashCommand::ScheduleInstall => {
+            let result = tokio::task::spawn_blocking(crate::schedule::install_daemon).await;
+            match result {
+                Ok(Ok(report)) => {
+                    let mut out = format!(
+                        "/schedule install: wrote {}\n",
+                        report.supervisor_path.display()
+                    );
+                    if report.next_steps.is_empty() {
+                        out.push_str(
+                            "/schedule install: daemon bootstrapped — try /schedule status",
+                        );
+                    } else {
+                        out.push_str("/schedule install: next steps:\n");
+                        for step in &report.next_steps {
+                            out.push_str(&format!("  $ {step}\n"));
+                        }
+                    }
+                    emit(events_tx, out.trim_end().to_string());
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule install: {e}")),
+                Err(e) => emit(events_tx, format!("/schedule install: join error: {e}")),
+            }
+        }
+        SlashCommand::ScheduleUninstall => {
+            let result = tokio::task::spawn_blocking(crate::schedule::uninstall_daemon).await;
+            match result {
+                Ok(Ok(path)) => {
+                    if path.exists() {
+                        emit(
+                            events_tx,
+                            format!(
+                                "/schedule uninstall: warning — supervisor file {} still exists",
+                                path.display()
+                            ),
+                        );
+                    } else {
+                        emit(events_tx, "/schedule uninstall: daemon uninstalled".into());
+                    }
+                }
+                Ok(Err(e)) => emit(events_tx, format!("/schedule uninstall: {e}")),
+                Err(e) => emit(events_tx, format!("/schedule uninstall: join error: {e}")),
+            }
+        }
+        SlashCommand::SchedulePresetList => {
+            emit(events_tx, crate::schedule_presets::format_preset_list());
+        }
+        SlashCommand::SchedulePresetAdd {
+            preset_id,
+            kms,
+            cwd,
+        } => {
+            let resolved_cwd = cwd.unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+            match crate::schedule_presets::add_from_preset(&preset_id, &kms, resolved_cwd) {
+                Ok(schedule) => {
+                    let preset = crate::schedule_presets::find(&preset_id);
+                    let desc = preset
+                        .map(|p| crate::schedule_presets::render_description(p, &kms))
+                        .unwrap_or_default();
+                    emit(
+                        events_tx,
+                        format!(
+                            "✓ schedule '{id}' created from preset '{preset_id}' (cron: {cron})\n  {desc}",
+                            id = schedule.id,
+                            cron = schedule.cron,
+                        ),
+                    );
+                }
+                Err(e) => emit(events_tx, format!("/schedule preset add: {e}")),
+            }
+        }
+        SlashCommand::Agent { name, prompt } => {
+            // Spawn user-driven side channel. Returns immediately
+            // with the assigned id; the agent runs concurrently on
+            // its own tokio task and streams `chat_side_channel_*`
+            // events back to the chat surface.
+            match crate::side_channel::spawn_side_channel(
+                name.clone(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!("✓ spawned background agent '{name}' (id: {id})"),
+                ),
+                Err(e) => emit(events_tx, format!("/subagent: {e}")),
+            }
+        }
+        SlashCommand::AgentsList => {
+            let active = crate::side_channel::list_side_channels();
+            if active.is_empty() {
+                emit(events_tx, "no active background agents".into());
+            } else {
+                let mut out = String::new();
+                for (id, name, elapsed) in active {
+                    out.push_str(&format!("  {id}  {name:24}  {elapsed:.1}s elapsed\n"));
+                }
+                emit(events_tx, out.trim_end().to_string());
+            }
+        }
+        SlashCommand::AgentCancel(id) => {
+            if crate::side_channel::cancel_side_channel(&id) {
+                emit(events_tx, format!("/subagent cancel '{id}': signal sent"));
+            } else {
+                emit(
+                    events_tx,
+                    format!("/subagent cancel '{id}': no such active agent (try /subagent list)"),
+                );
+            }
+        }
+        SlashCommand::AgentNew(name) => {
+            let Some(name) = crate::agent_defs::sanitize_agent_name(&name) else {
+                emit(
+                    events_tx,
+                    "/subagent new: name must be non-empty letters, digits, '-' or '_'".into(),
+                );
+                return;
+            };
+            if crate::agent_defs::AgentDefsConfig::find_on_disk(&name).is_some() {
+                emit(
+                    events_tx,
+                    format!("/subagent new: '{name}' already exists — use /subagent edit {name}"),
+                );
+                return;
+            }
+            let payload = serde_json::json!({
+                "type": "agent_editor_open",
+                "mode": "new",
+                "name": name,
+                "body": agent_starter_template(&name),
+            });
+            let _ = events_tx.send(ViewEvent::AgentEditorOpen(payload.to_string()));
+        }
+        SlashCommand::AgentEdit(name) => {
+            let Some(name) = crate::agent_defs::sanitize_agent_name(&name) else {
+                emit(
+                    events_tx,
+                    "/subagent edit: name must be non-empty letters, digits, '-' or '_'".into(),
+                );
+                return;
+            };
+            // Prefer the raw on-disk file (preserves the user's exact
+            // YAML + formatting). Fall back to reconstructing from the
+            // loaded def so built-ins (translator, dream, …) open with
+            // their real content — saving lands a project override.
+            let body = match crate::agent_defs::AgentDefsConfig::find_on_disk(&name) {
+                Some(path) => match std::fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        emit(
+                            events_tx,
+                            format!("/subagent edit: can't read {}: {e}", path.display()),
+                        );
+                        return;
+                    }
+                },
+                None => {
+                    match state.agent_defs.get(&name) {
+                        Some(def) => def.to_markdown(),
+                        None => {
+                            emit(
+                            events_tx,
+                            format!("/subagent edit: no such agent '{name}' (try /subagent new {name})"),
+                        );
+                            return;
+                        }
+                    }
+                }
+            };
+            let payload = serde_json::json!({
+                "type": "agent_editor_open",
+                "mode": "edit",
+                "name": name,
+                "body": body,
+            });
+            let _ = events_tx.send(ViewEvent::AgentEditorOpen(payload.to_string()));
+        }
+        SlashCommand::Dream {
+            focus,
+            all_sessions,
+        } => {
+            // `/dream` dispatches the built-in `dream` AgentDef as a
+            // side channel. Built-in def is seeded into the registry
+            // by `AgentDefsConfig::seed_builtins`, so the existing
+            // side-channel pipeline handles the rest. Empty focus
+            // falls back to a default consolidate-everything prompt
+            // so the agent has something to chew on.
+            //
+            // The `--all` flag is encoded into the user message as a
+            // recognizable token; dream.md's Pass 1 instructions read
+            // it to decide between "last 10 sessions" (default) vs
+            // "all sessions" scope.
+
+            // Ensure the project-scope `dreams` KMS exists before the
+            // agent runs. The dream procedure writes per-session
+            // digests (Pass 2b) and the run summary (Pass 4) there
+            // (NOT to the user's active KMSes) so session/audit content
+            // doesn't contaminate the curated topic vaults. `kms::create`
+            // is idempotent — returns the existing ref if already
+            // present, so calling on every /dream is safe and
+            // side-effect-free after the first.
+            // Best-effort: if creation somehow fails (permissions,
+            // disk full), the agent's KmsWrite will surface a clear
+            // error later in Pass 4 — surface it to the user as a
+            // hint here so they're not surprised.
+            if let Err(e) = crate::kms::create("dreams", crate::kms::KmsScope::Project) {
+                emit(
+                    events_tx,
+                    format!(
+                        "warning: could not ensure 'dreams' KMS exists ({e}); dream summary may fail at Pass 4"
+                    ),
+                );
+            }
+
+            let (mine, live) = crate::session::dream_session_globs();
+            let scope_note = format!(
+                "\n\n[sessions: your sessions are `{mine}`. A session id is LIVE if its file matches any of: {}. Use these patterns wherever the procedure says `.thclaws/sessions/`.]{}",
+                live.iter()
+                    .map(|g| format!("`{g}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if all_sessions {
+                    "\n\n[scope: ALL_SESSIONS — process every one of your session files, not just the 10 most recent. Widen Pass 3b targeted reconciliation to every page Pass 3 touched.]"
+                } else {
+                    ""
+                }
+            );
+            let prompt = if focus.trim().is_empty() {
+                format!(
+                    "Consolidate the project's knowledge by mining recent sessions into per-session digests and canonical topic pages. Follow your standard multi-pass procedure.{scope_note}"
+                )
+            } else {
+                format!("{focus}{scope_note}")
+            };
+            match crate::side_channel::spawn_side_channel(
+                "dream".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(events_tx, format!("✓ dreaming (id: {id})")),
+                Err(e) => emit(events_tx, format!("/dream: {e}")),
+            }
+        }
+        SlashCommand::Deploy {
+            pod,
+            token,
+            dry_run,
+            full,
+            include_memory,
+            allow_stdio_mcp,
+            restart,
+        } => {
+            // Defaults from the configured deploy target (settings.json
+            // + keychain). Explicit /deploy --pod / --token win.
+            let resolved_pod = pod.clone().or_else(crate::remote_agent::url);
+            let resolved_token = token.clone().or_else(crate::remote_agent::token);
+            let Some(pod_url) = resolved_pod else {
+                emit(
+                    events_tx,
+                    "[deploy] REMOTE_AGENT_URL not set — open Settings → Provider API keys → Deploy target, or pass --pod <URL>".into(),
+                );
+                return;
+            };
+            let Some(token_val) = resolved_token else {
+                emit(
+                    events_tx,
+                    "[deploy] REMOTE_AGENT_TOKEN not set — open Settings → Provider API keys → Deploy target, or pass --token <T>".into(),
+                );
+                return;
+            };
+            let events_tx_clone = events_tx.clone();
+            crate::workdir::spawn_scoped(async move {
+                let args = crate::deploy_client::DeployArgs {
+                    pod: pod_url,
+                    token: Some(token_val),
+                    include_memory,
+                    allow_stdio_mcp,
+                    dry_run,
+                    full,
+                    restart,
+                };
+                // Pipe deploy progress / errors into the same SlashOutput
+                // event stream the rest of /<command> output uses, so
+                // the user sees the actual upload events / failure
+                // reason inline instead of having to switch to the
+                // terminal thclaws was launched from.
+                let sink_tx = events_tx_clone.clone();
+                let sink = move |line: &str, level: crate::deploy_client::DeployLog| {
+                    let _ = level; // (level distinction is for stdio sinks; chat
+                                   // surface renders them all the same)
+                    let _ = sink_tx.send(ViewEvent::SlashOutput(line.to_string()));
+                };
+                let code = crate::deploy_client::run_with_sink(args, sink).await;
+                let _ = events_tx_clone.send(ViewEvent::SlashOutput(format!(
+                    "[deploy] finished (exit code {code})"
+                )));
+            });
+        }
+        SlashCommand::PublishApp { path } => {
+            let cloud_cfg = crate::config::ProjectConfig::load().and_then(|c| c.cloud.clone());
+            let events_tx_clone = events_tx.clone();
+            let input_tx_clone = input_tx.clone();
+            // Spawned: the upload is network-bound and the chat tab must
+            // stay responsive, same as every other cloud command here.
+            crate::workdir::spawn_scoped(async move {
+                match crate::cloud::cmd::publish_app_result(&path, None, cloud_cfg.as_ref()).await {
+                    Ok(app) => {
+                        // Back to the worker loop rather than out as
+                        // `SlashOutput`: the link belongs in the agent's
+                        // history, where it renders as markdown and
+                        // survives a reload. This task cannot reach
+                        // `WorkerState` itself — see `ShellInput::PublishedApp`.
+                        let _ =
+                            input_tx_clone.send(crate::shared_session::ShellInput::PublishedApp {
+                                detail: crate::cloud::cmd::publish_detail_line(&app),
+                                url: app.url,
+                                // As typed, not the sandbox-resolved
+                                // absolute path: the reader recognises
+                                // what they asked for, not where it
+                                // happened to live on disk.
+                                file: path,
+                            });
+                    }
+                    // A refusal is not something to keep in the
+                    // conversation — it says nothing a day later.
+                    Err(e) => {
+                        let _ = events_tx_clone.send(ViewEvent::SlashOutput(e));
+                    }
+                }
+            });
+        }
+        SlashCommand::Cloud(sub) => {
+            let cloud_cfg = crate::config::ProjectConfig::load().and_then(|c| c.cloud.clone());
+            let events_tx_clone = events_tx.clone();
+            // The SESSION's root, not the process cwd: in a multiuser pod those
+            // are different directories, and every cloud command below reads or
+            // overwrites the one it is handed.
+            let cwd = state.cwd.clone();
+            // push / pull / revision move the workspace; publish / get keep
+            // `cwd`, the agent's own folder under a host.
+            let sync_root = crate::workdir::cloud_sync_root(&cwd);
+            crate::workdir::spawn_scoped(async move {
+                // Stream every progress line the moment it is produced, so
+                // long-running syncs show life instead of a silent wait.
+                let mut emit = |line: String| {
+                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                };
+                match sub {
+                    CloudSlash::Status => {
+                        // One SlashOutput = one system bubble in chat. Emit the
+                        // whole report as a single block (like /providers) so it
+                        // reads as one list, not a bubble ("pill") per row.
+                        let lines = crate::cloud::cmd::status_lines(None, cloud_cfg.as_ref());
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::List { mine } => {
+                        // Single block, same reasoning as Status above.
+                        let lines =
+                            crate::cloud::cmd::list_lines(mine, None, cloud_cfg.as_ref()).await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Get { slug } => {
+                        // Returns the whole progress log at once (not a live
+                        // stream), so emit it as one block — a bubble per line
+                        // reads as a stack of "pills". Same reasoning as Status.
+                        let lines = crate::cloud::cmd::get_into_cwd_lines(
+                            slug.clone(),
+                            &cwd,
+                            None,
+                            cloud_cfg.as_ref(),
+                        )
+                        .await;
+                        let installed = lines.iter().any(|l| l.starts_with("✓ Extracted"));
+                        emit(lines.join("\n"));
+                        // A just-installed agent is inert until the engine
+                        // re-reads it: the system prompt (AGENTS.md), agent
+                        // defs, skills, and seeded workflows were all built at
+                        // startup from the OLD/absent agent. Re-exec so
+                        // `/cloud get` just works — sessions survive on disk.
+                        // Gated on the success marker so a 404 / auth error /
+                        // uuid-mismatch refusal never restarts the process.
+                        if installed {
+                            emit(format!(
+                                "↻ activating '{slug}' — reloading thclaws to make it live (sessions survive)…"
+                            ));
+                            // `events_tx_clone` is the owned sender already moved
+                            // into this async task; clone it again for the
+                            // re-exec thread (can't borrow the outer `events_tx`
+                            // reference into a 'static task).
+                            let reexec_tx = events_tx_clone.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(400));
+                                let err = crate::util::reexec_self();
+                                let _ = reexec_tx.send(ViewEvent::SlashOutput(format!(
+                                    "[reload] re-exec failed: {err} — run /reload to activate the agent"
+                                )));
+                            });
+                            return;
+                        }
+                    }
+                    CloudSlash::Publish => {
+                        // Single block, same reasoning as Get above.
+                        let lines =
+                            crate::cloud::cmd::publish_cwd_lines(&cwd, None, cloud_cfg.as_ref())
+                                .await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Doctor => {
+                        let url = crate::cloud::resolve_cloud_url(None, cloud_cfg.as_ref());
+                        emit(
+                            crate::cloud::browser_login::doctor_lines(&url)
+                                .await
+                                .join("\n"),
+                        );
+                    }
+                    CloudSlash::Unbind => {
+                        // Single block, same reasoning as Status above.
+                        emit(crate::cloud::cmd::unbind_lines().join("\n"));
+                    }
+                    CloudSlash::Revision { workspace } => {
+                        let lines = crate::cloud::cmd::revision_lines(
+                            &sync_root,
+                            None,
+                            cloud_cfg.as_ref(),
+                            workspace.as_deref(),
+                        )
+                        .await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Push {
+                        delete,
+                        dry_run,
+                        workspace,
+                        force_rebind,
+                        force,
+                    } => {
+                        crate::cloud::cmd::push_streaming(
+                            &sync_root,
+                            None,
+                            cloud_cfg.as_ref(),
+                            crate::cloud::cmd::SyncOpts {
+                                delete,
+                                dry_run,
+                                workspace,
+                                force_rebind,
+                                force,
+                            },
+                            &mut emit,
+                        )
+                        .await;
+                    }
+                    CloudSlash::Pull {
+                        delete,
+                        dry_run,
+                        workspace,
+                        force_rebind,
+                        force,
+                    } => {
+                        crate::cloud::cmd::pull_streaming(
+                            &sync_root,
+                            None,
+                            cloud_cfg.as_ref(),
+                            crate::cloud::cmd::SyncOpts {
+                                delete,
+                                dry_run,
+                                workspace,
+                                force_rebind,
+                                force,
+                            },
+                            &mut emit,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        SlashCommand::WorkflowRun(prompt) => {
+            dispatch_workflow_run(prompt, state, events_tx).await;
+        }
+        SlashCommand::WorkflowList => {
+            dispatch_workflow_list(events_tx);
+        }
+        SlashCommand::WorkflowInspect(prefix) => {
+            dispatch_workflow_inspect(prefix, events_tx);
+        }
+        SlashCommand::WorkflowResume(prefix) => {
+            dispatch_workflow_resume(prefix, state, events_tx).await;
+        }
+        SlashCommand::WorkflowExec(path) => {
+            dispatch_workflow_exec(path, state, events_tx).await;
+        }
+        SlashCommand::WorkflowRm(_) => {
+            emit(
+                events_tx,
+                "/workflow rm needs a stdin y/N confirm that the chat tab doesn't expose. \
+                 Run `thclaws --cli` to delete workflows, or use `rm -rf .thclaws/workflows/<id>/` directly."
+                    .to_string(),
+            );
+        }
+        SlashCommand::Unknown(detail) => {
+            emit(events_tx, format!("unknown command: {detail}"));
+        }
+    }
+}
+
+/// Local copy of the toggle helper for the GUI chat dispatch path —
+/// repl.rs has its own at module scope. Both are short enough that
+/// duplicating beats threading visibility.
+fn toggle_schedule_enabled_dispatch(id: &str, enabled: bool) -> crate::error::Result<()> {
+    let mut store = crate::schedule::ScheduleStore::load()?;
+    let entry = store
+        .get_mut(id)
+        .ok_or_else(|| crate::error::Error::Config(format!("no schedule with id '{id}'")))?;
+    entry.enabled = enabled;
+    store.save()
+}
+
+/// Switch to a new model. If the provider supports listing, validate
+/// the target exists in the catalogue.
+///
+/// `fallback_to_first` controls what happens when validation fails:
+///   - `false` (used by `/model X`): abort with an error message.
+///     The user named a specific model — a typo should fail loud.
+///   - `true` (used by `/provider X`): pick the first available model
+///     from the catalogue. The user named a provider, not a model;
+///     the hardcoded default may have drifted as the provider ships
+///     or retires models.
+///
+/// Persists to `.thclaws/settings.json` and rebuilds the agent with
+/// the new provider — clearing history so conversation pieces built
+/// for a different provider's schema don't confuse the new one.
+async fn switch_model(
+    state: &mut WorkerState,
+    new_model: &str,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    fallback_to_first: bool,
+) {
+    // Shared-agent mode (dev-plan/41): when the company pins the model,
+    // members can't switch it. (Non-locked shared agents still allow
+    // switching among gateway models; build_provider rejects any
+    // non-gateway-routable target — see below.)
+    if crate::shared::is_model_locked() {
+        emit(
+            events_tx,
+            "this shared agent has a locked model — switching is disabled".into(),
+        );
+        return;
+    }
+    let resolved_initial = crate::providers::ProviderKind::resolve_alias(new_model);
+    if resolved_initial != new_model {
+        emit(
+            events_tx,
+            format!("(alias '{new_model}' → '{resolved_initial}')"),
+        );
+    }
+    let mut candidate = state.config.clone();
+    candidate.model = resolved_initial.clone();
+    let new_provider = match crate::repl::build_provider(&candidate) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(events_tx, format!("{e}"));
+            return;
+        }
+    };
+
+    // Catalogue validation. If the provider supports listing and the
+    // requested model isn't there, either abort (strict, /model X)
+    // or fall back to the first available model (permissive,
+    // /provider X). Empty list / unsupported listing accepts the
+    // requested model optimistically.
+    let mut resolved = resolved_initial.clone();
+    // `openrouter/fusion+` is a thClaws pseudo-model (build_provider maps it
+    // to the configured outer model + injected fusion tool); it never appears
+    // in OpenRouter's live /models list, so skip the membership check for it.
+    let is_pseudo_model = resolved == crate::config::FUSION_PLUS_MODEL;
+    if let Ok(models) = new_provider.list_models().await {
+        if !is_pseudo_model && !models.is_empty() && !models.iter().any(|m| m.id == resolved) {
+            if fallback_to_first {
+                let first = models[0].id.clone();
+                emit(
+                    events_tx,
+                    format!(
+                        "default model '{resolved}' not in {} catalogue — falling back to first available: {first}",
+                        candidate.detect_provider().unwrap_or("provider"),
+                    ),
+                );
+                resolved = first;
+                candidate.model = resolved.clone();
+            } else {
+                emit(
+                    events_tx,
+                    format!(
+                        "model '{resolved}' not found in {} catalogue — aborting switch (try /models to see what's available)",
+                        candidate.detect_provider().unwrap_or("provider"),
+                    ),
+                );
+                return;
+            }
+        }
+    }
+
+    // Preserve history across every model swap, intra- or cross-family.
+    // The JSONL log is the canonical conversation; whichever provider
+    // serves the next turn translates ContentBlocks to its wire format
+    // (anthropic.rs serializes blocks directly, openai.rs maps ToolUse →
+    // tool_calls, etc.). Blocks that don't map cleanly (e.g. Anthropic
+    // Thinking on a non-reasoning OpenAI model) are silently dropped per
+    // provider — accepted tradeoff for continuity. Pre-fix, cross-family
+    // swaps forked to a fresh session because mid-conversation
+    // translation was deemed risky; user reversed that on
+    // thClaws/thClaws#142.
+    save_history(&state.agent, &mut state.session, &state.session_store);
+
+    state.config = candidate;
+    if let Err(e) = state.rebuild_agent(true) {
+        emit(events_tx, format!("rebuild failed: {e}"));
+        return;
+    }
+    // Append a `model` event so the switch persists to the JSONL immediately
+    // (not only when the next chat turn writes an assistant line) and a restore
+    // recovers it. Updates the in-memory label too.
+    if let Some(store) = state.session_store.as_ref() {
+        let path = store.path_for(&state.session.id);
+        let model = state.config.model.clone();
+        let _ = state.session.record_model_to(&path, &model);
+    } else {
+        state.session.model = state.config.model.clone();
+    }
+
+    // Persist the model choice to project settings so a restart lands
+    // on the same provider/model.
+    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+    project.set_model(&state.config.model);
+    let _ = project.save();
+
+    let provider = state.config.detect_provider().unwrap_or("unknown");
+    emit(
+        events_tx,
+        format!(
+            "model → {} (provider: {provider}; saved to .thclaws/settings.json; conversation preserved)",
+            state.config.model
+        ),
+    );
+    // Catalogue hint: if we don't have an exact context-window entry
+    // for this model, try to discover it at the source.
+    // - Ollama models: hit `POST /api/show` for the chosen context
+    //   (prefers `num_ctx` over native `context_length`) and write
+    //   the result into the user cache so it sticks.
+    // - Everyone else: emit the "run /models refresh" nudge.
+    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+    let (ctx, src) =
+        crate::model_catalogue::effective_context_window_with(&cat, &state.config.model);
+    if !src.is_known() {
+        // Re-derive the provider kind from the now-active model — the
+        // intra/cross-family classification we used pre-#142 is gone.
+        let new_kind = crate::providers::ProviderKind::detect(&state.config.model);
+        let is_ollama = matches!(
+            new_kind,
+            Some(crate::providers::ProviderKind::Ollama)
+                | Some(crate::providers::ProviderKind::OllamaAnthropic)
+        );
+        let mut resolved_via_ollama = false;
+        if is_ollama {
+            let base = std::env::var("OLLAMA_BASE_URL")
+                .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
+            let ollama =
+                crate::providers::ollama::OllamaProvider::new().with_base_url(base.clone());
+            let model_id = state.config.model.clone();
+            match ollama.show(&model_id).await {
+                Ok((n, which)) => {
+                    let provider_key = match new_kind {
+                        Some(crate::providers::ProviderKind::OllamaAnthropic) => "ollama-anthropic",
+                        _ => "ollama",
+                    };
+                    let entry = crate::model_catalogue::ModelEntry {
+                        context: Some(n),
+                        max_output: None,
+                        source: Some(format!("ollama://{base}/api/show ({which})")),
+                        verified_at: Some(crate::model_catalogue::today_iso()),
+                        free: None,
+                        chat: None,
+                        ..Default::default()
+                    };
+                    match crate::model_catalogue::upsert_cache_entry(provider_key, &model_id, entry)
+                    {
+                        Ok(()) => {
+                            emit(
+                                events_tx,
+                                format!(
+                                    "auto-scanned '{model_id}' via Ollama /api/show → {n} tokens ({which}); cached for next time"
+                                ),
+                            );
+                            resolved_via_ollama = true;
+                        }
+                        Err(e) => emit(
+                            events_tx,
+                            format!(
+                                "scanned Ollama context ({n} tokens) but cache write failed: {e}"
+                            ),
+                        ),
+                    }
+                }
+                Err(e) => emit(
+                    events_tx,
+                    format!("could not scan Ollama context for '{model_id}': {e}"),
+                ),
+            }
+        }
+        // Same idea for `openai-compat`: the endpoint is the user's own, so
+        // the shipped catalogue can never carry its models. Ask it — LiteLLM
+        // answers `/model/info`, vLLM publishes `max_model_len` on `/models`
+        // — and cache what comes back. Without this the switch silently keeps
+        // the fallback context AND sends an uncapped `max_tokens`, which the
+        // upstream rejects when the real ceiling is lower.
+        // `litellm` is the same shape — a user-pointed endpoint whose aliases
+        // the catalogue can't know — and it is the one that actually answers
+        // `/model/info`.
+        let mut resolved_via_endpoint = false;
+        let probe_kind = match new_kind {
+            Some(k @ crate::providers::ProviderKind::OpenAICompat)
+            | Some(k @ crate::providers::ProviderKind::LiteLlm) => Some(k),
+            _ => None,
+        };
+        if let Some(probe_kind) = probe_kind {
+            let model_id = state.config.model.clone();
+            match crate::providers::openai::probe_compat_limits(probe_kind, &model_id).await {
+                Some((n, max_out, source)) => {
+                    let entry = crate::model_catalogue::ModelEntry {
+                        context: Some(n),
+                        max_output: max_out,
+                        source: Some(source.clone()),
+                        verified_at: Some(crate::model_catalogue::today_iso()),
+                        free: None,
+                        chat: None,
+                        ..Default::default()
+                    };
+                    match crate::model_catalogue::upsert_cache_entry(
+                        crate::model_catalogue::provider_kind_name(probe_kind),
+                        &model_id,
+                        entry,
+                    ) {
+                        Ok(()) => {
+                            emit(
+                                events_tx,
+                                format!(
+                                    "auto-scanned '{model_id}' via {source} → {n} tokens{}; cached for next time",
+                                    max_out
+                                        .map(|m| format!(", max output {m}"))
+                                        .unwrap_or_default()
+                                ),
+                            );
+                            resolved_via_endpoint = true;
+                        }
+                        Err(e) => emit(
+                            events_tx,
+                            format!("scanned context ({n} tokens) but cache write failed: {e}"),
+                        ),
+                    }
+                }
+                None => emit(
+                    events_tx,
+                    format!(
+                        "'{model_id}': {} publishes no model limits (tried /model/info and /models)",
+                        crate::providers::endpoint_hint(probe_kind)
+                    ),
+                ),
+            }
+        }
+        if !resolved_via_ollama && !resolved_via_endpoint {
+            // `/models refresh` re-downloads the shipped catalogue, which by
+            // definition can't learn a user-hosted endpoint's models — point
+            // those users at the override instead.
+            let remedy = if probe_kind.is_some() {
+                format!(
+                    "Set it yourself: \"modelOverrides\": {{ \"{}\": {{ \"context\": <n>, \"maxOutput\": <n> }} }} in .thclaws/settings.json.",
+                    state.config.model
+                )
+            } else {
+                "Run /models refresh to pick up newer entries.".to_string()
+            };
+            emit(
+                events_tx,
+                format!(
+                    "⚠ no catalogue entry for '{}' — using {} ({} tokens). {remedy}",
+                    state.config.model, provider, ctx
+                ),
+            );
+        }
+    }
+    // Never reset the view's history on a model swap — the bubbles /
+    // terminal replay stay as-is and the next turn continues the
+    // conversation under the new provider.
+    let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+        &state.session_store,
+        &state.session.id,
+    )));
+    // Push the sidebar's Provider/Model section immediately so it
+    // doesn't lag behind until the 5 s config_poll fires.
+    let payload = serde_json::json!({
+        "type": "provider_update",
+        "provider": provider,
+        "model": state.config.model,
+        "provider_ready": true,
+    });
+    let _ = events_tx.send(crate::shared_session::ViewEvent::ProviderUpdate(
+        payload.to_string(),
+    ));
+}
+
+fn doctor_report(state: &WorkerState) -> String {
+    let v = crate::version::info();
+    let dirty = if v.git_dirty { "+dirty" } else { "" };
+    let api_key = if state.config.api_key_from_env().is_some() {
+        "set ✓"
+    } else {
+        "MISSING ✗"
+    };
+    let sandbox = crate::sandbox::Sandbox::root()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "disabled".into());
+    let sessions = crate::session::SessionStore::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none".into());
+    let memory = crate::memory::MemoryStore::default_path()
+        .map(|p| {
+            if p.exists() {
+                format!("{} ✓", p.display())
+            } else {
+                format!("{} (empty)", p.display())
+            }
+        })
+        .unwrap_or_else(|| "none".into());
+    let tmux = if crate::team::has_tmux() {
+        "available ✓"
+    } else {
+        "not found"
+    };
+
+    format!(
+        "── thClaws diagnostics ──\n\
+         version:    {}\n\
+         revision:   {}{dirty} ({})\n\
+         built:      {} ({})\n\
+         model:      {}\n\
+         provider:   {}\n\
+         api key:    {api_key}\n\
+         sandbox:    {sandbox}\n\
+         sessions:   {sessions}\n\
+         memory:     {memory}\n\
+         tmux:       {tmux}\n\
+         tools:      {} registered\n\
+         history:    {} messages\n",
+        v.version,
+        v.git_sha,
+        v.git_branch,
+        v.build_time,
+        v.build_profile,
+        state.config.model,
+        state.config.detect_provider().unwrap_or("unknown"),
+        state.tool_registry.names().len(),
+        state.agent.history_snapshot().len(),
+    )
+}
+
+/// Squash a multi-line upstream error into one readable line, capped.
+/// Endpoints that aren't OpenAI-shaped reply with a whole HTML page.
+fn one_line(msg: &str, max: usize) -> String {
+    let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
+    let _ = events_tx.send(ViewEvent::SlashOutput(text));
+}
+
+/// Starter `.md` body for `/agent new` — a commented frontmatter
+/// skeleton plus a system-prompt stub. Mirrors the field set the
+/// parser understands (see [`crate::agent_defs`]).
+fn agent_starter_template(name: &str) -> String {
+    format!(
+        "---\n\
+         name: {name}\n\
+         description: \n\
+         tools: Read, Glob, Grep\n\
+         permissionMode: ask\n\
+         maxTurns: 20\n\
+         color: cyan\n\
+         ---\n\n\
+         You are the {name} agent.\n\n\
+         Describe the task this agent should focus on, what to return, and \
+         anything it must not do.\n"
+    )
+}
+
+/// dev-plan/32 Tier 3 `/workflow run` for the GUI / chat surface.
+/// Author phase calls the model; review phase emits
+/// `ViewEvent::WorkflowReviewRequest` and awaits the
+/// `WorkflowApprover`'s oneshot for an Approve / Cancel / Rework
+/// decision. Rework loops back into the author phase carrying the
+/// user's revision note + a bumped revision counter so the bubble
+/// can show "Revision 2" / "Revision 3" labels.
+async fn dispatch_workflow_run(
+    prompt: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let goal = prompt.trim();
+    if goal.is_empty() {
+        emit(events_tx, "/workflow run: missing goal".to_string());
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+    let provider = match crate::repl::build_provider(&state.config) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: can't build provider: {e}"),
+            );
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+    };
+
+    let workflow_id = crate::workflow::generate_workflow_id();
+    let mut revision_note: Option<String> = None;
+    let mut revision: u32 = 0;
+
+    loop {
+        emit(
+            events_tx,
+            format!(
+                "/workflow run: authoring script (model={}, revision {})…",
+                state.config.model,
+                revision + 1
+            ),
+        );
+        let script = match crate::workflow::author(
+            provider.as_ref(),
+            &state.config.model,
+            goal,
+            revision_note.as_deref(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                emit(events_tx, format!("/workflow run: author failed: {e}"));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+        };
+
+        let _ = events_tx.send(ViewEvent::WorkflowReviewRequest {
+            id: workflow_id.clone(),
+            prompt: goal.to_string(),
+            script: script.clone(),
+            model: state.config.model.clone(),
+            revision,
+        });
+
+        let decision = state.workflow_approver.request(workflow_id.clone()).await;
+        match decision {
+            crate::workflow::WorkflowDecision::Approve => {
+                run_workflow_inline(state, events_tx, goal, script, None).await;
+                // TurnDone clears the chat-tab `streaming` flag so the
+                // Stop button stops showing and Send re-enables.
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Cancel => {
+                emit(events_tx, "/workflow run: cancelled".to_string());
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Rework(note) => {
+                revision_note = Some(note);
+                revision += 1;
+                // Loop and re-author with the revision note.
+            }
+        }
+    }
+}
+
+async fn dispatch_workflow_resume(
+    prefix: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    let script = match crate::workflow::read_workflow_script(&cwd, &id) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow resume: can't read script.js for {id}: {e}"),
+            );
+            return;
+        }
+    };
+    let cache = match crate::workflow::read_completed_workers(&cwd, &id) {
+        Ok(v) => v,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!(
+            "/workflow resume: id={id} — {} cached worker(s)",
+            cache.len()
+        ),
+    );
+    run_workflow_inline(state, events_tx, "(resume)", script, Some((id, cache))).await;
+    // Mirror dispatch_workflow_run: clear chat-tab streaming flag so
+    // the Stop button hides after a resumed workflow ends (or is
+    // cancelled mid-run by the user).
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Mid-session equivalent of `thclaws --workflow <path>`: read a
+/// pre-authored script from disk and execute it under the active
+/// session — skipping the `/workflow run` author + review phase
+/// entirely. Output streams through the chat tab via the same
+/// `run_workflow_inline` engine that powers `/workflow run` /
+/// `/workflow resume`.
+async fn dispatch_workflow_exec(
+    path: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        emit(events_tx, "/workflow exec: missing path".to_string());
+        return;
+    }
+    let script_path = std::path::PathBuf::from(trimmed);
+    let script = match std::fs::read_to_string(&script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!(
+                    "/workflow exec: can't read '{}': {e}",
+                    script_path.display()
+                ),
+            );
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!("/workflow exec: running {}…", script_path.display()),
+    );
+    let label = format!("(exec {})", script_path.display());
+    run_workflow_inline(state, events_tx, &label, script, None).await;
+    // Same chat-tab streaming-flag cleanup as the other two entry points.
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Shared spawn_blocking + thread-locals wiring used by
+/// `dispatch_workflow_run` (fresh) and `dispatch_workflow_resume`
+/// (with cache). Streams the final result + cost summary back through
+/// `emit`. Stage F/G/H/I/K behaviours all participate (logger, usage
+/// sink, replay cache); only the per-worker progress lines (Stage E)
+/// don't reach the chat surface since they print to stdout.
+async fn run_workflow_inline(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    goal: &str,
+    script: String,
+    resume: Option<(String, Vec<(String, String)>)>,
+) {
+    let cwd_for_persist = crate::workdir::scoped_root().or_else(|| std::env::current_dir().ok());
+    let (workflow_id, cache, is_resume) = match resume {
+        Some((id, c)) => (id, c, true),
+        None => (crate::workflow::generate_workflow_id(), Vec::new(), false),
+    };
+
+    let logger_handle: Option<crate::workflow::LoggerHandle> = match cwd_for_persist
+        .as_ref()
+        .and_then(|cwd| crate::workflow::WorkflowLogger::new(workflow_id.clone(), cwd).ok())
+    {
+        Some(mut l) => {
+            if is_resume {
+                l.set_next_worker_id(cache.len() as u32);
+            } else {
+                let _ = l.start(goal, &script);
+                if let Some(cwd) = cwd_for_persist.as_ref() {
+                    let _ = crate::workflow::write_workflow_script(cwd, &workflow_id, &script);
+                }
+            }
+            Some(std::sync::Arc::new(std::sync::Mutex::new(l)))
+        }
+        None => {
+            emit(
+                events_tx,
+                "/workflow run: state.jsonl unavailable — proceeding without checkpoint"
+                    .to_string(),
+            );
+            None
+        }
+    };
+    if !is_resume {
+        emit(events_tx, format!("/workflow run: id={workflow_id}"));
+    }
+
+    let task_tool = state.tool_registry.get(crate::subagent::TOOL_NAME);
+    let logger_for_thread = logger_handle.clone();
+    let cache_for_thread = if cache.is_empty() { None } else { Some(cache) };
+    // Tier 3 polish: pass the chat broadcast sender into the
+    // spawn_blocking thread so each thclaws.subagent host call can emit
+    // ToolCallStart/Result events, rendering worker progression in the
+    // chat tab as one-line `▸ … ✓` bubbles.
+    let events_tx_for_thread = events_tx.clone();
+    // Stop-button: clone the worker cancel token so the workflow runtime
+    // can observe `shared.cancel.cancel()` (fired by `shell_cancel` IPC)
+    // mid-worker via `tokio::select!`. Reset after the run so the next
+    // turn isn't pre-cancelled.
+    let cancel_for_thread = state.cancel.clone();
+    let include_base_for_thread = cwd_for_persist.clone();
+
+    type WfBlockingOut = (
+        std::result::Result<String, String>,
+        Vec<crate::providers::Usage>,
+        usize,
+    );
+    let started = std::time::Instant::now();
+    let outcome: std::result::Result<WfBlockingOut, tokio::task::JoinError> =
+        crate::workdir::spawn_blocking_scoped(move || {
+            crate::workflow::set_task_tool(task_tool);
+            crate::workflow::set_logger(logger_for_thread);
+            crate::workflow::set_usage_sink(true);
+            crate::workflow::set_replay_cache(cache_for_thread);
+            crate::workflow::set_events_tx(Some(events_tx_for_thread));
+            crate::workflow::set_cancel(Some(cancel_for_thread));
+            crate::workflow::set_include_base(include_base_for_thread);
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sandbox =
+                    crate::workflow::WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sandbox.run(&script).map_err(|e| e.to_string())
+            })();
+            let usages = crate::workflow::take_all_usages();
+            let remaining = crate::workflow::replay_remaining();
+            crate::workflow::set_task_tool(None);
+            crate::workflow::set_logger(None);
+            crate::workflow::set_usage_sink(false);
+            crate::workflow::set_replay_cache(None);
+            crate::workflow::set_events_tx(None);
+            crate::workflow::set_cancel(None);
+            crate::workflow::set_include_base(None);
+            (res, usages, remaining)
+        })
+        .await;
+
+    let (result, usages, remaining) = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: worker thread panicked: {e}"),
+            );
+            return;
+        }
+    };
+
+    // Stop-button: detect a cancel triggered mid-run. Either the JS
+    // script unwound cleanly with the sentinel error, or it caught the
+    // throw and ran to completion — in the latter case the token is
+    // still set, so we treat it as cancelled regardless. Reset the
+    // shared token afterwards so the next user turn starts clean.
+    let was_cancelled = state.cancel.is_cancelled()
+        || matches!(&result, Err(e) if e.contains(crate::workflow::WORKFLOW_CANCELLED_MSG));
+    if was_cancelled {
+        state.cancel.reset();
+    }
+
+    if let Some(handle) = &logger_handle {
+        if let Ok(mut l) = handle.lock() {
+            let _ = match (&result, was_cancelled) {
+                (_, true) => l.error(crate::workflow::WORKFLOW_CANCELLED_MSG),
+                (Ok(text), _) => l.done(text),
+                (Err(e), _) => l.error(e),
+            };
+        }
+    }
+
+    let elapsed = crate::tool_display::format_duration(started.elapsed());
+    let total_in: u64 = usages.iter().map(|u| u.input_tokens as u64).sum();
+    let total_out: u64 = usages.iter().map(|u| u.output_tokens as u64).sum();
+    let diverged = if remaining > 0 {
+        format!(" — {remaining} cache unused (diverged)")
+    } else {
+        String::new()
+    };
+    let status_word = if was_cancelled { "stopped" } else { "done" };
+    emit(
+        events_tx,
+        format!(
+            "workflow {status_word} — {} workers, {elapsed}, {total_in}in / {total_out}out{diverged}",
+            usages.len()
+        ),
+    );
+
+    match (result, was_cancelled) {
+        (_, true) => emit(events_tx, "/workflow run: stopped by user".to_string()),
+        (Ok(text), _) => emit(events_tx, text),
+        (Err(e), _) => emit(events_tx, format!("/workflow run: script failed: {e}")),
+    }
+}
+
+fn dispatch_workflow_list(events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: can't read cwd: {e}"));
+            return;
+        }
+    };
+    match crate::workflow::list_workflows(&cwd) {
+        Ok(workflows) if workflows.is_empty() => {
+            emit(
+                events_tx,
+                "no workflows under .thclaws/workflows/".to_string(),
+            );
+        }
+        Ok(workflows) => {
+            let mut lines = Vec::new();
+            for wf in &workflows {
+                let preview = if wf.prompt.chars().count() > 60 {
+                    let head: String = wf.prompt.chars().take(60).collect();
+                    format!("{head}…")
+                } else {
+                    wf.prompt.clone()
+                };
+                let id_short: String = wf.id.chars().take(20).collect();
+                let err_suffix = if wf.workers_error > 0 {
+                    format!(" ({} err)", wf.workers_error)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  {id_short}  {icon} {done}/{started}w{err_suffix}  {preview}",
+                    icon = wf.status.icon(),
+                    done = wf.workers_done,
+                    started = wf.workers_started,
+                ));
+            }
+            emit(events_tx, lines.join("\n"));
+        }
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: {e}"));
+        }
+    }
+}
+
+fn dispatch_workflow_inspect(prefix: String, events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let events = match crate::workflow::read_events(&cwd, &id) {
+        Ok(e) => e,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let take_preview = |s: &str, cap: usize| -> String {
+        if s.chars().count() > cap {
+            let head: String = s.chars().take(cap).collect();
+            format!("{head}…")
+        } else {
+            s.to_string()
+        }
+    };
+    let mut lines = vec![format!("workflow {id}")];
+    for ev in &events {
+        let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+        let ts = ev.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        match kind {
+            "start" => {
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  start    {prompt}"));
+            }
+            "worker_start" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} →   {}", take_preview(prompt, 80)));
+            }
+            "worker_done" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let output = ev.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✓   {}", take_preview(output, 80)));
+            }
+            "worker_error" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✗   {}", take_preview(err, 80)));
+            }
+            "done" => {
+                let result = ev.get("result").and_then(|r| r.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  done     {}", take_preview(result, 80)));
+            }
+            "error" => {
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  error    {err}"));
+            }
+            other => {
+                lines.push(format!("  {ts}  {other}"));
+            }
+        }
+    }
+    emit(events_tx, lines.join("\n"));
+}
+
+/// `/permissions <mode>` is refused when the org pins the mode, and in a
+/// multiuser pod, where the mode is one process-wide value for every member.
+fn permissions_change_refusal(arg: &str) -> Option<String> {
+    if crate::workdir::is_multiuser() {
+        return Some(
+            "Permission mode is fixed (auto) in shared workspaces — it applies to every member."
+                .into(),
+        );
+    }
+    permissions_arg_mode(arg).and_then(crate::policy::permission_mode_refusal)
+}
+
+fn permissions_arg_mode(arg: &str) -> Option<crate::permissions::PermissionMode> {
+    use crate::permissions::PermissionMode;
+    match arg.trim().to_lowercase().as_str() {
+        "auto" | "yolo" => Some(PermissionMode::Auto),
+        "ask" | "default" => Some(PermissionMode::Ask),
+        "linegated" | "line" => Some(PermissionMode::LineGated),
+        _ => None,
+    }
+}
+
+/// When LINE is currently bridged and the user just chose `auto` or
+/// `ask`, swap `state.approver` back to the pre-LINE (desktop) approver
+/// so future approval prompts surface locally rather than getting
+/// pushed to the user's phone. The LINE session itself stays connected
+/// — sidebar pill stays green and `/permissions linegated` can pull
+/// the LINE approver back out of `state.line_session.approver`.
+///
+/// No-op when LINE isn't bridged (the approver is already a desktop
+/// one) or when `line_pre_approver` is unset (shouldn't happen — they
+/// move in lockstep with `line_pre_mode` — but the check is cheap).
+fn restore_desktop_approver_if_line_bridged(state: &mut WorkerState) {
+    if state.line_session.is_some() {
+        if let Some(desktop) = state.line_pre_approver.clone() {
+            state.approver = desktop;
+        }
+    }
+}
+
+/// Persist `auto` / `ask` (the only two settable-and-persistent modes)
+/// to `.thclaws/settings.json` and emit a confirmation. Pulled out of
+/// the `/permissions` handler so the `linegated` arm — which must
+/// NOT touch settings.json — doesn't have to inline-duplicate the
+/// shared path.
+fn persist_permission_mode(mode: &str, events_tx: &broadcast::Sender<ViewEvent>) {
+    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+    project.set_permissions_mode(mode);
+    let save_note = match project.save() {
+        Ok(()) => "saved to .thclaws/settings.json",
+        Err(_) => "warning: could not save to .thclaws/settings.json",
+    };
+    let label = if mode == "auto" {
+        "permissions → auto (no prompts)"
+    } else {
+        "permissions → ask"
+    };
+    emit(events_tx, format!("{label} ({save_note})"));
+}
+
+/// Multi-byte-aware truncation for one-line research-job display.
+/// Mirrors `repl::truncate_for_repl`; both modules need it but they
+/// don't currently share a string-utils home.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
+/// GUI-side mirror of `repl::resolve_skill_install_target` so the Chat
+/// tab's `/skill install <name>` resolves a marketplace slug the same
+/// way the CLI does. Inlined here (rather than reaching into `repl::`)
+/// to keep the GUI's shell_dispatch module self-contained.
+fn resolve_skill_install_target_gui(
+    arg: &str,
+    explicit_name: Option<&str>,
+) -> (String, Option<String>, Option<String>) {
+    let looks_like_url = arg.contains("://")
+        || arg.starts_with("git@")
+        || arg.starts_with('/')
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || arg.to_ascii_lowercase().ends_with(".zip");
+    if looks_like_url {
+        return (arg.to_string(), explicit_name.map(String::from), None);
+    }
+    let mp = crate::marketplace::load();
+    match mp.find(arg) {
+        Some(entry) if entry.license_tier == "linked-only" => {
+            let homepage = if entry.homepage.is_empty() {
+                "the upstream repo".to_string()
+            } else {
+                entry.homepage.clone()
+            };
+            (
+                String::new(),
+                None,
+                Some(format!(
+                    "'{}' is source-available and cannot be redistributed — install directly from {}",
+                    entry.name, homepage
+                )),
+            )
+        }
+        Some(entry) => match &entry.install_url {
+            Some(url) => (
+                url.clone(),
+                Some(
+                    explicit_name
+                        .map(String::from)
+                        .unwrap_or_else(|| entry.name.clone()),
+                ),
+                None,
+            ),
+            None => (
+                String::new(),
+                None,
+                Some(format!(
+                    "'{}' has no install_url in the marketplace catalogue",
+                    entry.name
+                )),
+            ),
+        },
+        None => (
+            String::new(),
+            None,
+            Some(format!(
+                "no skill named '{arg}' in marketplace and not a URL — {}",
+                crate::marketplace::not_found_hint("try /skill search <query> or pass a git URL")
+            )),
+        ),
+    }
+}
+
+/// Push the latest KMS list to the sidebar after a /kms mutation so
+/// the sidebar's list, active-marker, and scope tags reflect the new
+/// state without waiting for a full session_update tick.
+fn broadcast_kms_update(events_tx: &broadcast::Sender<ViewEvent>) {
+    let payload = crate::gui::build_kms_update_payload();
+    let _ = events_tx.send(ViewEvent::KmsUpdate(payload.to_string()));
+}
+
+/// M6.25: human-readable lint summary for `/kms lint`.
+/// M6.29: helper for the `/loop` and `/goal` arms.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// M6.29: short status line for `/goal status`.
+fn format_goal_status(g: &crate::goal_state::GoalState) -> String {
+    let elapsed = g.time_used_secs();
+    let token_budget = g
+        .budget_tokens
+        .map(|n| format!("{}/{}", g.tokens_used, n))
+        .unwrap_or_else(|| format!("{} (unlimited)", g.tokens_used));
+    let last = g
+        .last_message
+        .as_deref()
+        .or(g.last_audit.as_deref())
+        .unwrap_or("(none)");
+    format!(
+        "goal status: {}\n  elapsed: {}s, iterations: {}, tokens: {}\n  objective: {}\n  last: {}",
+        g.status.as_str(),
+        elapsed,
+        g.iterations_done,
+        token_budget,
+        truncate_inline(&g.objective, 100),
+        truncate_inline(last, 200),
+    )
+}
+
+/// M6.29: full goal contents for `/goal show`.
+fn format_goal_show(g: &crate::goal_state::GoalState) -> String {
+    let mut out = format!(
+        "goal: {}\nstatus: {}\nstarted_at: {}\niterations_done: {}\ntokens_used: {}\n",
+        g.objective,
+        g.status.as_str(),
+        g.started_at,
+        g.iterations_done,
+        g.tokens_used,
+    );
+    if let Some(b) = g.budget_tokens {
+        out.push_str(&format!("budget_tokens: {b}\n"));
+    }
+    if let Some(b) = g.budget_time_secs {
+        out.push_str(&format!("budget_time_secs: {b}\n"));
+    }
+    if let Some(a) = &g.last_audit {
+        out.push_str(&format!("last_audit: {a}\n"));
+    }
+    if let Some(m) = &g.last_message {
+        out.push_str(&format!("last_message: {m}\n"));
+    }
+    if let Some(c) = g.completed_at {
+        out.push_str(&format!("completed_at: {c}\n"));
+    }
+    out
+}
+
+fn truncate_inline(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.replace('\n', " ")
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out.replace('\n', " ")
+    }
+}
+
+// `format_lint_report` and `format_wrap_up_report` were moved to
+// `crate::kms` in M6.38.3 — they need to be reachable from CLI dispatch
+// (repl.rs) which builds without the `gui` feature, but `shell_dispatch`
+// is `#[cfg(feature = "gui")]`-gated. Pure functions, so co-locating
+// with the data types they format keeps the cfg surface narrower.
+
+/// True if the lint report or stale list contains anything the
+/// `kms-linker` subagent can sensibly act on. Orphan pages and missing
+/// frontmatter are excluded — orphans are often intentional, and a
+/// missing-frontmatter page is something the subagent's prompt tells
+/// it to leave alone (it can't safely invent a category).
+pub(crate) fn has_actionable_issues(
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+) -> bool {
+    !lint.broken_links.is_empty()
+        || !lint.missing_in_index.is_empty()
+        || !lint.missing_required_fields.is_empty()
+        || !stale.is_empty()
+}
+
+/// Build the initial prompt for the `kms-linker` subagent. Embeds the
+/// KMS name, the lint report (only the actionable categories — see
+/// `has_actionable_issues`), and the stale-marker list as a structured
+/// brief the subagent can iterate over with TodoWrite.
+pub(crate) fn compose_kms_linker_prompt(
+    name: &str,
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+) -> String {
+    let mut out = format!(
+        "You are fixing the KMS named `{name}`. Pass `kms: \"{name}\"` to every tool call.\n\n"
+    );
+    out.push_str("## Lint report\n\n");
+    if lint.broken_links.is_empty() {
+        out.push_str("- broken links: none\n");
+    } else {
+        out.push_str(&format!("- broken links ({}):\n", lint.broken_links.len()));
+        for (page, target) in &lint.broken_links {
+            out.push_str(&format!("  - on `{page}` → missing `pages/{target}.md`\n"));
+        }
+    }
+    if lint.missing_in_index.is_empty() {
+        out.push_str("- pages missing from index: none\n");
+    } else {
+        out.push_str(&format!(
+            "- pages missing from index ({}):\n",
+            lint.missing_in_index.len()
+        ));
+        for stem in &lint.missing_in_index {
+            out.push_str(&format!("  - `{stem}`\n"));
+        }
+    }
+    if lint.missing_required_fields.is_empty() {
+        out.push_str("- missing required frontmatter fields: none\n");
+    } else {
+        out.push_str(&format!(
+            "- missing required frontmatter fields ({}):\n",
+            lint.missing_required_fields.len()
+        ));
+        for (page, source_key, field) in &lint.missing_required_fields {
+            out.push_str(&format!(
+                "  - `{page}`: '{field}' (required by {source_key})\n"
+            ));
+        }
+    }
+    if !lint.orphan_pages.is_empty() {
+        out.push_str(&format!(
+            "- orphan pages ({}, do NOT modify — list in final report):\n",
+            lint.orphan_pages.len()
+        ));
+        for stem in &lint.orphan_pages {
+            out.push_str(&format!("  - `{stem}`\n"));
+        }
+    }
+
+    out.push_str("\n## Stale markers\n\n");
+    if stale.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        out.push_str(&format!("- pages awaiting refresh ({}):\n", stale.len()));
+        for entry in stale {
+            out.push_str(&format!(
+                "  - `{}`: source `{}` re-ingested on {}\n",
+                entry.page_stem, entry.source_alias, entry.date
+            ));
+        }
+    }
+    out.push_str(
+        "\nWork through the categories in the order from your operating procedure. \
+         Use TodoWrite to track progress. Stop after one pass and produce the final \
+         **Fixed** / **Skipped** report.\n",
+    );
+    out
+}
+
+/// Build the initial prompt for the `kms-reconcile` subagent. Names the
+/// target KMS, the optional focus topic, and whether the agent should
+/// dry-run (just propose) or apply (actually rewrite). The subagent's
+/// own body declares the four-pass procedure.
+pub(crate) fn compose_kms_reconcile_prompt(name: &str, focus: Option<&str>, apply: bool) -> String {
+    let mode_clause = if apply {
+        "**Apply mode** — rewrite outdated pages with `## History` sections, write `Conflict — <topic>.md` pages for ambiguous cases. Every write must preserve the original claim somewhere."
+    } else {
+        "**Dry-run mode** — DO NOT write to the KMS. Produce the same final report you would in apply mode, listing what you *would* change, but make no `KmsWrite` or `KmsAppend` calls. The user re-runs with `--apply` to execute."
+    };
+    let focus_clause = match focus {
+        Some(f) => format!(
+            "\n\n## Focus\n\nNarrow this pass to the topic / entity: `{f}`. Skip pages unrelated to this focus.",
+        ),
+        None => String::new(),
+    };
+    format!(
+        "You are reconciling contradictions in the KMS named `{name}`. Pass `kms: \"{name}\"` to every tool call.\n\
+         \n\
+         {mode_clause}{focus_clause}\n\
+         \n\
+         Work through the four-pass procedure from your operating manual (claims, entities, decisions, source-freshness). Use TodoWrite to track progress. Stop after one pass and produce the final **Auto-resolved** / **Flagged for user** / **Stale pages updated** report."
+    )
+}
+
+/// Compose the brief for the `kms-maintain` umbrella agent: the
+/// structural lint report + stale-marker list (the same inputs the
+/// linker gets) plus the apply/dry-run mode. The agent's own manual
+/// carries the five-stage procedure; this just feeds it the data and
+/// the mode.
+pub(crate) fn compose_kms_maintain_prompt(
+    name: &str,
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+    apply: bool,
+) -> String {
+    let mode_clause = if apply {
+        "**Apply mode** — execute fixes across all stages. Preserve history (never silently drop a claim) and never delete a page — the most you remove is a dead reference inside a page."
+    } else {
+        "**Dry-run mode** — make NO `KmsWrite`/`KmsAppend` calls. Report what you *would* change across every stage, then stop. The user re-runs with `--apply` to execute."
+    };
+    let mut out = format!(
+        "You are maintaining the KMS named `{name}`. Pass `kms: \"{name}\"` to every KMS tool call.\n\n{mode_clause}\n\n"
+    );
+    out.push_str("## Structural report (lint)\n\n");
+    out.push_str(&crate::kms::format_lint_report(name, lint));
+    out.push_str("\n\n## Stale markers\n\n");
+    if stale.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for entry in stale {
+            out.push_str(&format!(
+                "- `{}`: source `{}` re-ingested on {}\n",
+                entry.page_stem, entry.source_alias, entry.date
+            ));
+        }
+    }
+    out.push_str(
+        "\nWork your five-stage operating procedure in order (structural fixes → \
+         source reconciliation against live sessions → stale refresh → contradiction \
+         reconciliation → orphans). Use TodoWrite to track stages, and finish with the \
+         staged final report.\n",
+    );
+    out
+}
+
+// `format_schedule_preset_list` and `format_migration_report` moved to
+// their data-owning modules (schedule_presets / kms) in M6.38.3. See
+// the comment above `format_lint_report`'s removal for rationale.
+
+/// M6.25 BUG #4: alias-sanitizer used by /kms file-answer. Delegates to
+/// the canonical `kms::sanitize_alias` so Thai/non-Latin titles survive
+/// here too (they used to fold to empty).
+fn sanitize_alias_for_dispatch(raw: &str) -> String {
+    crate::kms::sanitize_alias(raw)
+}
+
+/// Same shape as [`broadcast_kms_update`], for the MCP-server list. Read
+/// fresh from disk by `build_mcp_update_payload` so user-scope removals
+/// (which the live tool registry can't surgically reflect) at least
+/// disappear from the sidebar immediately.
+fn broadcast_mcp_update(events_tx: &broadcast::Sender<ViewEvent>) {
+    let payload = crate::gui::build_mcp_update_payload();
+    let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
+}
+
+/// Shared persist + spawn + tool-registration flow used by both
+/// `/mcp add <url>` (HTTP) and `/mcp add <command> [args...]` (stdio).
+/// Caller builds the right [`McpServerConfig`] (transport, url-or-cmd);
+/// this function handles writing to mcp.json, spawning the live client,
+/// listing its tools, registering them in the session, rebuilding the
+/// agent, and emitting the user-facing result message.
+async fn persist_and_register_mcp(
+    state: &mut crate::shared_session::WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cfg: crate::mcp::McpServerConfig,
+    user: bool,
+) {
+    let name = cfg.name.clone();
+    let saved_to = match crate::config::save_mcp_server(&cfg, user) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(events_tx, format!("write failed: {e}"));
+            return;
+        }
+    };
+    // Non-interactive: an HTTP server needing OAuth returns a "run
+    // /mcp reauth" error instead of blocking the worker thread for up
+    // to 5 min on a browser callback (issue #114). stdio keeps the GUI
+    // approver for the command-allowlist gate.
+    match crate::mcp::McpClient::spawn_noninteractive(cfg.clone(), Some(state.approver.clone()))
+        .await
+    {
+        Ok(client) => match client.list_tools().await {
+            Ok(tool_infos) => {
+                let names: Vec<String> = tool_infos.iter().map(|t| t.name.clone()).collect();
+                for info in tool_infos {
+                    let tool = crate::mcp::McpTool::new(client.clone(), info);
+                    state.tool_registry.register(std::sync::Arc::new(tool));
+                }
+                state.mcp_clients.push(client);
+                // Refresh the system prompt FIRST so the new server's
+                // InitializeResult.instructions land in the
+                // `# MCP server instructions` section and the factory
+                // snapshot picks up the new tools — matches the
+                // McpReady path in shared_session.rs. Pre-fix this
+                // path only called rebuild_agent, so the new tools
+                // reached the parent but the system prompt's MCP
+                // section stayed stale until the next /reload.
+                state.rebuild_system_prompt();
+                if let Err(e) = state.rebuild_agent(true) {
+                    emit(events_tx, format!("rebuild failed: {e}"));
+                    return;
+                }
+                emit(
+                    events_tx,
+                    format!(
+                        "mcp '{name}' added ({}, {} tool(s)) → {}\nTools: {}",
+                        if user { "user" } else { "project" },
+                        names.len(),
+                        saved_to.display(),
+                        names.join(", "),
+                    ),
+                );
+                broadcast_mcp_update(events_tx);
+            }
+            Err(e) => emit(
+                events_tx,
+                format!(
+                    "saved '{name}' to {} but list_tools failed: {e}",
+                    saved_to.display()
+                ),
+            ),
+        },
+        Err(e) => emit(
+            events_tx,
+            format!(
+                "saved '{name}' to {} but connect failed: {e}",
+                saved_to.display()
+            ),
+        ),
+    }
+}
+
+/// M6.16 BUG H1 helper: refresh skill_store + rebuild system prompt
+/// + rebuild agent so plugin contributions stop / start being callable
+/// in this session without a restart. Mirrors the install path's
+/// refresh block; called from PluginRemove / PluginEnable / PluginDisable.
+/// MCP subprocess teardown is NOT handled here — the live tool registry
+/// can't surgically detach an already-spawned client. Callers append a
+/// hint to their user-facing message when the plugin contributed MCP
+/// servers (see has_running_mcp_contributions).
+fn refresh_after_plugin_change(
+    state: &mut crate::shared_session::WorkerState,
+    events_tx: &broadcast::Sender<crate::shared_session::ViewEvent>,
+) {
+    let refreshed = crate::skills::SkillStore::discover();
+    if let Ok(mut store) = state.skill_store.lock() {
+        *store = refreshed;
+    }
+    state.rebuild_system_prompt();
+    if let Err(e) = state.rebuild_agent(true) {
+        emit(events_tx, format!("[plugin] agent rebuild failed: {e}"));
+    }
+}
+
+/// Sorted list of MCP server names a plugin contributes (or `None`
+/// if the plugin isn't found / has no MCP servers / manifest unread).
+/// Used by /plugin install / enable / disable / remove to render an
+/// emphasized "⚠  restart to spawn / drop server(s): a, b, c" hint
+/// — the user gets the actual names so they know what's coming
+/// after relaunch, not just a generic "restart needed" note.
+/// M6.16.1 — replaces the older boolean `has_running_mcp_contributions`.
+fn mcp_server_names(name: &str) -> Option<Vec<String>> {
+    let plugin = crate::plugins::find_installed(name)?;
+    let manifest = plugin.manifest().ok()?;
+    if manifest.mcp_servers.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = manifest.mcp_servers.keys().cloned().collect();
+    names.sort();
+    Some(names)
+}
+
+#[cfg(test)]
+mod dispatch_helper_tests {
+    /// A box that isn't OpenAI-shaped answers `/models` with an HTML error
+    /// page. The note has to name the failure, not paste the page.
+    #[test]
+    fn one_line_flattens_and_caps_upstream_errors() {
+        let html = "http 404: <!DOCTYPE HTML>\n<html>\n  <head>\n    <title>Error response</title>\n  </head>\n</html>";
+        let out = super::one_line(html, 40);
+        assert!(!out.contains('\n'), "single line: {out}");
+        assert!(out.ends_with('…'), "truncated: {out}");
+        assert_eq!(out.chars().count(), 41, "40 chars + ellipsis");
+
+        // Short messages pass through whole, just de-wrapped.
+        assert_eq!(
+            super::one_line("connection\n  refused", 80),
+            "connection refused"
+        );
+    }
+}

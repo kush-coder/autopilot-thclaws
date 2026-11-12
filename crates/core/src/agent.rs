@@ -1,0 +1,5164 @@
+//! Agent loop: ties providers + tools + context + compaction together.
+//!
+//! `Agent::run_turn(user_msg)` returns a live stream of [`AgentEvent`]s that
+//! the REPL/UI consumes as the turn unfolds. The loop:
+//!
+//! 1. Append user message to history.
+//! 2. Compact history if over token budget.
+//! 3. Call `provider.stream()` → `assemble` → drain events, collecting
+//!    streaming text (yielded as `AgentEvent::Text`) and complete tool_use
+//!    blocks.
+//! 4. Persist the assistant message (text + tool_use blocks).
+//! 5. If any tool_use blocks: execute each via the registry, persist a user
+//!    message with the tool_result blocks, then loop back to step 3.
+//! 6. Otherwise: yield `AgentEvent::Done` and return.
+//!
+//! A `max_iterations` cap prevents runaway tool-call loops.
+
+use crate::compaction::compact;
+use crate::error::{Error, Result};
+use crate::permissions::{
+    ApprovalDecision, ApprovalRequest, ApprovalSink, AutoApprover, PermissionMode,
+};
+use crate::providers::{assemble, AssembledEvent, Provider, StreamRequest, Usage};
+use crate::tools::ToolRegistry;
+use crate::types::{ContentBlock, Message, Role};
+use async_stream::try_stream;
+use futures::{Stream, StreamExt};
+use serde_json::Value;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// Emitted at the start of each provider iteration (0-indexed).
+    IterationStart { iteration: usize },
+    /// A chunk of assistant text — for live streaming.
+    Text(String),
+    /// A chunk of model reasoning (thinking-model `reasoning_content` or
+    /// inline `<think>` tags). Surfaced as a separate event so chat
+    /// surfaces can render it dimmed/collapsed without blending into
+    /// the user-visible assistant text. Persistence still happens via
+    /// the consolidated `Thinking` block on the assistant message.
+    Thinking(String),
+    /// Tool is about to be called.
+    ToolCallStart {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Tool finished. `output` uses `std::result::Result<String, String>` so
+    /// the event stays `Clone` (our `crate::Error` isn't `Clone`).
+    ToolCallResult {
+        id: String,
+        name: String,
+        output: std::result::Result<String, String>,
+        /// MCP-Apps widget the chat surface should embed inline below
+        /// this tool's text result. `Some` only when the tool's
+        /// upstream MCP server declared a `ui.resourceUri` and the
+        /// resource fetch succeeded. Plain tools (Read, Bash, …)
+        /// always have `None`.
+        ui_resource: Option<crate::tools::UiResource>,
+    },
+    /// Tool was denied by the approver. No call was made.
+    ToolCallDenied { id: String, name: String },
+    /// A user message that was queued via `Agent::push_injection`
+    /// while the agent was mid-task has now been folded into the
+    /// conversation. Emitted once per drained injection, in queue
+    /// order, at the boundary after a tool_result lands. The frontend
+    /// uses this to flip a "queued" badge to "delivered" on the
+    /// corresponding chat bubble (see issue #106).
+    UserMessageInjected { text: String },
+    /// Display-only progress signal from the provider layer.
+    /// Not part of the conversation — never persisted or accumulated.
+    Progress(crate::providers::ProgressKind),
+    /// Turn is complete. No further events follow.
+    Done {
+        stop_reason: Option<String>,
+        usage: Usage,
+    },
+}
+
+/// Build the dynamic plan-mode reminder appended to the system prompt
+/// at the start of each turn. Returns `None` when no reminder applies
+/// (mode != Plan and no active plan).
+///
+/// State machine:
+///
+///   (Plan, no plan)         → exploration phase: tell model to use
+///                             read-only tools, then SubmitPlan.
+///   (Plan, plan submitted)  → user-approval window: model waits.
+///   (not-Plan, plan exists) → execution phase: Layer-2 narrowed view.
+///                             Only the **current step's description**
+///                             is shown; remaining steps appear as
+///                             titles only so the model can't reason
+///                             ahead and start debating future work
+///                             (M4.1). Already-done steps reduced to a
+///                             single comma-separated line.
+///   (not-Plan, no plan)     → no reminder.
+///
+/// Extracted to a free function so the reminder shape is unit-testable
+/// without spinning up the agent loop. Pure — reads `mode` and `plan`,
+/// returns the formatted string.
+pub fn build_plan_reminder(
+    mode: crate::permissions::PermissionMode,
+    plan: Option<&crate::tools::plan_state::Plan>,
+) -> Option<String> {
+    use crate::permissions::PermissionMode;
+
+    match (mode, plan) {
+        (PermissionMode::Plan, None) => Some(
+            "## Plan mode is active\n\n\
+             Mutating tools (Write, Edit, Bash, document editors, etc.) \
+             are BLOCKED. Use Read / Grep / Glob / Ls to explore the \
+             codebase. When you have enough context, call SubmitPlan \
+             with an ordered list of concrete, testable steps. The \
+             user will review the plan in the right-side sidebar and \
+             approve before execution.\n\n\
+             Do NOT call TodoWrite in plan mode — SubmitPlan is the \
+             structured replacement that the user can see live.\n\n\
+             ### What makes a good plan\n\n\
+             **Step count: as many as needed; no caps.** A plan is \
+             correctly decomposed when EVERY step satisfies all three:\n\
+             1. ONE action — a single command, edit, or generation. \
+             \"Scaffold the project\" is one action; \"scaffold AND \
+             install deps\" is two.\n\
+             2. ONE shell-runnable verification — exit code, file \
+             existence, regex match, HTTP probe, or test runner. If \
+             you wrote two verifications (build exits 0 AND tests \
+             pass), it's two steps.\n\
+             3. PRESERVED across the next step — if step N's output \
+             gets overwritten or replaced by step N+1, merge them. \
+             Throwaway work shouldn't be a step.\n\n\
+             If a 30-step plan satisfies all three rules, ship it. The \
+             driver runs one step at a time with bounded retries; long \
+             plans don't burn context because history is compacted at \
+             every step boundary. Bundling steps to fit a small count \
+             makes the plan WORSE — when a combined step fails, the \
+             user can't tell which half failed.\n\n\
+             Floor: a plan needs at least 2 steps. A 1-step plan isn't \
+             a plan, it's a tool call — just do the work without \
+             entering plan mode.\n\n\
+             **Build-and-run, implement-and-test, refactor-and-smoke- \
+             test are all TWO steps each.** When a combined step \
+             fails, the user can't tell which half failed; the sidebar \
+             just shows ✕ on a vague label. Keep one action per step.\n\n\
+             **Verifications must be shell-runnable.** Every \
+             verification is one of:\n\
+             - Shell exit code: `cargo build --release` exits 0\n\
+             - File existence: `test -f target/release/foo` or `ls \
+             dist/index.html`\n\
+             - Regex match: `grep -q 'useState' src/App.tsx`\n\
+             - HTTP probe: `curl -fsS localhost:8080/healthz`\n\
+             - Test runner: `pnpm test`, `cargo test --test integration`\n\n\
+             NO human-eye checks: \"in browser\", \"visually clear\", \
+             \"feels right\", \"the UI works\" — an autonomous agent \
+             can't verify these. If a step's only check is human-eye, \
+             reframe it as \"file matches grep pattern X\" or \"build \
+             exits 0\" or split it so a different step has the runnable \
+             check.\n\n\
+             **Long-running processes are NOT verifications.** \
+             `pnpm run dev` / `cargo run --release` / `python -m \
+             http.server` are servers — they don't exit. The Bash tool \
+             can't sit on them. Use the equivalent build/test command \
+             instead: `pnpm run build` (static check), `cargo build \
+             --release` (compile only), `python -c \"import …\"` \
+             (import smoke).\n\n\
+             **No bootstrap-then-overwrite steps.** If step N+1 will \
+             replace what step N produced, merge them. Test: would \
+             step N's output survive into step N+1? If no, step N is \
+             throwaway. Example: \"step 1: pnpm init\" + \"step 2: \
+             pnpm create vite . --force\" — step 2 overwrites step 1's \
+             package.json, so step 1 is throwaway. Use the canonical \
+             scaffolder as one step.\n\n\
+             **Default to canonical scaffolders.** When the goal needs \
+             a Vite / Next / Nuxt / cargo project, use the official \
+             non-interactive scaffolder as ONE step (`pnpm create \
+             vite@latest <dir> --template react-ts`, `cargo new <dir> \
+             --bin`, etc.) — don't decompose it into \"init package, \
+             add deps, configure tooling\". Scaffolders exist for a \
+             reason. Avoid commands that require an interactive TTY \
+             prompt; the Bash tool can't answer them.\n\n\
+             **Name cross-step artifacts in descriptions.** When step \
+             N+1 depends on a file step N produced, BOTH descriptions \
+             must name the file. \"Step 3 edits src/App.tsx\" requires \
+             step 2's description to name `src/App.tsx` as an output. \
+             Surfaces implicit deps and lets the user audit the chain \
+             before approving.\n\n\
+             **When executing the step, ACTUALLY RUN the verification \
+             before marking it done.** The flow is:\n\
+             1. UpdatePlanStep(id, \"in_progress\")\n\
+             2. Perform the step's main action (Edit / Write / Bash)\n\
+             3. **Run the verification** (Bash / Read / curl — whatever \
+             you specified)\n\
+             4. If verification passes → UpdatePlanStep(id, \"done\")\n\
+             5. If verification fails → UpdatePlanStep(id, \"failed\", \
+             note: \"<what failed, ideally one line>\")\n\n\
+             Do NOT skip the verification and call \"done\" anyway. The \
+             gate will accept it (the agent can't tell whether you \
+             actually ran the check), but the user is going to find out \
+             on the next step or in production, and trust degrades.\n\n\
+             On failure, mark the step Failed — don't paper over a \
+             broken build by marking it done and moving on. The user \
+             has Retry / Skip / Abort buttons in the sidebar; that's \
+             the right path when something legitimately broke.\n\n\
+             **Titles: imperative verb + outcome.** \"Add /healthz \
+             endpoint to web server\", not \"Endpoint work\" or \"I \
+             will add an endpoint\". User skims titles; make them \
+             scannable.\n\n\
+             **Descriptions: name the files, the operations, and the \
+             verification.** \"Edit src/routes.rs: add GET /healthz \
+             handler returning {ok: true}. Verify: `curl \
+             localhost:8080/healthz | jq .ok` returns true.\"\n\n\
+             **Order by dependency, then by risk.** Step N+1 must be \
+             safe to start only after step N succeeds — that's how the \
+             gate works. Within dependency constraints, tackle \
+             risky / uncertain work early so failures surface before \
+             half the plan is committed. Don't put \"deploy to \
+             production\" before \"run the test suite\".\n\n\
+             **Read before planning.** Drafted-from-imagination plans \
+             miss real constraints — function signatures, build \
+             configs, existing patterns. If your plan involves editing \
+             a file you haven't read, read it now before calling \
+             SubmitPlan.\n\n\
+             **Ask before submitting if the stack is undetermined.** \
+             AskUserQuestion is REQUIRED — not optional — when a key \
+             decision can't be resolved from the code or the user's \
+             prompt alone (which framework? which storage backend? \
+             which deployment target?). A wrong assumption forces a \
+             full replan, wastes the user's review time, and burns \
+             execution attempts on the wrong target. Ask BEFORE \
+             SubmitPlan.\n\n\
+             **No \"maybe\" / \"optional\" steps.** Either a step is \
+             needed and you'll do it, or it isn't and you skip it. The \
+             gate has Done / Failed, not Maybe.\n\n\
+             ### Audit BEFORE calling SubmitPlan\n\n\
+             After drafting the plan, run this self-audit. If any \
+             check fails, revise — don't submit a plan you wouldn't \
+             approve yourself.\n\n\
+             1. **Goal coverage** — Read the user's original ask. Does \
+             executing every step in order actually deliver what they \
+             asked for? If a step is missing (a feature, a build \
+             check, a final smoke test), add it.\n\
+             2. **Atomic steps** — Apply the three-rule test (one \
+             action, one shell-runnable verification, output preserved \
+             across the next step) to EVERY step. Split any that fail.\n\
+             3. **Bash-runnable verifications** — Re-read every \
+             `Verify:` line. Could you run that as a shell command \
+             right now? If a verification mentions \"browser\", \
+             \"visually\", or \"feels\", replace it with a grep / curl \
+             / build check, or split the step.\n\
+             4. **Cross-step dependencies named** — For every step \
+             that edits a file, confirm the file's existence is \
+             established by an earlier step's description (or by the \
+             current code). If step 3 needs `src/App.tsx` and the \
+             plan never names where that comes from, fix step 2's \
+             description.\n\
+             5. **No throwaway steps** — Walk pairs (step N, step \
+             N+1). Will step N+1 overwrite or replace step N's \
+             output? If yes, merge them.\n\
+             6. **No long-running servers as verifications** — Search \
+             your verification lines for `pnpm run dev`, `cargo run`, \
+             `npm start`, `python -m http.server`. Replace each with \
+             the build-only equivalent.\n\
+             7. **Stack decisions made** — Did you assume a framework \
+             / storage / deploy target the user didn't specify? If so, \
+             call AskUserQuestion BEFORE SubmitPlan.\n\n\
+             Only call SubmitPlan once all seven checks pass. The user \
+             trusts the plan you submit; submitting a plan you'd flag \
+             as weak yourself wastes their approval and your retry \
+             budget."
+                .to_string(),
+        ),
+        (PermissionMode::Plan, Some(p)) => {
+            // M6.9 (Bug C1): if the prior plan finished and the user
+            // re-entered plan mode for a NEW task, the slot still
+            // holds the all-done plan. Treat that case as "plan mode
+            // is active, no plan yet" so the model gets the right
+            // exploration/SubmitPlan reminder instead of "awaiting
+            // approval" of a finished plan. The sidebar's Approve
+            // button is also gated on !allDone so it doesn't show
+            // either.
+            use crate::tools::plan_state::StepStatus;
+            let all_done = p.steps.iter().all(|s| s.status == StepStatus::Done);
+            if all_done {
+                // Recurse with effectively-no-plan to get the
+                // (Plan, None) reminder. Cheaper than duplicating
+                // the long string here.
+                return build_plan_reminder(mode, None);
+            }
+            Some(format!(
+                "## Plan mode — awaiting user approval\n\n\
+                 You have submitted a plan ({} steps). The user is reviewing \
+                 it in the right-side sidebar. They will click **Approve** to \
+                 begin execution, or **Cancel** to discard the plan.\n\n\
+                 While waiting for approval, do NOT:\n\
+                 - Call **any other tools** — not Read, Grep, Edit, Bash, \
+                 UpdatePlanStep, or ExitPlanMode. The agent loop will block \
+                 these and surface a tool-result error if you try.\n\
+                 - Call **SubmitPlan again** unless the user explicitly asks \
+                 for a different plan.\n\
+                 - Tell the user to **type anything** to start (\"type 'go' \
+                 / 'start' / 'begin' to proceed\"). The buttons are the \
+                 contract — there is no chat-input route to approve. If you \
+                 tell them to type something, they will, and the system will \
+                 block your follow-up tool calls anyway.\n\n\
+                 Just emit a brief one-line confirmation that the plan is \
+                 ready for review (or stay silent) and stop. The sidebar \
+                 buttons are how the user moves the workflow forward, not \
+                 chat messages.",
+                p.steps.len(),
+            ))
+        }
+        (_, Some(p)) => Some(build_execution_reminder(p)),
+        (_, None) => None,
+    }
+}
+
+/// Layer-2 narrowed view (M4.1). The model sees:
+///   - the current step's title + full description
+///   - remaining steps as titles only (no descriptions)
+///   - completed steps as a single comma-separated tally
+///   - per-step protocol + the M3 "execute autonomously" wording
+///
+/// Goal: focus the model on the one step it's working on. Hiding step
+/// descriptions for upcoming work prevents the model from coordinating
+/// across step boundaries (e.g. "let me also do step 5 while I'm here")
+/// and reduces the urge to ask the user "shall I proceed?" between
+/// steps — there's nothing to debate when only one step is visible in
+/// detail.
+fn build_execution_reminder(plan: &crate::tools::plan_state::Plan) -> String {
+    use crate::tools::plan_state::StepStatus;
+
+    let total = plan.steps.len();
+
+    // Pick the focus step:
+    //   1. The InProgress step, if any (model already started)
+    //   2. The Failed step, if any (recovery state)
+    //   3. The first Todo step (about to start)
+    //   4. None — all steps Done
+    let focus_idx = plan
+        .steps
+        .iter()
+        .position(|s| s.status == StepStatus::InProgress)
+        .or_else(|| {
+            plan.steps
+                .iter()
+                .position(|s| s.status == StepStatus::Failed)
+        })
+        .or_else(|| plan.steps.iter().position(|s| s.status == StepStatus::Todo));
+
+    let mut out = String::new();
+    out.push_str("## Executing approved plan");
+    if let Some(idx) = focus_idx {
+        out.push_str(&format!(" — step {} of {}\n\n", idx + 1, total));
+        let step = &plan.steps[idx];
+
+        // Heading line: title + status hint when relevant.
+        let status_hint = match step.status {
+            StepStatus::InProgress => "  Current step:",
+            StepStatus::Failed => "  Failed step (awaiting user retry / skip / abort):",
+            StepStatus::Todo => "  Next step (call UpdatePlanStep with \"in_progress\" to begin):",
+            StepStatus::Done => "  Step:",
+        };
+        out.push_str(&format!("{status_hint} \"{}\"\n\n", step.title));
+
+        if !step.description.trim().is_empty() {
+            // Indent the description so it visually clusters with the
+            // current step block.
+            for line in step.description.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+
+        if let Some(note) = &step.note {
+            if !note.trim().is_empty() {
+                out.push_str(&format!("  (note: {note})\n\n"));
+            }
+        }
+
+        // Already complete: short tally line.
+        let done_titles: Vec<String> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.status == StepStatus::Done)
+            .map(|(i, s)| format!("{}. {}", i + 1, s.title))
+            .collect();
+        if !done_titles.is_empty() {
+            out.push_str("Already complete: ");
+            out.push_str(&done_titles.join(" · "));
+            out.push_str("\n\n");
+        }
+
+        // Remaining steps: titles only, NO descriptions. The whole
+        // point of Layer-2 — model can see the shape of what's coming
+        // but can't preview details and start working on later steps.
+        let remaining: Vec<String> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .skip(idx + 1)
+            .filter(|(_, s)| s.status != StepStatus::Done)
+            .map(|(i, s)| format!("  • {}. {}", i + 1, s.title))
+            .collect();
+        if !remaining.is_empty() {
+            out.push_str("Remaining (titles only, do NOT preview):\n");
+            out.push_str(&remaining.join("\n"));
+            out.push_str("\n\n");
+        }
+
+        // M6.3: surface cross-step outputs from completed steps so the
+        // model can read prior data (generated ids, hashes, paths)
+        // even after step-boundary compaction has trimmed the chat
+        // history. Only completed Done steps with a populated `output`
+        // field are listed.
+        let prior_outputs = collect_prior_step_outputs(plan, &step.id);
+        if !prior_outputs.is_empty() {
+            out.push_str("Outputs from prior steps (use these instead of guessing):\n");
+            for (i, title, output) in &prior_outputs {
+                out.push_str(&format!("  - Step {i} ({title}): {output}\n"));
+            }
+            out.push('\n');
+        }
+
+        // Per-step protocol — references the focus step's id directly.
+        let protocol = match step.status {
+            StepStatus::InProgress => format!(
+                "Per-step protocol:\n\
+                 - You're already on this step. Focus on completing it.\n\
+                 - **Run the verification before marking done.** The plan's description \
+                 for this step should specify what to check (build exits 0, test passes, \
+                 endpoint returns 200, etc.). Actually run that check.\n\
+                 - If verification passes: UpdatePlanStep(\"{id}\", \"done\")\n\
+                 - If verification fails: UpdatePlanStep(\"{id}\", \"failed\", note: \"<one-line reason>\")\n\
+                 - Don't paper over a failure by marking it done — the user has Retry / \
+                 Skip / Abort buttons in the sidebar for the Failed path.",
+                id = step.id,
+            ),
+            StepStatus::Todo => format!(
+                "Per-step protocol:\n\
+                 - Begin: UpdatePlanStep(\"{id}\", \"in_progress\")\n\
+                 - Perform the step's main action.\n\
+                 - **Run the verification** specified in the step's description.\n\
+                 - If verification passes: UpdatePlanStep(\"{id}\", \"done\")\n\
+                 - If verification fails: UpdatePlanStep(\"{id}\", \"failed\", note: \"<one-line reason>\")",
+                id = step.id,
+            ),
+            StepStatus::Failed => "Per-step protocol:\n\
+                 - This step is in Failed state. The user has Retry / Skip / Abort \
+                 buttons in the sidebar. Do NOT call UpdatePlanStep again unless \
+                 the user explicitly retries — wait for their next message."
+                .to_string(),
+            StepStatus::Done => String::new(),
+        };
+        if !protocol.is_empty() {
+            out.push_str(&protocol);
+            out.push_str("\n\n");
+        }
+    } else {
+        // All steps Done.
+        out.push_str(" — all steps complete\n\n");
+        out.push_str(
+            "Every step is Done. Wrap up the conversation with a brief \
+             summary of what was accomplished. Do not call any further \
+             tools unless the user requests follow-up work.\n\n",
+        );
+    }
+
+    // Trailing autonomous-execution wording — same as M3.
+    out.push_str(
+        "**Execute autonomously.** The user has already approved this \
+         plan by clicking the sidebar Approve button — do NOT pause to \
+         ask \"shall I proceed?\" / \"should I do X?\" / \"continue with \
+         the next step?\". Step transitions are the contract; the user \
+         monitors progress via the sidebar checkmarks, not via chat \
+         confirmations. Run end-to-end without intermediate user \
+         checkpoints.\n\n\
+         Only stop to ask the user (via AskUserQuestion or plain chat) \
+         if you hit a genuine blocker — missing credentials, an ambiguous \
+         decision the plan didn't resolve, or a destructive action that \
+         materially exceeds the plan's scope. Otherwise: keep going.\n\n\
+         Plans are strictly sequential — focus only on the current \
+         step. The gate will reject any out-of-order transition.",
+    );
+    out
+}
+
+/// M6.1 Ralph-loop per-step continuation prompt. Used by the worker's
+/// plan-execution driver to wake the agent loop with a focused user
+/// message after a turn ends mid-plan. Terse on purpose — the heavy
+/// lifting (full per-step protocol, sequential-gate rules, autonomous-
+/// execution wording) is already in the system reminder built by
+/// `build_execution_reminder`. This message just says "you have one
+/// step to work on right now, go".
+///
+/// `attempt` is 1 on the first nudge for a step, 2 on the second
+/// retry, etc. Higher attempt numbers escalate the wording so the
+/// model knows it's been spinning and should commit to a transition.
+pub fn build_step_continuation_prompt(
+    plan: &crate::tools::plan_state::Plan,
+    step: &crate::tools::plan_state::PlanStep,
+    attempt: usize,
+) -> String {
+    use crate::tools::plan_state::StepStatus;
+
+    let total = plan.steps.len();
+    let position = plan
+        .steps
+        .iter()
+        .position(|s| s.id == step.id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let action_hint = match step.status {
+        StepStatus::Todo => format!(
+            "Begin: UpdatePlanStep(\"{}\", \"in_progress\"). Then perform the step's action, run the verification, and finish with UpdatePlanStep(\"{}\", \"done\") or UpdatePlanStep(\"{}\", \"failed\", note: \"<reason>\").",
+            step.id, step.id, step.id,
+        ),
+        StepStatus::InProgress => format!(
+            "You're already on this step. Run the verification specified in the step's description, then call UpdatePlanStep(\"{}\", \"done\") if it passed, or UpdatePlanStep(\"{}\", \"failed\", note: \"<reason>\") if it didn't.",
+            step.id, step.id,
+        ),
+        StepStatus::Failed | StepStatus::Done => {
+            // Driver shouldn't be picking these as the next-actionable
+            // step, but be defensive — return a no-op-ish prompt.
+            return format!(
+                "Plan step \"{}\" is in state {:?}. Wait for the user to retry, skip, or abort via the sidebar.",
+                step.title, step.status,
+            );
+        }
+    };
+
+    // M6.3: surface prior step outputs so the model can read data from
+    // earlier steps without relying on chat history (which gets
+    // compacted between steps in M6.2). Only Done steps with a
+    // populated `output` field are listed.
+    let prior_outputs = collect_prior_step_outputs(plan, &step.id);
+    let outputs_block = if prior_outputs.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("\n\nOutputs from prior steps:\n");
+        for (i, title, out) in prior_outputs {
+            s.push_str(&format!("  - Step {i} ({title}): {out}\n"));
+        }
+        s
+    };
+
+    if attempt <= 1 {
+        format!(
+            "Continue plan execution. Focus: step {position}/{total} \"{}\".\n\n{}{outputs_block}",
+            step.title, action_hint,
+        )
+    } else {
+        // Escalate. The model has had at least one turn on this step
+        // without committing; remind it that the retry budget is
+        // bounded and that "failed" with a one-line note is a valid
+        // outcome the user can recover from.
+        format!(
+            "Continue plan execution — attempt {attempt} on step {position}/{total} \"{}\". \
+             You have at most {} attempts per step; after that the driver \
+             will mark this step Failed automatically. Commit to a \
+             transition this turn: do the work and call \
+             UpdatePlanStep(\"{}\", \"done\"), OR if the step can't be \
+             finished, call UpdatePlanStep(\"{}\", \"failed\", note: \
+             \"<one-line reason>\") so the user can retry / skip / \
+             abort via the sidebar.\n\n{}",
+            step.title,
+            crate::tools::plan_state::MAX_RETRIES_PER_STEP,
+            step.id,
+            step.id,
+            action_hint,
+        )
+    }
+}
+
+/// Read `.thclaws/state/todos.md` from the working directory and, if it
+/// exists and has any incomplete items (`[ ]` pending or `[-]`
+/// in_progress), return a system-reminder string surfacing the list.
+/// Returns `None` if the file is missing, empty, or has only completed
+/// items — no point nagging the model with a fully-checked list.
+///
+/// This is the programmatic counterpart to the system-prompt directive
+/// that says "check `.thclaws/state/todos.md` BEFORE asking for context."
+/// Real-world testing showed that prompt-only guidance isn't enough on
+/// some models — gpt-4.1 in particular still asks the user instead of
+/// reading the file. Auto-injecting the contents removes the model's
+/// option to ignore the rule.
+///
+/// Mirrors Claude Code's `todo_reminder` attachment shape (see
+/// claude-code-src/utils/messages.ts:3663) but always-on instead of
+/// every-N-turns — we don't have the turn-count tracking, and the
+/// content is small enough (~200 bytes for a typical 3–5 item list)
+/// that always-on is acceptable.
+pub fn build_todos_reminder() -> Option<String> {
+    let path = std::env::current_dir()
+        .ok()?
+        .join(".thclaws")
+        .join("state")
+        .join("todos.md");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    // Quick check: any incomplete checkbox (`[ ]` pending or `[-]`
+    // in_progress)? If everything is `[x]` completed, skip the
+    // reminder — the model doesn't need to be reminded about a
+    // closed-out list.
+    let has_incomplete = raw
+        .lines()
+        .any(|l| l.trim_start().starts_with("- [ ]") || l.trim_start().starts_with("- [-]"));
+    if !has_incomplete {
+        return None;
+    }
+    // M6.18 BUG M6: cap todos.md so an unmaintained list doesn't burn
+    // unbounded tokens every turn. 80 lines / 6 KB is generous for a
+    // typical scratchpad — headers + bullets average ~50 bytes/line.
+    let bounded =
+        crate::memory::truncate_for_prompt(raw.trim_end(), 80, 6_000, ".thclaws/state/todos.md");
+    Some(format!(
+        "## Existing todos (.thclaws/state/todos.md)\n\n\
+         A scratchpad todo list from a prior session is present in this \
+         workspace. Surface this to the user before asking what to work \
+         on, and offer to resume incomplete items (`[ ]` pending or \
+         `[-]` in_progress) or replace the list. Don't ask \"what \
+         should we do?\" while these answers are sitting in front of \
+         you.\n\n\
+         Current contents:\n\n\
+         ```markdown\n{bounded}```\n\n\
+         If the user wants to resume, mark the next pending item as \
+         `in_progress` via TodoWrite (passing the full list with that \
+         one item flipped) and start work on it. If they want a fresh \
+         start, write an updated list via TodoWrite that reflects the \
+         new direction."
+    ))
+}
+
+/// What pre-retrieval found for a user message, kept so the same note goes
+/// back on the same message in every later request.
+///
+/// A provider's prompt cache is a prefix cache: the request must repeat,
+/// byte for byte, up to the point where it is new. A note that is there on
+/// the turn it was made and gone on the next changes the middle of the
+/// conversation and forfeits everything after it. So a note, once made,
+/// stays with its message for as long as this agent lives. History itself
+/// is never touched — the note exists only on the outgoing copy — so the
+/// transcript, the session file and compaction see what the user typed.
+///
+/// Keyed by the message's text rather than its position: compaction
+/// renumbers history, and the note is a function of the text anyway.
+#[derive(Default)]
+pub struct TurnNotes {
+    notes: std::collections::VecDeque<(u64, String)>,
+}
+
+impl TurnNotes {
+    /// Past this the oldest note goes, at the cost of one cache miss deep
+    /// in a conversation long enough that compaction is already at work.
+    const MAX: usize = 64;
+
+    fn key(text: &str) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    /// The first note made for a text is the one that stays: a later search
+    /// of a changed KMS must not rewrite what an earlier turn was sent.
+    pub fn remember(&mut self, user_text: &str, note: String) {
+        let key = Self::key(user_text);
+        if self.notes.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        if self.notes.len() == Self::MAX {
+            self.notes.pop_front();
+        }
+        self.notes.push_back((key, note));
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.notes
+            .iter()
+            .map(|(_, n)| crate::tokens::estimate_tokens(n))
+            .sum()
+    }
+
+    /// Put each note back on its message in an outgoing copy of history.
+    pub fn attach(&self, messages: &mut [Message]) {
+        if self.notes.is_empty() {
+            return;
+        }
+        for m in messages.iter_mut().filter(|m| m.role == Role::User) {
+            let text = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                continue;
+            }
+            let key = Self::key(&text);
+            if let Some((_, note)) = self.notes.iter().find(|(k, _)| *k == key) {
+                m.content.push(ContentBlock::text(format!(
+                    "<system-reminder>\n{note}\n</system-reminder>"
+                )));
+            }
+        }
+    }
+}
+
+/// Strip tantivy query-syntax metacharacters so a raw user message can be
+/// used as a search query without `QueryParser` choking on stray `:`/`(`/
+/// `?` etc. Turns the message into a safe bag-of-words.
+#[cfg(feature = "kms_search_index")]
+fn sanitize_kms_query(q: &str) -> String {
+    let cleaned: String = q
+        .chars()
+        .map(|c| match c {
+            '+' | '-' | '&' | '|' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~'
+            | '*' | '?' | ':' | '\\' | '/' => ' ',
+            other => other,
+        })
+        .collect();
+    // Cap length — the Thai segmenter handles long input but there's no
+    // point feeding a whole paragraph; the first ~200 chars carry the topic.
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Deterministic pre-retrieval (RAG, lightweight): before the model answers,
+/// search the active KMS for the user's message and splice a short **pointer
+/// list** of the matching canonical topic pages (name + one-line topic) into
+/// the system prompt. This removes the dependence on the model *choosing* to
+/// call `KmsSearch` — weak/economy models (and even strong ones, for "casual"
+/// phrasings) routinely skip the mandatory-consult instruction and answer from
+/// training data. Naming the relevant pages reliably triggers a `KmsRead`; we
+/// inject pointers, not full bodies, so the per-turn token cost is ~200 bytes
+/// instead of multiple KB (the model pulls only what it needs). Returns `None`
+/// (no injection) when there's no active KMS, the message is too short, or
+/// nothing clears the relevance floor — so greetings / coding turns / off-topic
+/// asks don't pull noise. Provenance (`sess-*`) and audit (`dream-*`) pages are
+/// skipped; only canonical topic pages are surfaced.
+#[cfg(feature = "kms_search_index")]
+pub fn build_kms_context_reminder(query: &str) -> Option<String> {
+    // Below the BM25 score floor we treat a hit as coincidental, not a real
+    // topic match (e.g. a one-word overlap). Tuned against observed scores:
+    // a direct topic match lands ~10-20, the audit page ~1-2.
+    const SCORE_FLOOR: f32 = 4.0;
+    const MAX_PAGES: usize = 3;
+
+    let q = sanitize_kms_query(query);
+    if q.chars().count() < 4 {
+        return None;
+    }
+    let active = crate::config::AppConfig::load().ok()?.kms_active;
+    if active.is_empty() {
+        return None;
+    }
+
+    // (score, kms_name, page, label) for canonical topic pages above the floor.
+    let mut hits: Vec<(f32, String, String, String)> = Vec::new();
+    for name in &active {
+        let Some(kref) = crate::kms::resolve(name) else {
+            continue;
+        };
+        let Ok(idx) = crate::kms_search_index::get_or_open(&kref.root) else {
+            continue;
+        };
+        let Ok(found) = idx.search(&q, &[], None, 5) else {
+            continue;
+        };
+        for h in found {
+            if h.score < SCORE_FLOOR {
+                continue;
+            }
+            // Skip provenance/audit pages — only canonical topic pages are
+            // the answer surface (digests are thin stubs, dream-* is audit).
+            if h.page.starts_with("sess-") || h.page.starts_with("dream-") {
+                continue;
+            }
+            // Prefer the page's one-line `topic:` as the pointer label, then
+            // its title, then the page stem.
+            let label = h
+                .topic
+                .clone()
+                .or_else(|| h.title.clone())
+                .unwrap_or_else(|| h.page.clone());
+            hits.push((h.score, name.clone(), h.page, label));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(MAX_PAGES);
+
+    let mut list = String::new();
+    for (_score, name, page, label) in &hits {
+        list.push_str(&format!("- `KMS: {name}/{page}` — {label}\n"));
+    }
+    Some(format!(
+        "## Relevant KMS pages (auto-matched to this message)\n\n\
+         The user's knowledge base has the following page(s) matching the current \
+         message. **Before answering, `KmsRead` the most relevant one(s) and answer \
+         from them** — the user populated the KMS specifically so answers come from \
+         here, not from training data or a fresh web search. Cite the page you used \
+         (`KMS: <name>/<page>`). If none of them actually cover the question, ignore \
+         this block and answer normally.\n\n{list}"
+    ))
+}
+
+/// No-op when the BM25 search index feature is off — auto-retrieval needs
+/// ranked scores to gate on, which only the indexed path provides.
+#[cfg(not(feature = "kms_search_index"))]
+pub fn build_kms_context_reminder(_query: &str) -> Option<String> {
+    None
+}
+
+/// Collect (position, title, output) tuples for completed steps that
+/// have a populated `output` field, for steps prior to `current_step_id`.
+/// Used by both the per-step continuation prompt and the system
+/// reminder to expose the cross-step data channel (M6.3).
+fn collect_prior_step_outputs(
+    plan: &crate::tools::plan_state::Plan,
+    current_step_id: &str,
+) -> Vec<(usize, String, String)> {
+    use crate::tools::plan_state::StepStatus;
+    let current_idx = plan
+        .steps
+        .iter()
+        .position(|s| s.id == current_step_id)
+        .unwrap_or(plan.steps.len());
+    plan.steps
+        .iter()
+        .enumerate()
+        .take(current_idx)
+        .filter_map(|(i, s)| {
+            if s.status != StepStatus::Done {
+                return None;
+            }
+            let out = s.output.as_ref()?.trim();
+            if out.is_empty() {
+                return None;
+            }
+            Some((i + 1, s.title.clone(), out.to_string()))
+        })
+        .collect()
+}
+
+/// Max tool result size kept in context. Excess is saved to disk with a preview.
+pub const TOOL_RESULT_CONTEXT_LIMIT: usize = 50_000;
+
+/// Default output token cap (keeps normal responses lean).
+pub const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Escalated cap when the model hits the output limit.
+pub const ESCALATED_MAX_TOKENS: u32 = 64000;
+
+pub struct Agent {
+    provider: Arc<dyn Provider>,
+    pub(crate) tools: ToolRegistry,
+    model: String,
+    system: String,
+    pub budget_tokens: usize,
+    pub max_tokens: u32,
+    pub max_iterations: usize,
+    pub max_retries: usize,
+    pub thinking_budget: Option<u32>,
+    /// Prototype: run a browser step with thinking off. See
+    /// [`BrowserStepThinking`] and `config::AppConfig::browser_fast_steps`.
+    pub browser_fast_steps: bool,
+    pub permission_mode: PermissionMode,
+    /// Tool names that always trip the approval gate, even under
+    /// `PermissionMode::Auto` (config `askTools`). Interactive-only — with
+    /// an `AutoApprover` sink there's no human to prompt, so a listed tool
+    /// still sails through. Empty = mode alone decides (original behavior).
+    pub ask_tools: Vec<String>,
+    approver: Arc<dyn ApprovalSink>,
+    history: Arc<Mutex<Vec<Message>>>,
+    /// Cooperative cancel signal shared with the worker / driver. M6.17
+    /// BUGs H1 + M3: pre-fix the agent's retry-backoff sleeps blocked
+    /// uninterruptibly (1+2+4 = 7 s worst case), so a Cancel during a
+    /// transient-error retry was silently waited out. With a cancel
+    /// token wired in, the sleep `tokio::select!`s against
+    /// `cancelled().await` and exits with a synthetic error mid-wait.
+    /// `None` for tests / non-interactive consumers that don't want
+    /// cancellation plumbing.
+    pub(crate) cancel: Option<crate::cancel::CancelToken>,
+    /// M6.35 HOOK1+HOOK3: lifecycle hooks. Pre-fix the `crate::hooks`
+    /// module existed and had a documented user-manual chapter
+    /// (`ch13-hooks.md`) but was completely orphaned — no production
+    /// code path called `fire_*`. Now the dispatch site (around
+    /// `tool.call_multimodal`) and the explicit-deny site fire the
+    /// configured hooks. `None` keeps tests and standalone consumers
+    /// hook-free.
+    pub(crate) hooks: Option<std::sync::Arc<crate::hooks::HooksConfig>>,
+    /// Identity of this agent for permission-request attribution.
+    /// Default `Main` for the user's primary agent; side-channel
+    /// spawns set `SideChannel { id, agent_name }` so the approver
+    /// modal can render "translator (side) wants to run Bash" vs
+    /// "Main wants to run Bash" when concurrent agents request
+    /// permissions. The factory chain (ProductionAgentFactory) and
+    /// the side-channel spawner set this at construction time.
+    pub(crate) origin: crate::permissions::AgentOrigin,
+    /// Per-iteration model override. Read fresh inside `run_turn` for
+    /// every `provider.stream` call, so a side channel (e.g. the
+    /// SkillTool firing `skill_state::request_model`) can swap the
+    /// active model mid-turn without rebuilding the agent. The model
+    /// captured at run_turn start serves as the baseline; this slot,
+    /// when `Some`, takes precedence. Cleared at the end of run_turn
+    /// so a follow-up turn starts with a clean baseline. Wrapping in
+    /// Arc<Mutex> lets external state (the worker's skill resolver)
+    /// hold a clone and write into it from outside the agent loop.
+    pub(crate) model_override: Arc<Mutex<Option<String>>>,
+    /// Per-turn override for the provider's per-chunk idle timeout.
+    /// Read at the top of every iteration's `StreamRequest` build and
+    /// cleared at the end of `run_turn`, so a slash dispatch
+    /// (e.g. `/kms html`) can mark the *next* user-submitted turn as
+    /// long-running without bumping the user's global
+    /// `stream_chunk_timeout_secs` setting. `None` means: defer to the
+    /// global setting via `providers::stream_chunk_timeout()`.
+    pub(crate) next_turn_chunk_timeout: Arc<Mutex<Option<std::time::Duration>>>,
+    /// dev-plan/64 P2.1: what pre-retrieval found for each user message,
+    /// re-attached to that message on every request. See [`TurnNotes`].
+    pub(crate) turn_notes: Arc<Mutex<TurnNotes>>,
+    /// Queue of user messages submitted while the agent was busy. Drained
+    /// at the boundary after a tool_result message lands in history, so
+    /// the user can "steer" the leader between tool calls without
+    /// waiting for the whole turn to end (issue #106). Each drained
+    /// item folds in as a `Text` content block on the same user-role
+    /// message that carries the tool_result blocks — that keeps the
+    /// user/assistant alternation valid for providers (e.g. Anthropic)
+    /// that reject two consecutive user messages.
+    pub(crate) injection_queue: Arc<Mutex<std::collections::VecDeque<String>>>,
+    /// The running turn's usage so far, updated after every provider
+    /// call. A turn that ends in an error or is dropped on cancel never
+    /// yields `Done`, so surfaces read this instead
+    /// ([`Agent::partial_turn_usage`]) — the gateway billed those calls.
+    turn_usage: Arc<Mutex<Usage>>,
+}
+
+/// Build a provider for a model that belongs to a different backend than
+/// the session's — the cross-provider half of a skill's `model:`
+/// recommendation. Returns `None` when the model routes to the same
+/// provider kind (nothing to swap), when the config can't be read, or
+/// when that provider has no usable credential — all cases where the
+/// caller should keep the session's provider and let the model string
+/// stand on its own.
+pub(crate) fn provider_for_model(model: &str) -> Option<Arc<dyn Provider>> {
+    let mut cfg = crate::config::AppConfig::load().ok()?;
+    let current = cfg.detect_provider_kind().ok();
+    cross_provider_kind(current, model)?;
+    cfg.model = model.to_string();
+    crate::repl::build_provider(&cfg).ok()
+}
+
+/// The backend a swapped model belongs to, when it isn't the session's
+/// own. `None` means "same family, or unrecognisable" — either way the
+/// session's provider is the right one to keep.
+fn cross_provider_kind(
+    current: Option<crate::providers::ProviderKind>,
+    model: &str,
+) -> Option<crate::providers::ProviderKind> {
+    let wanted = crate::providers::ProviderKind::detect(model)?;
+    (Some(wanted) != current).then_some(wanted)
+}
+
+/// Prototype: decide what a browser step is worth thinking about.
+///
+/// A browse alternates between two kinds of turn. One is a plan — "find the
+/// cheapest flight, then book it" — and deserves the session's thinking level.
+/// The other is mechanical: the snapshot is in the transcript, the elements
+/// are enumerated with refs, and the only question is which ref comes next.
+/// Decision-model work (Jev, Kev and the rest) earns its speed by answering
+/// the second kind in a single pass, and the same split is available here for
+/// free, because a browser step is already recognisable from the tools the
+/// previous iteration called.
+///
+/// So: an iteration that follows browser-only tool calls runs with thinking
+/// OFF, and the moment the step stops looking mechanical it goes back to the
+/// configured level. Two signals end it, both cheap and both observed rather
+/// than guessed at:
+///
+/// - **A repeat.** The same tool aimed at the same target twice running means
+///   the last action did not do what the model expected. That is the point to
+///   start thinking, not the point to try it a third time.
+/// - **Anything else in the mix.** One non-browser call — a read, a shell
+///   command, a subagent — and the turn is no longer a step.
+///
+/// Off by default. It buys latency with reasoning, and which way that trade
+/// lands is the thing to measure, not to assume.
+#[derive(Debug, Default)]
+struct BrowserStepThinking {
+    /// The previous iteration called browser tools and nothing else.
+    following_browser: bool,
+    /// `name(target)` of the previous iteration's calls, to catch a repeat.
+    last_signature: Option<String>,
+}
+
+impl BrowserStepThinking {
+    /// A browser tool by either of the names it can arrive under: native, or
+    /// namespaced by the MCP server that provides it.
+    fn is_browser_tool(name: &str) -> bool {
+        name.starts_with("browser_") || name.contains("__browser_")
+    }
+
+    /// What identifies a step, for spotting one repeated. The element ref is
+    /// what makes two clicks the same click; without it every click on a page
+    /// would look like a repeat.
+    fn signature(calls: &[(String, serde_json::Value)]) -> String {
+        calls
+            .iter()
+            .map(|(name, input)| {
+                let target = ["ref", "element", "selector", "url"]
+                    .iter()
+                    .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                format!("{name}({target})")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The budget for the iteration about to run.
+    fn budget(&self, configured: Option<u32>) -> Option<u32> {
+        if self.following_browser {
+            Some(0)
+        } else {
+            configured
+        }
+    }
+
+    /// Record what this iteration called, and decide whether the next one is
+    /// still a step.
+    fn observe(&mut self, calls: &[(String, serde_json::Value)]) {
+        if calls.is_empty() || !calls.iter().all(|(n, _)| Self::is_browser_tool(n)) {
+            self.following_browser = false;
+            self.last_signature = None;
+            return;
+        }
+        let signature = Self::signature(calls);
+        let repeated = self.last_signature.as_deref() == Some(signature.as_str());
+        self.last_signature = Some(signature);
+        // A repeat means the page did not answer the way the model expected.
+        // Hand the next iteration its full thinking back.
+        self.following_browser = !repeated;
+    }
+}
+
+impl Agent {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        tools: ToolRegistry,
+        model: impl Into<String>,
+        system: impl Into<String>,
+    ) -> Self {
+        let model = model.into();
+        // Resolve the model's real context window from the shipped
+        // catalogue (user cache → embedded baseline → provider default
+        // → global fallback). This drives auto-compact + `/compact` +
+        // `/fork` thresholds so they match the model in use rather
+        // than a blanket hardcoded number.
+        let budget_tokens = crate::model_catalogue::effective_context_window(&model) as usize;
+        Self {
+            provider,
+            tools,
+            model,
+            system: system.into(),
+            budget_tokens,
+            max_tokens: 8192,
+            max_iterations: 200,
+            max_retries: 3,
+            thinking_budget: None,
+            browser_fast_steps: false,
+            permission_mode: PermissionMode::Auto,
+            ask_tools: Vec::new(),
+            approver: Arc::new(AutoApprover),
+            history: Arc::new(Mutex::new(Vec::new())),
+            cancel: None,
+            hooks: None,
+            origin: crate::permissions::AgentOrigin::Main,
+            model_override: Arc::new(Mutex::new(None)),
+            next_turn_chunk_timeout: Arc::new(Mutex::new(None)),
+            turn_notes: Arc::new(Mutex::new(TurnNotes::default())),
+            injection_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            turn_usage: Arc::new(Mutex::new(Usage::default())),
+        }
+    }
+
+    /// Usage of the current (or last) turn's completed provider calls —
+    /// for a turn that ended without `Done` (error, cancel).
+    pub fn partial_turn_usage(&self) -> Usage {
+        self.turn_usage
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Append a user message to the injection queue. Drained at the
+    /// next tool_result boundary inside `run_turn`. Returns the new
+    /// queue length so the IPC layer can echo a queue position back
+    /// to the frontend.
+    pub fn push_injection(&self, text: String) -> usize {
+        let mut q = self.injection_queue.lock().expect("injection_queue lock");
+        q.push_back(text);
+        q.len()
+    }
+
+    /// Snapshot the injection queue length without mutating it.
+    /// Useful for the IPC layer's "what's pending right now?" probe.
+    pub fn pending_injections(&self) -> usize {
+        self.injection_queue.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Replace the agent's injection queue with an externally-owned
+    /// one so the IPC layer can hold a stable clone (independent of
+    /// agent reconstructions on ChangeCwd / NewSession). Call right
+    /// after each `new` / rebuild — drains any in-flight entries
+    /// from the old queue into the new one so a message queued
+    /// mid-rebuild isn't lost.
+    pub fn use_injection_queue(&mut self, queue: Arc<Mutex<std::collections::VecDeque<String>>>) {
+        let carry: Vec<String> = self
+            .injection_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        if !carry.is_empty() {
+            if let Ok(mut q) = queue.lock() {
+                for s in carry {
+                    q.push_back(s);
+                }
+            }
+        }
+        self.injection_queue = queue;
+    }
+
+    /// Mark the next `run_turn` as long-running so its `StreamRequest`
+    /// carries an override that bypasses the user's global
+    /// `stream_chunk_timeout_secs` setting. Cleared automatically when
+    /// that turn ends. Slash dispatches like `/kms html` call this
+    /// right before submitting the prompt.
+    pub fn set_next_turn_chunk_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .next_turn_chunk_timeout
+            .lock()
+            .expect("next_turn_chunk_timeout lock") = Some(timeout);
+    }
+
+    /// Clone the override slot so an external component (worker /
+    /// dispatch layer) can write into it without holding `&Agent`.
+    pub fn next_turn_chunk_timeout_slot(&self) -> Arc<Mutex<Option<std::time::Duration>>> {
+        self.next_turn_chunk_timeout.clone()
+    }
+
+    /// Hand out a clone of the model-override slot so an external
+    /// component (the worker's skill-state resolver) can write a
+    /// recommended model into it. The agent reads this slot at the
+    /// top of every iteration's request build, so a write between
+    /// iterations takes effect on the very next provider.stream call.
+    pub fn model_override_handle(&self) -> Arc<Mutex<Option<String>>> {
+        self.model_override.clone()
+    }
+
+    /// Set the agent's origin (Main / SideChannel / Subagent). Drives
+    /// the `originator` field on every approval request the agent
+    /// fires; the GUI uses it to render which agent is asking when
+    /// multiple are running concurrently. Default is `Main`.
+    pub fn with_origin(mut self, origin: crate::permissions::AgentOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Wire in a cancel token so retry sleeps and (future) long awaits
+    /// can be interrupted by the worker / driver. Caller is responsible
+    /// for `cancel.reset()`-ing between turns. M6.17 BUG H1 + M3.
+    pub fn with_cancel(mut self, token: crate::cancel::CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Wire in a HooksConfig so the agent fires user-configured shell
+    /// hooks at tool dispatch / permission denial. M6.35 HOOK1.
+    pub fn with_hooks(mut self, hooks: std::sync::Arc<crate::hooks::HooksConfig>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    pub fn with_max_iterations(mut self, n: usize) -> Self {
+        self.max_iterations = n;
+        self
+    }
+
+    /// Override the per-request output token budget. The provider receives
+    /// this as `max_tokens` (Anthropic) / `max_completion_tokens` (OpenAI).
+    /// Without this, `Agent::new` defaults to 8192 — fine for large-context
+    /// models but rejected by 16 k models when the input alone is ~13 k.
+    /// Wired from `AppConfig::max_tokens` at every call site so
+    /// `settings.json`'s `maxTokens` actually reaches the wire.
+    pub fn with_max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = n;
+        self
+    }
+
+    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+
+    /// Reasoning depth for every provider call this agent makes
+    /// (`config.thinking_budget`; see `providers::ThinkingLevel`).
+    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.thinking_budget = budget;
+        self
+    }
+
+    /// Prototype — see [`BrowserStepThinking`].
+    pub fn with_browser_fast_steps(mut self, on: bool) -> Self {
+        self.browser_fast_steps = on;
+        self
+    }
+
+    /// Force the approval gate on for these tool names regardless of the
+    /// permission mode (config `askTools`). See the field docs.
+    pub fn with_ask_tools(mut self, tools: Vec<String>) -> Self {
+        self.ask_tools = tools;
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Arc<dyn ApprovalSink>) -> Self {
+        self.approver = approver;
+        self
+    }
+
+    /// Append text to the system prompt.
+    pub fn append_system(&mut self, text: &str) {
+        self.system.push_str(text);
+    }
+
+    /// Replace the agent's system prompt wholesale. Used by the
+    /// `InstructionsChanged` path (GUI Settings → Folder Instructions
+    /// save) so the next provider.stream call sees the updated
+    /// AGENTS.md without an agent rebuild. Without this the agent's
+    /// captured `system` field stayed at construction-time content
+    /// and only a full restart picked up edits.
+    pub fn set_system(&mut self, text: impl Into<String>) {
+        self.system = text.into();
+    }
+
+    /// Read-only view of the captured system prompt. Used by
+    /// regression tests that verify `set_system` / `append_system`
+    /// land what they claim — particularly the
+    /// `refresh_repl_system_prompt` addendum-preservation path,
+    /// where wiping the team-role addenda would be a silent failure
+    /// otherwise.
+    pub fn system_text(&self) -> &str {
+        &self.system
+    }
+
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.history.lock().expect("history lock").clone()
+    }
+
+    /// Borrow the underlying provider. Used by the worker to call
+    /// `Provider::provider_session_id` after each turn so any
+    /// captured server-side session UUID can be persisted to the
+    /// thClaws session JSONL for resume-across-restart support
+    /// (`anthropic-agent` SDK only — other providers return `None`).
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn clear_history(&self) {
+        self.history.lock().expect("history lock").clear();
+    }
+
+    /// The tools this agent actually exposes to the model this turn
+    /// (gate/env filtered, sorted). Backs the `/tools` command so users get
+    /// registry ground truth instead of a model's prose enumeration.
+    pub fn tool_defs(&self) -> Vec<crate::types::ToolDef> {
+        self.tools.tool_defs()
+    }
+
+    /// Replace the agent's history wholesale — used when loading a saved session.
+    pub fn set_history(&self, messages: Vec<Message>) {
+        let mut h = self.history.lock().expect("history lock");
+        *h = messages;
+    }
+
+    /// Append one message to the agent's history.
+    ///
+    /// Without this a caller adding a single entry has to emulate it as
+    /// `history_snapshot()` → push → `set_history()`, which is a
+    /// read-modify-write over a lock it releases in between: anything a
+    /// running turn appends in that window is silently thrown away. The
+    /// `/publish` result arrives from a spawned task and can land
+    /// mid-turn, which is exactly that race. One lock, one push.
+    pub fn append_message(&self, message: Message) {
+        self.history.lock().expect("history lock").push(message);
+    }
+
+    /// Run one user turn. The returned stream drives the full provider↔tools
+    /// loop and appends to the agent's internal history.
+    pub fn run_turn(
+        &self,
+        user_msg: String,
+    ) -> impl Stream<Item = Result<AgentEvent>> + Send + 'static {
+        // Common case: a plain text turn. Wrap as a single Text block
+        // and delegate to the multipart entry point so the body lives
+        // in exactly one place.
+        self.run_turn_multipart(vec![ContentBlock::text(user_msg)])
+    }
+
+    /// Multipart variant of [`run_turn`]. Accepts an arbitrary list of
+    /// content blocks for the user turn — used by the GUI chat composer
+    /// to ship a message with both text and pasted/dragged image
+    /// attachments (Phase 4: paste/drag → ContentBlock::Image alongside
+    /// ContentBlock::Text). Exact same agent loop semantics; the only
+    /// difference is what gets pushed onto history at turn start.
+    pub fn run_turn_multipart(
+        &self,
+        user_content: Vec<ContentBlock>,
+    ) -> impl Stream<Item = Result<AgentEvent>> + Send + 'static {
+        crate::audit::begin_turn(matches!(self.origin, crate::permissions::AgentOrigin::Main));
+        let provider = self.provider.clone();
+        // Cache for a cross-provider skill swap, so the provider is built
+        // once per turn rather than per iteration.
+        let swapped_provider: Arc<Mutex<Option<(String, Arc<dyn Provider>)>>> =
+            Arc::new(Mutex::new(None));
+        let tools = self.tools.clone();
+        let model = self.model.clone();
+        let model_override = self.model_override.clone();
+        let next_turn_chunk_timeout = self.next_turn_chunk_timeout.clone();
+        let turn_notes = self.turn_notes.clone();
+        // Compose the per-turn system prompt: base + dynamic plan-mode
+        // reminder + dynamic todos reminder so the model sees fresh
+        // state every turn (plan mode active? plan submitted but not
+        // approved? existing todos.md from a prior session?). Cheap —
+        // just a string concat per turn.
+        // Query for deterministic KMS pre-retrieval: the user's text for
+        // this turn. Computed before `user_content` is moved into history.
+        let kms_query: String = user_content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let system = {
+            let base = self.system.clone();
+            let mode = crate::permissions::current_mode();
+            let active_plan = crate::tools::plan_state::get();
+            let plan_reminder = build_plan_reminder(mode, active_plan.as_ref());
+            let todos_reminder = build_todos_reminder();
+            // Chain reminders. Plan reminder dominates when active —
+            // it has the strongest per-turn discipline and would be
+            // redundant with todos guidance. Otherwise surface todos
+            // when a list exists.
+            let chained = match (plan_reminder, todos_reminder) {
+                (Some(p), Some(t)) => Some(format!("{p}\n\n{t}")),
+                (Some(p), None) => Some(p),
+                (None, Some(t)) => Some(t),
+                (None, None) => None,
+            };
+            match chained {
+                Some(r) if !base.is_empty() => format!("{base}\n\n{r}"),
+                Some(r) => r,
+                None => base,
+            }
+        };
+        // Deterministic pre-retrieval: name the KMS pages that match this
+        // message so the model reads them without having to decide to
+        // search first. It rides on the user message, not in `system` —
+        // it differs every turn, and in `system` it sat ahead of the whole
+        // history, so every turn re-billed the prompt, the tool
+        // definitions and the conversation at full price.
+        if let Some(found) = build_kms_context_reminder(&kms_query) {
+            turn_notes
+                .lock()
+                .expect("turn_notes lock")
+                .remember(&kms_query, found);
+        }
+        let budget_tokens = self.budget_tokens;
+        let base_max_tokens = self.max_tokens;
+        let max_iterations = self.max_iterations;
+        let max_retries = self.max_retries;
+        let thinking_budget = self.thinking_budget;
+        // Copied out with the rest: `try_stream!` builds a 'static stream, so
+        // anything it reads from `self` would borrow the agent for as long as
+        // the stream lives.
+        let browser_fast_steps = self.browser_fast_steps;
+        // Captured here only as the *fallback* default when no global mode
+        // has been set yet. The actual gate at tool-dispatch time reads
+        // `permissions::current_mode()` so EnterPlanMode / ExitPlanMode /
+        // `/plan` flips take effect mid-turn rather than next-message.
+        let permission_mode_default = self.permission_mode;
+        // `askTools`: names that force the approval gate on regardless of
+        // mode (read once per turn — a static config list, unlike the live
+        // `current_mode()` above).
+        let ask_tools = self.ask_tools.clone();
+        let approver = self.approver.clone();
+        let review_model = self.model.clone();
+        let history = self.history.clone();
+        let cancel = self.cancel.clone();
+        let hooks = self.hooks.clone();
+        let origin = self.origin.clone();
+        let injection_queue = self.injection_queue.clone();
+        let turn_usage = self.turn_usage.clone();
+        if let Ok(mut g) = turn_usage.lock() {
+            *g = Usage::default();
+        }
+
+        try_stream! {
+            // One turn id for every gateway call this turn makes, so a quota
+            // install lets an admitted turn finish (`gateway_turn`). Nested
+            // turns (subagents) reuse the open one.
+            let _turn = crate::gateway_turn::TurnGuard::begin();
+            {
+                let mut h = history.lock().expect("history lock");
+                h.push(Message {
+                    role: Role::User,
+                    content: user_content,
+                });
+            }
+
+            let mut current_max_tokens = base_max_tokens;
+            let mut cumulative_usage = Usage::default();
+
+            // Degenerate-tool-loop breaker: a model that repeats the SAME
+            // failing tool call (same tool, same input, same error) burns the
+            // whole iteration budget learning nothing — grok-4.5 re-sent an
+            // argless WorkflowRun 22× straight. Track a signature of each
+            // all-errors tool iteration; three identical ones in a row ends
+            // the turn with a clear message instead of grinding to the cap.
+            let mut degen_sig: Option<String> = None;
+            let mut degen_count: u32 = 0;
+
+            // 0 means unlimited.
+            let effective_max = if max_iterations == 0 { usize::MAX } else { max_iterations };
+            // Prototype: thinking is a session-wide setting, but a browse is
+            // not one kind of turn. This carries the per-iteration answer.
+            let mut browser_step = BrowserStepThinking::default();
+            for iteration in 0..effective_max {
+                yield AgentEvent::IterationStart { iteration };
+
+                let messages = {
+                    let h = history.lock().expect("history lock");
+                    // M6.18 BUG H1: subtract the system-prompt size + a
+                    // safety margin for tool definitions from the
+                    // budget BEFORE compacting messages. Pre-fix, a
+                    // large system prompt (CLAUDE.md cascade + memory
+                    // bodies + KMS indices + skills) plus a budget-
+                    // filling history could push the total request past
+                    // the model's context window even though `compact`
+                    // had "fitted" the messages. The provider then
+                    // 400'd with "context length exceeded."
+                    //
+                    // We reserve 4 KiB for tool definitions (typical
+                    // catalog of ~30-40 builtins + MCP tools) on top
+                    // of the system-prompt deduction — rough but keeps
+                    // the request comfortably inside the window.
+                    let system_tokens = crate::tokens::estimate_tokens(&system);
+                    let tools_reserve_tokens = 1024;
+                    let notes_tokens = turn_notes.lock().expect("turn_notes lock").tokens();
+                    let messages_budget = budget_tokens
+                        .saturating_sub(system_tokens)
+                        .saturating_sub(tools_reserve_tokens)
+                        .saturating_sub(notes_tokens);
+
+                    // M6.35 HOOK4: pre_compact / post_compact fire only
+                    // when compaction actually trims (history is over
+                    // budget). compact() is called every turn but
+                    // no-ops when within budget — firing on every turn
+                    // would spam audit hooks with empty events.
+                    let pre_tokens = crate::compaction::estimate_messages_tokens(&h);
+                    let pre_count = h.len();
+                    let will_compact = pre_tokens > messages_budget;
+                    if will_compact {
+                        if let Some(hk) = &hooks {
+                            crate::hooks::fire_compact(
+                                hk,
+                                crate::hooks::HookEvent::PreCompact,
+                                pre_count,
+                                pre_tokens,
+                            );
+                        }
+                    }
+                    let mut compacted = compact(&h, messages_budget);
+                    if will_compact {
+                        if let Some(hk) = &hooks {
+                            let post_tokens =
+                                crate::compaction::estimate_messages_tokens(&compacted);
+                            crate::hooks::fire_compact(
+                                hk,
+                                crate::hooks::HookEvent::PostCompact,
+                                compacted.len(),
+                                post_tokens,
+                            );
+                        }
+                    }
+                    // Issue #144: defensive last-mile sanitization.
+                    // Compaction's no-op path (history fits budget) skips
+                    // the orphan-tool-result protection in compact(),
+                    // and `/model` swap preserves history across
+                    // providers — so the destination wire format can
+                    // see partial-state blocks (tool_use without
+                    // matching tool_result, or vice versa). Every
+                    // provider rejects those (DashScope code 2013,
+                    // Anthropic "tool_use ids without matching
+                    // tool_result", OpenAI "tool_call_ids did not
+                    // have response messages"). Strip just before
+                    // the request leaves the engine.
+                    crate::compaction::sanitize_tool_pairs(&mut compacted);
+                    // Bound the base64 image payload to the gateway body cap.
+                    // compact() trims by *tokens*, which doesn't track base64
+                    // byte size — N freshly-read images (e.g. "read all 7
+                    // namecards") can sit within the token budget yet blow the
+                    // 5 MB body cap on the one request that must carry them.
+                    // Shrinks images (then evicts oldest as a last resort) on
+                    // this outgoing copy only; stored history is untouched and
+                    // gets redacted post-send.
+                    fit_outgoing_image_payload(&mut compacted);
+                    turn_notes
+                        .lock()
+                        .expect("turn_notes lock")
+                        .attach(&mut compacted);
+                    compacted
+                };
+                let tool_defs = tools.tool_defs();
+
+                // Read the override slot fresh every iteration. When a
+                // SkillTool invocation between iterations writes a
+                // recommended model into the slot, the very next
+                // provider.stream call uses it. Cleared at end of
+                // run_turn so subsequent turns start clean.
+                let active_model = {
+                    let g = model_override.lock().expect("model_override lock");
+                    g.as_ref().cloned().unwrap_or_else(|| model.clone())
+                };
+                // A skill's `model:` recommendation can name a model from a
+                // DIFFERENT provider than the session's (extract-and-save
+                // asks for `gpt-4.1-nano` while the user sits on DeepSeek).
+                // Swapping only the model string sends OpenAI's model id to
+                // DeepSeek's endpoint — "model not found", with the id
+                // rendered as `deepseek/gpt-4.1-nano`. Build the matching
+                // provider for the swapped model instead, once per turn.
+                let active_provider: Arc<dyn Provider> = if active_model == model {
+                    provider.clone()
+                } else {
+                    match swapped_provider.lock() {
+                        Ok(mut slot) => {
+                            let hit = slot
+                                .as_ref()
+                                .filter(|(m, _)| *m == active_model)
+                                .map(|(_, p)| p.clone());
+                            match hit {
+                                Some(p) => p,
+                                None => match provider_for_model(&active_model) {
+                                    Some(p) => {
+                                        *slot = Some((active_model.clone(), p.clone()));
+                                        p
+                                    }
+                                    // Same provider family (or nothing usable
+                                    // to build) — the model string alone is
+                                    // the right change.
+                                    None => provider.clone(),
+                                },
+                            }
+                        }
+                        Err(_) => provider.clone(),
+                    }
+                };
+                // Long-running-feature override: read fresh every
+                // iteration so a slash dispatch that set it before
+                // run_turn carries through every retry/iteration of
+                // the same turn. Cleared in the end-of-run_turn cleanup
+                // (alongside `model_override`).
+                let chunk_timeout_override = next_turn_chunk_timeout
+                    .lock()
+                    .expect("next_turn_chunk_timeout lock")
+                    .clone();
+                // Cap the requested max_tokens against the model's
+                // documented `max_output` so we don't hit per-model 400s
+                // (e.g. gpt-4o = 16384, gpt-4-turbo = 4096). Pre-fix the
+                // default 32000 sailed through unchanged for any model
+                // with a smaller completion-token ceiling and the
+                // upstream rejected the entire turn. `None` means the
+                // catalogue doesn't track a cap — we trust
+                // `current_max_tokens` as authored.
+                let request_max_tokens = match crate::model_catalogue::effective_max_output(
+                    &active_model,
+                ) {
+                    Some(cap) => current_max_tokens.min(cap),
+                    None => current_max_tokens,
+                };
+                // dev-plan/55: swap Thai PII for `[ID_1]`-style placeholders
+                // on the way out, and restore it on the way back below.
+                // History stays plaintext — the masking lives at the wire, so
+                // every turn re-masks and coreference keeps the placeholders
+                // stable. Skipped for local models: nothing leaves the host,
+                // and masking would only cost the model context.
+                let masker = crate::sensitive::active().filter(|_| {
+                    !crate::providers::ProviderKind::detect(&active_model)
+                        .map(|k| k.is_local())
+                        .unwrap_or(false)
+                });
+                let mut req = StreamRequest {
+                    model: active_model.clone(),
+                    system: if system.is_empty() { None } else { Some(system.clone()) },
+                    messages,
+                    tools: tool_defs,
+                    max_tokens: request_max_tokens,
+                    thinking_budget: if browser_fast_steps {
+                        browser_step.budget(thinking_budget)
+                    } else {
+                        thinking_budget
+                    },
+                    stream_chunk_timeout_override: chunk_timeout_override,
+                };
+                if let Some(m) = &masker {
+                    m.mask_request(&mut req);
+                }
+
+                // Retry with exponential backoff on transient errors.
+                // Config errors (missing API key, bad model name, etc.)
+                // won't fix themselves between attempts — skip the retry
+                // loop for those and surface the error immediately.
+                //
+                // M6.17 BUG M3: the backoff sleep `tokio::select!`s
+                // against the cancel token (when one is wired in) so a
+                // user-triggered Cancel during a 1-2-4s wait short-
+                // circuits with a clear error instead of stalling for
+                // up to 7 s.
+                let raw = {
+                    let mut last_err = None;
+                    let mut stream_result = None;
+                    let mut cancelled_during_retry = false;
+                    for attempt in 0..=max_retries {
+                        match active_provider.stream(req.clone()).await {
+                            Ok(s) => { stream_result = Some(s); break; }
+                            Err(e) => {
+                                // A spent credit quota stays spent; a rate-limit 429 clears.
+                                let is_config = matches!(e, Error::Config(_))
+                                    || crate::providers::is_quota_exceeded(&e.to_string())
+                                    || crate::desktop_update::is_client_update_required(&e.to_string())
+                                    || is_permanent_provider_error(&e.to_string());
+                                if !is_config && attempt < max_retries {
+                                    let delay = tokio::time::Duration::from_secs(1 << attempt);
+                                    eprintln!(
+                                        "\x1b[33m[retry {}/{} after {}s: {}]\x1b[0m",
+                                        attempt + 1, max_retries, delay.as_secs(), e
+                                    );
+                                    if let Some(token) = &cancel {
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(delay) => {}
+                                            _ = token.cancelled() => {
+                                                cancelled_during_retry = true;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                }
+                                last_err = Some(e);
+                                if is_config { break; }
+                            }
+                        }
+                    }
+                    if cancelled_during_retry {
+                        Err(Error::Provider("cancelled by user during retry backoff".into()))?
+                    }
+                    match stream_result {
+                        Some(s) => s,
+                        None => {
+                            // The swapped-in model is a *recommendation* — a
+                            // skill asking for something better suited. If it
+                            // won't answer (retired id, no entitlement,
+                            // history the new backend rejects — DeepSeek
+                            // refuses a thinking model whose prior turn
+                            // carries no `reasoning_content`), the turn is
+                            // still the user's to finish. Drop back to the
+                            // session's own model rather than failing it.
+                            if active_model != model {
+                                let err = last_err
+                                    .as_ref()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "\x1b[33m[skill model {active_model} unavailable — falling back to {model}: {err}]\x1b[0m"
+                                );
+                                if let Ok(mut g) = model_override.lock() {
+                                    *g = None;
+                                }
+                                let _ = crate::skills_state::take_swap_active();
+                                let mut retry_req = req.clone();
+                                retry_req.model = model.clone();
+                                provider.stream(retry_req).await?
+                            } else {
+                                Err(last_err.unwrap())?
+                            }
+                        }
+                    }
+                };
+                let mut assembled = Box::pin(assemble(raw));
+
+                let mut turn_text = String::new();
+                let mut turn_thinking = String::new();
+                let mut turn_tool_uses: Vec<ContentBlock> = Vec::new();
+                // Un-masking carry buffer: a placeholder can straddle two
+                // text deltas, so the tail of a chunk that might still become
+                // one is held until the next chunk (flushed after the loop).
+                let mut mask_pending = String::new();
+                // L4 (M6.17): id → parse error message for any tool use
+                // whose JSON input failed to parse mid-stream. The per-
+                // tool dispatch loop emits a synthetic error tool_result
+                // for any id present here, instead of running the tool.
+                let mut turn_parse_errors: Vec<(String, String)> = Vec::new();
+                let mut turn_stop_reason: Option<String> = None;
+
+                while let Some(ev) = assembled.next().await {
+                    match ev? {
+                        AssembledEvent::Text(s) => {
+                            match &masker {
+                                // Persist the plain reading, show the marked
+                                // one: history and tools must never carry the
+                                // display wrapper, but the reader should see
+                                // which values were put back locally.
+                                Some(m) => {
+                                    let r = m.feed(&mut mask_pending, &s);
+                                    if !r.is_empty() {
+                                        turn_text.push_str(&r.plain);
+                                        yield AgentEvent::Text(r.display);
+                                    }
+                                }
+                                None => {
+                                    turn_text.push_str(&s);
+                                    yield AgentEvent::Text(s);
+                                }
+                            }
+                        }
+                        AssembledEvent::Thinking(s) => {
+                            // Capture for persistence so it can be echoed
+                            // back next turn (DeepSeek v4 etc. require
+                            // reasoning_content to round-trip), and also
+                            // surface live so chat surfaces can render
+                            // a dimmed reasoning block as the model thinks.
+                            turn_thinking.push_str(&s);
+                            yield AgentEvent::Thinking(s);
+                        }
+                        AssembledEvent::ToolParseFailed { id, name, error } => {
+                            // L4 (M6.17): the provider sent malformed JSON
+                            // for this tool use. Synthesize a ToolUse with
+                            // empty input so the assistant message stays
+                            // well-formed (some providers reject a tool
+                            // ID without a matching tool_use), then push
+                            // an error tool_result the model reads on the
+                            // next iteration. Pre-fix this killed the
+                            // entire turn via `?`.
+                            let synth_block = ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({}),
+                                thought_signature: None,
+                            };
+                            yield AgentEvent::ToolCallStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({}),
+                            };
+                            turn_tool_uses.push(synth_block);
+                            // Stash the parse error so the per-tool loop
+                            // below can emit a matching error result.
+                            turn_parse_errors.push((id, error));
+                        }
+                        AssembledEvent::ToolUse(mut block) => {
+                            // Restore real values in the arguments BEFORE the
+                            // tool runs — otherwise a Write lands `[PHONE_1]`
+                            // in the user's file. Done on the parsed Value, so
+                            // a value carrying a quote can't break the JSON.
+                            if let Some(m) = &masker {
+                                if let ContentBlock::ToolUse { input, .. } = &mut block {
+                                    m.unmask_json(input);
+                                }
+                            }
+                            // L1 (M6.17): announce the tool call as soon as
+                            // it's parsed, BEFORE the per-tool execution
+                            // loop's approval / plan-mode / dispatch gates.
+                            // Pre-fix the announce came right before the
+                            // actual call() — meaning the user saw the
+                            // assistant text stream, then a silent pause
+                            // (during which the model had decided to call
+                            // tools but the UI didn't show it), then the
+                            // tool result. Yielding here gives an instant
+                            // "[tool: X] queued" indicator the moment the
+                            // tool block lands. Approval gating still
+                            // happens later — denial / plan-mode block
+                            // emit ToolCallDenied / ToolCallResult as
+                            // before, so UI consumers don't get orphaned
+                            // ToolCallStart events.
+                            if let ContentBlock::ToolUse { id, name, input, .. } = &block {
+                                yield AgentEvent::ToolCallStart {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                };
+                            }
+                            turn_tool_uses.push(block);
+                        }
+                        AssembledEvent::Progress(kind) => {
+                            yield AgentEvent::Progress(kind);
+                        }
+                        AssembledEvent::Done { stop_reason, usage } => {
+                            turn_stop_reason = stop_reason;
+                            if let Some(u) = &usage {
+                                cumulative_usage.accumulate(u);
+                                if let Ok(mut g) = turn_usage.lock() {
+                                    *g = cumulative_usage.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Whatever the un-masker was still holding for a possible
+                // placeholder is plain text now that the stream is over.
+                if let Some(m) = &masker {
+                    let tail = m.flush(&mut mask_pending);
+                    if !tail.is_empty() {
+                        turn_text.push_str(&tail.plain);
+                        yield AgentEvent::Text(tail.display);
+                    }
+                }
+
+                // Persist assistant message. Thinking comes FIRST so it
+                // mirrors the order the model emitted (reasoning then
+                // answer); some providers also expect that order in echo.
+                {
+                    let mut assistant_content: Vec<ContentBlock> = Vec::new();
+                    if !turn_thinking.is_empty() {
+                        assistant_content.push(ContentBlock::Thinking {
+                            content: turn_thinking.clone(),
+                            signature: None,
+                        });
+                    }
+                    if !turn_text.is_empty() {
+                        assistant_content.push(ContentBlock::Text { text: turn_text.clone() });
+                    }
+                    assistant_content.extend(turn_tool_uses.iter().cloned());
+                    if !assistant_content.is_empty() {
+                        let mut h = history.lock().expect("history lock");
+                        h.push(Message {
+                            role: Role::Assistant,
+                            content: assistant_content,
+                        });
+                        // Image-redaction pass. The provider.stream call
+                        // above just consumed any image blocks present in
+                        // tool_results — the model has seen the bytes once
+                        // and produced its response. Strip the base64
+                        // payloads from history so subsequent iterations
+                        // don't re-ship them. The text summary block that
+                        // the Read tool emits alongside each image
+                        // ("image: foo.jpg · 234 KB · image/jpeg") stays
+                        // intact, so the model retains a textual handle on
+                        // what it saw earlier. Without this, a single
+                        // 2 MB screenshot would inflate every subsequent
+                        // turn's request body, blow past the model's
+                        // context window, and trigger compaction far
+                        // earlier than necessary.
+                        redact_consumed_images_from_history(&mut h);
+                    }
+                }
+
+                // No tool uses → turn is over.
+                if turn_tool_uses.is_empty() {
+                    // Output token escalation: if the model hit the output limit,
+                    // escalate max_tokens and retry this iteration.
+                    if turn_stop_reason.as_deref() == Some("max_tokens")
+                        && current_max_tokens < ESCALATED_MAX_TOKENS
+                    {
+                        current_max_tokens = ESCALATED_MAX_TOKENS;
+                        eprintln!(
+                            "\x1b[33m[output limit hit — escalating to {}]\x1b[0m",
+                            ESCALATED_MAX_TOKENS
+                        );
+                        // Skip the tool-result push below — there were no
+                        // tool uses, so `result_blocks` would be empty and
+                        // Anthropic rejects any user message with empty
+                        // content ("messages.N: user messages must have
+                        // non-empty content").
+                        // Pop the partial assistant we just pushed at the
+                        // top of this block. The retry re-asks with a
+                        // larger token budget and the model produces a
+                        // fresh complete response — leaving the partial
+                        // in history would make the next provider.stream
+                        // call's messages end with role=assistant, which
+                        // claude-opus-4-7+ rejects ("This model does not
+                        // support assistant message prefill. The
+                        // conversation must end with a user message.").
+                        {
+                            let mut h = history.lock().expect("history lock");
+                            if h.last().map(|m| m.role) == Some(Role::Assistant) {
+                                h.pop();
+                            }
+                        }
+                        continue;
+                    } else {
+                        // Clear any skill-recommended model override
+                        // before signaling Done so the next run_turn
+                        // starts from the baseline model. Worker
+                        // observes Done separately and emits a chat
+                        // status line if a swap was active this turn.
+                        if let Ok(mut g) = model_override.lock() {
+                            *g = None;
+                        }
+                        if let Ok(mut g) = next_turn_chunk_timeout.lock() {
+                            *g = None;
+                        }
+                        yield AgentEvent::Done { stop_reason: turn_stop_reason, usage: cumulative_usage.clone() };
+                        return;
+                    }
+                }
+
+                // Execute each tool (after approval, if required) and collect results.
+                let mut result_blocks: Vec<ContentBlock> = Vec::new();
+                // ── Concurrent fast-path (dev-plan/46) ──────────────────
+                // When a turn emits ≥2 tool calls that are ALL parallelizable
+                // (read-only / Task subagents — no approval, no mutation), run
+                // them in one concurrent batch instead of awaiting each in
+                // turn: wall-clock collapses from sum-of-N to max-of-N. This
+                // is behaviourally identical to the sequential loop below for
+                // these tools (they clear every guard anyway). Any other mix
+                // (mutating tools, approvals, parse errors) leaves the flag
+                // false and falls through to the sequential loop unchanged.
+                // Before dispatch, so the NEXT iteration knows whether this
+                // one was a browser step. Reading it after would mean reading
+                // it once per dispatch path.
+                if browser_fast_steps {
+                    let calls: Vec<(String, Value)> = turn_tool_uses
+                        .iter()
+                        .filter_map(|tu| match tu {
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                Some((name.clone(), input.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    browser_step.observe(&calls);
+                }
+                let mut handled_concurrently = false;
+                {
+                    let exec: Vec<(String, String, Value)> = turn_tool_uses
+                        .iter()
+                        .filter_map(|tu| match tu {
+                            ContentBlock::ToolUse { id, name, input, .. } => {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            }
+                            _ => None,
+                        })
+                        .filter(|(id, _, _)| !turn_parse_errors.iter().any(|(eid, _)| eid == id))
+                        .collect();
+                    let all_parallelizable = exec.len() >= 2
+                        && exec.iter().all(|(_, name, _)| {
+                            tools.get(name).map(|t| t.parallelizable()).unwrap_or(false)
+                                && !crate::payments::is_payment_tool(name)
+                        });
+                    if all_parallelizable {
+                        let futs = exec.into_iter().map(|(id, name, input)| {
+                            let tool = tools.get(&name).expect("parallelizable ⇒ tool exists");
+                            let hooks = hooks.clone();
+                            async move {
+                                let hook_denied: Option<String> = if let Some(h) = &hooks {
+                                    let input_str = serde_json::to_string(&input)
+                                        .unwrap_or_else(|_| "<unserializable>".to_string());
+                                    match crate::hooks::fire_pre_tool_use_gate(h, &name, &input_str)
+                                        .await
+                                    {
+                                        crate::hooks::PreToolDecision::Deny(r) => Some(r),
+                                        crate::hooks::PreToolDecision::Allow => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                let started = std::time::Instant::now();
+                                let tool_result = match &hook_denied {
+                                    Some(reason) => Err(crate::error::Error::Tool(format!(
+                                        "blocked by policy: {reason}"
+                                    ))),
+                                    None => tool.call_multimodal(input.clone()).await,
+                                };
+                                let duration_ms = started.elapsed().as_millis() as u64;
+                                let ui_resource = if tool_result.is_ok() {
+                                    tool.fetch_ui_resource().await
+                                } else {
+                                    None
+                                };
+                                (id, name, tool_result, ui_resource, (tool, input, duration_ms, hook_denied))
+                            }
+                        });
+                        // join_all preserves input order → result_blocks +
+                        // events stay in the model's tool_use order.
+                        let results = futures::future::join_all(futs).await;
+                        for (id, name, tool_result, ui_resource, (audit_tool, audit_input, duration_ms, hook_denied)) in results {
+                            let (content, is_error) = match &tool_result {
+                                Ok(c) => {
+                                    let truncated = match c {
+                                        crate::types::ToolResultContent::Text(s) => {
+                                            crate::types::ToolResultContent::Text(
+                                                maybe_truncate_to_disk(s),
+                                            )
+                                        }
+                                        crate::types::ToolResultContent::Blocks(_) => c.clone(),
+                                    };
+                                    (truncated, false)
+                                }
+                                Err(e) => (
+                                    crate::types::ToolResultContent::Text(format!("error: {e}")),
+                                    true,
+                                ),
+                            };
+                            let content = if content.is_empty() {
+                                crate::types::ToolResultContent::Text("(no output)".to_string())
+                            } else {
+                                content
+                            };
+                            match &hook_denied {
+                                Some(reason) => crate::audit::record_denied(
+                                    &id, audit_tool.as_ref(), &audit_input, "hook", reason,
+                                ),
+                                None => crate::audit::record_tool_call(crate::audit::ToolCall {
+                                    tool_use_id: &id,
+                                    tool: audit_tool.as_ref(),
+                                    input: &audit_input,
+                                    decision: crate::audit::record::Decision::Allow,
+                                    decided_by: "auto",
+                                    output: &content.to_text(),
+                                    is_error,
+                                    duration_ms,
+                                }),
+                            }
+                            if let Some(h) = &hooks {
+                                let preview = match &content {
+                                    crate::types::ToolResultContent::Text(s) => s.clone(),
+                                    crate::types::ToolResultContent::Blocks(_) => {
+                                        "<multimodal>".to_string()
+                                    }
+                                };
+                                crate::hooks::fire_post_tool_use(h, &name, &preview, is_error);
+                            }
+                            result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: content.clone(),
+                                is_error,
+                            });
+                            yield AgentEvent::ToolCallResult {
+                                id,
+                                name,
+                                output: match tool_result {
+                                    Ok(c) => Ok(c.to_text()),
+                                    Err(e) => Err(format!("{e}")),
+                                },
+                                ui_resource,
+                            };
+                        }
+                        handled_concurrently = true;
+                    }
+                }
+
+                for tu in &turn_tool_uses {
+                    if handled_concurrently {
+                        break;
+                    }
+                    let ContentBlock::ToolUse { id, name, input, .. } = tu else { continue };
+
+                    // L4 (M6.17): if this tool's JSON input failed to
+                    // parse during assembly, short-circuit with a
+                    // synthetic error tool_result instead of dispatching
+                    // (the tool would just fail on the empty input
+                    // anyway, and the parse-error message is more
+                    // actionable for the model).
+                    if let Some((_, err)) =
+                        turn_parse_errors.iter().find(|(eid, _)| eid == id)
+                    {
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: err.clone().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(err.clone()),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
+                    let tool = match tools.get(name) {
+                        Some(t) => t,
+                        None => {
+                            let msg = format!("unknown tool: {name}");
+                            result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: msg.clone().into(),
+                                is_error: true,
+                            });
+                            yield AgentEvent::ToolCallResult {
+                                id: id.clone(),
+                                name: name.clone(),
+                                output: Err(msg),
+                                ui_resource: None,
+                            };
+                            continue;
+                        }
+                    };
+
+                    // Read the mode dynamically — EnterPlanMode (or the
+                    // sidebar Approve / `/plan` slash) may have flipped it
+                    // mid-turn, and we want that to take effect on the
+                    // very next dispatch. `permission_mode_default` only
+                    // matters when nothing has set the global yet.
+                    let permission_mode = crate::policy::clamp_permission_mode({
+                        let m = crate::permissions::current_mode();
+                        if matches!(m, PermissionMode::Ask) && permission_mode_default == PermissionMode::Auto {
+                            // Worker startup before init — fall back to
+                            // the agent's constructed default rather than
+                            // accidentally prompting on a bare-Ask Mutex
+                            // default.
+                            permission_mode_default
+                        } else {
+                            m
+                        }
+                    });
+
+                    // M6.20 BUG M1: TodoWrite block fires BEFORE the
+                    // generic mutating-tool block below. Pre-fix the
+                    // generic block ran first (because TodoWrite has
+                    // requires_approval=true), so the model always saw
+                    // the generic "Use Read/Grep/Glob/Ls" message
+                    // instead of this specific "Use SubmitPlan" one.
+                    // TodoWrite is the casual scratchpad outside plan
+                    // mode — letting it coexist with SubmitPlan
+                    // confused the model in tests (it would TodoWrite
+                    // a draft list AND SubmitPlan the same content).
+                    if matches!(permission_mode, PermissionMode::Plan)
+                        && name == "TodoWrite"
+                    {
+                        let blocked = "Blocked: TodoWrite is the casual scratchpad outside plan mode. \
+                                       In plan mode, call SubmitPlan to publish your plan to the \
+                                       sidebar — UpdatePlanStep tracks progress per step.";
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: blocked.to_string().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(blocked.to_string()),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
+                    // Plan-mode block (M2): mutating tools are off-limits
+                    // during plan-mode exploration. Return a structured
+                    // tool_result the model reads on the next turn and
+                    // self-corrects ("oh, I'm in plan mode — call Read
+                    // instead, then SubmitPlan when ready"). The whole
+                    // dispatch path is short-circuited — no approval
+                    // popup, no actual call. Plan tools themselves
+                    // (SubmitPlan, UpdatePlanStep, EnterPlanMode,
+                    // ExitPlanMode) have requires_approval=false and so
+                    // sail through.
+                    // Phase 8: a denied tool is removed from every
+                    // registry, so the model normally never sees it.
+                    // Refuse again here for the registries this did not
+                    // reach — a subagent built elsewhere, a tool added
+                    // at runtime — because "the model could not call it"
+                    // is a weaker claim than "the call does not run".
+                    if !crate::policy::tool_allowed(name) {
+                        crate::audit::record_denied(
+                            &id,
+                            tool.as_ref(),
+                            input,
+                            "policy",
+                            "denied by policies.runtime.deny_tools",
+                        );
+                        let blocked = format!(
+                            "Blocked: {name} is disabled by org policy and will not run. \
+                             Do not try again; solve the task without it or tell the user."
+                        );
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: blocked.clone().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(blocked),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
+                    if matches!(permission_mode, PermissionMode::Plan)
+                        && tool.requires_approval(input)
+                    {
+                        let blocked = format!(
+                            "Blocked: {name} is not available in plan mode. \
+                             Use Read / Grep / Glob / Ls to explore the codebase. \
+                             When you have enough context, call SubmitPlan with an \
+                             ordered list of concrete steps. The user will review \
+                             and approve before execution."
+                        );
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: blocked.clone().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(blocked),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
+                    // Approval-window gate (bug fix after M5 testing):
+                    // while a plan is submitted but the user hasn't
+                    // approved yet, the model must NOT progress steps
+                    // (UpdatePlanStep) or unilaterally exit plan mode
+                    // (ExitPlanMode). Both bypass the user's review
+                    // window — the model could call ExitPlanMode
+                    // interpreting a casual "Start" as approval, flip
+                    // mode to Auto on its own, and start writing files
+                    // before the user has reviewed the plan.
+                    //
+                    // The sole legal path out of "plan submitted,
+                    // awaiting approval" is the user clicking the
+                    // sidebar Approve / Cancel button (which fire
+                    // plan_approve / plan_cancel IPCs from the GUI).
+                    // Re-submitting via SubmitPlan stays allowed —
+                    // that's the model's "I changed my mind" channel
+                    // and the new plan also waits for approval.
+                    if matches!(permission_mode, PermissionMode::Plan)
+                        && (name == "UpdatePlanStep" || name == "ExitPlanMode")
+                        && crate::tools::plan_state::get().is_some()
+                    {
+                        let blocked = format!(
+                            "Blocked: {name} is not available while waiting for the user to \
+                             approve the plan. The user reviews the plan in the right-side \
+                             sidebar and clicks Approve to begin execution (or Cancel to \
+                             discard it). Do NOT instruct the user to type anything — the \
+                             buttons are the contract. While you wait, do not call any other \
+                             tools either; just stop emitting tool calls and let the sidebar \
+                             speak for itself.",
+                        );
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: blocked.clone().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(blocked),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
+
+                    // Approval gate. `asks_for_approval()` covers
+                    // both `Ask` (local prompt) and `LineGated`
+                    // (plan-07 Phase 1.2 — prompt routed to LINE).
+                    // `askTools` forces the gate on for a named tool even
+                    // under `Auto`, bypassing both the mode check and the
+                    // tool's own `requires_approval` — an interactive-only
+                    // escape hatch (an AutoApprover sink still auto-yeses).
+                    let force_ask = ask_tools.iter().any(|t| t.as_str() == name)
+                        || tool.forces_approval(input);
+                    let needs_approval = force_ask
+                        || (permission_mode.asks_for_approval() && tool.requires_approval(input));
+                    let mut audit_decision = (crate::audit::record::Decision::Allow, "auto");
+                    let review_shadow = name == "Bash" && crate::bash_review::shadow_enabled();
+                    if review_shadow {
+                        if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+                            let user = history
+                                .lock()
+                                .map(|h| crate::bash_review::recent_user_text(&h))
+                                .unwrap_or_default();
+                            crate::bash_review::spawn_shadow(
+                                id.clone(),
+                                cmd.to_string(),
+                                user,
+                                review_model.clone(),
+                            );
+                        }
+                    }
+                    if needs_approval {
+                        let req = ApprovalRequest {
+                            tool_name: name.clone(),
+                            input: input.clone(),
+                            summary: tool.approval_summary(input),
+                            // The agent's origin (Main / SideChannel /
+                            // Subagent) flows through every approval
+                            // request so the GUI modal can attribute
+                            // concurrent permission asks to the right
+                            // agent. Set via `Agent::with_origin` at
+                            // construction (factory + side-channel
+                            // spawner do this).
+                            originator: origin.clone(),
+                        };
+                        let decision = approver.approve(&req).await;
+                        audit_decision = (crate::audit::decision_of(&decision), approver.audit_kind());
+                        if matches!(decision, ApprovalDecision::Deny) {
+                            // M6.35 HOOK3: surface explicit user denial
+                            // to the configured permission_denied hook.
+                            // BashTool / sandbox / plan-mode hard-blocks
+                            // are NOT denials per this gate (they're
+                            // tool-level rejections); only the explicit
+                            // approver Deny lands here.
+                            if let Some(h) = &hooks {
+                                crate::hooks::fire_permission_denied(h, &name);
+                            }
+                            if review_shadow {
+                                crate::bash_review::record_outcome(
+                                    &id, &format!("{permission_mode:?}"), true, "deny", None,
+                                );
+                            }
+                            let denied = format!("denied by user: {name}");
+                            crate::audit::record_denied(
+                                &id, tool.as_ref(), input, approver.audit_kind(), &denied,
+                            );
+                            result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: denied.clone().into(),
+                                is_error: true,
+                            });
+                            yield AgentEvent::ToolCallDenied {
+                                id: id.clone(),
+                                name: name.clone(),
+                            };
+                            continue;
+                        }
+                    }
+
+                    // M6.35 HOOK1: pre_tool_use fires after the approval
+                    // gate but before the tool runs, as a synchronous GATE —
+                    // a hook that exits 2 denies the call (the tool never
+                    // runs; the model sees the hook's reason). Any other
+                    // outcome allows it (fail-open), so a plain audit hook
+                    // (exit 0) behaves exactly as the old fire-and-forget.
+                    let hook_denied: Option<String> = if let Some(h) = &hooks {
+                        let input_str = serde_json::to_string(input)
+                            .unwrap_or_else(|_| "<unserializable>".to_string());
+                        match crate::hooks::fire_pre_tool_use_gate(h, &name, &input_str).await {
+                            crate::hooks::PreToolDecision::Deny(reason) => Some(reason),
+                            crate::hooks::PreToolDecision::Allow => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    // ToolCallStart was yielded at parse time (see the
+                    // assembled-event loop above) so the UI shows the
+                    // tool queued before the approval modal pops. The
+                    // dispatch site here just runs the call (unless the
+                    // pre_tool_use gate denied it).
+                    let started = std::time::Instant::now();
+                    // Payments (dev-plan/74) are authorised inside the call:
+                    // `PaidFetch` learns the price only from the 402, and a
+                    // settings-tagged tool that pays by itself is gated here.
+                    let pay_ctx = crate::payments::PaymentContext {
+                        approver: approver.clone(),
+                        originator: origin.clone(),
+                        tool_name: name.clone(),
+                        ledger_path: crate::payments::default_ledger_path(),
+                        mandates: None,
+                        governance: None,
+                    };
+                    let external_pay = if hook_denied.is_none()
+                        && crate::payments::is_payment_tool(&name)
+                    {
+                        let q = crate::payments::external_quote(&name, input);
+                        Some((crate::payments::authorize_external(&pay_ctx, &q).await, q))
+                    } else {
+                        None
+                    };
+                    let tool_result = match (&hook_denied, &external_pay) {
+                        (Some(reason), _) => {
+                            Err(crate::error::Error::Tool(format!("blocked by policy: {reason}")))
+                        }
+                        (None, Some((Err(denied), _))) => {
+                            Err(crate::error::Error::Tool(denied.clone()))
+                        }
+                        (None, _) => {
+                            crate::payments::scope(pay_ctx.clone(), tool.call_multimodal(input.clone()))
+                                .await
+                        }
+                    };
+                    if let Some((Ok(auth), q)) = &external_pay {
+                        crate::payments::settle_external(
+                            &pay_ctx,
+                            q,
+                            auth,
+                            tool_result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+                        );
+                    }
+                    let duration_ms = started.elapsed().as_millis() as u64;
+
+                    let (content, is_error) = match &tool_result {
+                        Ok(c) => {
+                            // Truncate-to-disk only applies to text payloads;
+                            // multimodal blocks (e.g. an image returned by
+                            // Read) are passed through unchanged.
+                            let truncated = match c {
+                                crate::types::ToolResultContent::Text(s) => {
+                                    crate::types::ToolResultContent::Text(maybe_truncate_to_disk(s))
+                                }
+                                crate::types::ToolResultContent::Blocks(_) => c.clone(),
+                            };
+                            (truncated, false)
+                        }
+                        Err(e) => (
+                            crate::types::ToolResultContent::Text(format!("error: {e}")),
+                            true,
+                        ),
+                    };
+                    if review_shadow {
+                        let outcome = match (&hook_denied, needs_approval) {
+                            (Some(_), _) => "hook_denied",
+                            (None, true) => "approved",
+                            (None, false) => "auto",
+                        };
+                        crate::bash_review::record_outcome(
+                            &id, &format!("{permission_mode:?}"), needs_approval, outcome,
+                            Some(is_error),
+                        );
+                    }
+                    // Anthropic (and some other providers) reject
+                    //   user messages must have non-empty content
+                    // when a tool result is empty (e.g. a successful
+                    // Write, a Bash with no stdout). Replace empty
+                    // text-only results with a minimal marker so the
+                    // model still knows the call completed.
+                    let content = if content.is_empty() {
+                        crate::types::ToolResultContent::Text("(no output)".to_string())
+                    } else {
+                        content
+                    };
+                    match &hook_denied {
+                        Some(reason) => {
+                            crate::audit::record_denied(&id, tool.as_ref(), input, "hook", reason)
+                        }
+                        None => crate::audit::record_tool_call(crate::audit::ToolCall {
+                            tool_use_id: &id,
+                            tool: tool.as_ref(),
+                            input,
+                            decision: audit_decision.0,
+                            decided_by: audit_decision.1,
+                            output: &content.to_text(),
+                            is_error,
+                            duration_ms,
+                        }),
+                    }
+
+                    // M6.35 HOOK1: post_tool_use (or _failure) fires
+                    // after we've materialized the result content but
+                    // before pushing it into history. The output the
+                    // hook sees is the truncated-to-disk variant — same
+                    // text the next provider call will see, so audit
+                    // hooks log what the model actually consumed.
+                    if let Some(h) = &hooks {
+                        let preview = match &content {
+                            crate::types::ToolResultContent::Text(s) => s.clone(),
+                            crate::types::ToolResultContent::Blocks(_) => "<multimodal>".to_string(),
+                        };
+                        crate::hooks::fire_post_tool_use(h, &name, &preview, is_error);
+                    }
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: content.clone(),
+                        is_error,
+                    });
+
+                    // For MCP-Apps tools, fetch the widget HTML so the
+                    // chat surface can mount an iframe alongside the
+                    // text result. Only attempted on success; an
+                    // errored tool call doesn't produce a widget. The
+                    // fetch is best-effort — if it fails the user
+                    // still sees the text result.
+                    let ui_resource = if matches!(tool_result, Ok(_)) {
+                        tool.fetch_ui_resource().await
+                    } else {
+                        None
+                    };
+
+                    yield AgentEvent::ToolCallResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        output: match tool_result {
+                            Ok(c) => Ok(c.to_text()),
+                            Err(e) => Err(format!("{e}")),
+                        },
+                        ui_resource,
+                    };
+                }
+
+                // Degenerate-loop signature for THIS iteration: only when
+                // every tool call errored. Name + input + error text (capped)
+                // per call, joined — identical across iterations ⇒ the model
+                // is re-rolling the exact same failing call.
+                let degen_this: Option<String> = if !result_blocks.is_empty()
+                    && result_blocks.iter().all(|b| {
+                        matches!(b, ContentBlock::ToolResult { is_error: true, .. })
+                    }) {
+                    let mut sig = String::new();
+                    for tu in &turn_tool_uses {
+                        let ContentBlock::ToolUse { id, name, input, .. } = tu else { continue };
+                        let err = result_blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, content, .. }
+                                if tool_use_id == id =>
+                            {
+                                Some(content.to_text())
+                            }
+                            _ => None,
+                        });
+                        let err = err.unwrap_or_default();
+                        let err_head: String = err.chars().take(200).collect();
+                        sig.push_str(name);
+                        sig.push('\u{1}');
+                        sig.push_str(&input.to_string());
+                        sig.push('\u{1}');
+                        sig.push_str(&err_head);
+                        sig.push('\u{2}');
+                    }
+                    Some(sig)
+                } else {
+                    None
+                };
+                match (&degen_this, &degen_sig) {
+                    (Some(now), Some(prev)) if now == prev => degen_count += 1,
+                    (Some(now), _) => {
+                        degen_sig = Some(now.clone());
+                        degen_count = 1;
+                    }
+                    (None, _) => {
+                        degen_sig = None;
+                        degen_count = 0;
+                    }
+                }
+
+                if !result_blocks.is_empty() {
+                    // Drain any user-typed messages that arrived while
+                    // we were mid-tool (issue #106). Fold each as an
+                    // extra Text block on the SAME user-role message
+                    // that carries the tool_result blocks so the
+                    // user/assistant alternation stays valid for
+                    // providers (Anthropic) that reject two
+                    // consecutive user messages. The model sees the
+                    // tool's effect *and* the user's mid-flight
+                    // correction in the next turn's context.
+                    //
+                    // Lock guards are scoped tightly — they must NOT
+                    // live across the `yield` below (Mutex from std
+                    // is `!Send`, and run_turn returns a `Send`
+                    // stream).
+                    let injected: Vec<String> = {
+                        let mut q = injection_queue.lock().expect("injection_queue lock");
+                        q.drain(..).collect()
+                    };
+                    let mut content = result_blocks;
+                    for text in &injected {
+                        content.push(ContentBlock::Text { text: text.clone() });
+                    }
+                    {
+                        let mut h = history.lock().expect("history lock");
+                        h.push(Message {
+                            role: Role::User,
+                            content,
+                        });
+                    }
+                    for text in injected {
+                        yield AgentEvent::UserMessageInjected { text };
+                    }
+                }
+
+                // Three identical all-errors tool iterations in a row: the
+                // model is stuck re-rolling the same failing call. End the
+                // turn with a plain explanation instead of burning the rest
+                // of the iteration budget (grok-4.5 went 22 rounds here).
+                if degen_count >= 3 {
+                    let first_tool = turn_tool_uses
+                        .iter()
+                        .find_map(|tu| match tu {
+                            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "tool".to_string());
+                    yield AgentEvent::Text(format!(
+                        "\n[stopped: `{first_tool}` failed with the IDENTICAL call + error \
+                         {degen_count} times in a row — the model keeps re-sending the same \
+                         failing parameters. Try rephrasing the request, or switch to a model \
+                         with stronger tool-calling (this pattern is typical of models that \
+                         can't emit nested tool arguments).]"
+                    ));
+                    if let Ok(mut g) = model_override.lock() {
+                        *g = None;
+                    }
+                    if let Ok(mut g) = next_turn_chunk_timeout.lock() {
+                        *g = None;
+                    }
+                    yield AgentEvent::Done {
+                        stop_reason: Some("degenerate_tool_loop".to_string()),
+                        usage: cumulative_usage,
+                    };
+                    return;
+                }
+            }
+
+            // Hit the iteration cap without a natural stop. Same
+            // override-clear pass as the natural-stop site so a turn
+            // that capped out doesn't leak its skill recommendation
+            // forward.
+            if let Ok(mut g) = model_override.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = next_turn_chunk_timeout.lock() {
+                *g = None;
+            }
+            yield AgentEvent::Done {
+                stop_reason: Some("max_iterations".to_string()),
+                usage: cumulative_usage,
+            };
+        }
+    }
+}
+
+/// Strip `Image` blocks out of every `ToolResult`'s nested-blocks
+/// content in history, replacing each with a short text marker so the
+/// surrounding sequence stays well-formed. Called immediately after
+/// the assistant message has been appended for an iteration — the
+/// provider.stream call that produced that response already consumed
+/// the bytes once, and re-shipping them on every subsequent iteration
+/// is the dominant cause of premature compaction when an agent reads
+/// even one large screenshot. Idempotent — already-redacted entries
+/// are no-ops.
+/// Gateway/body cap is 5 MB. Keep the base64 image payload of an outgoing
+/// request under this so the full assembled body (system prompt + tool defs +
+/// text + JSON framing + images) stays within the cap. Conservative — leaves
+/// headroom for the non-image parts (a large CLAUDE.md/skills/memory cascade
+/// can be hundreds of KB).
+const OUTGOING_IMAGE_BUDGET_BYTES: usize = 3_500_000;
+
+/// Long edge to shrink images toward when the payload is over budget. Tighter
+/// than the per-read 1568 target because one turn can carry many images that
+/// share the budget (e.g. "read all 7 namecards" → 7 image blocks in one
+/// request). 1280px keeps small text legible for OCR while fitting several
+/// images comfortably.
+const FIT_LONG_EDGE: u32 = 1280;
+
+/// Sum of base64 image bytes across all messages — tool-result images (Read)
+/// plus pasted-attachment image blocks.
+fn outgoing_image_b64_bytes(messages: &[Message]) -> usize {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    let mut n = 0usize;
+    for m in messages {
+        for b in &m.content {
+            match b {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { data, .. },
+                } => n += data.len(),
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(bs),
+                    ..
+                } => {
+                    for tb in bs {
+                        if let ToolResultBlock::Image {
+                            source: ImageSource::Base64 { data, .. },
+                        } = tb
+                        {
+                            n += data.len();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+/// Re-encode a base64 image smaller: resize to ≤ `FIT_LONG_EDGE` long edge and
+/// JPEG-compress (q80). Returns `None` on decode/encode failure so the caller
+/// keeps the original. JPEG drops alpha — irrelevant for vision.
+fn shrink_b64_image(data: &str) -> Option<String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    let img = image::load_from_memory(&raw).ok()?;
+    let img = if img.width().max(img.height()) > FIT_LONG_EDGE {
+        img.resize(
+            FIT_LONG_EDGE,
+            FIT_LONG_EDGE,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut out = Vec::new();
+    rgb.write_to(
+        &mut std::io::Cursor::new(&mut out),
+        image::ImageOutputFormat::Jpeg(80),
+    )
+    .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(&out))
+}
+
+/// Replace every base64 image in one message with a text placeholder.
+fn drop_images_in_message(msg: &mut Message) {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    for b in msg.content.iter_mut() {
+        match b {
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. },
+            } => {
+                let mt = media_type.clone();
+                *b = ContentBlock::Text {
+                    text: format!("[{mt} dropped to fit the request size cap]"),
+                };
+            }
+            ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(bs),
+                ..
+            } => {
+                let new: Vec<ToolResultBlock> = bs
+                    .drain(..)
+                    .map(|tb| match tb {
+                        ToolResultBlock::Image {
+                            source: ImageSource::Base64 { media_type, .. },
+                        } => ToolResultBlock::Text {
+                            text: format!("[{media_type} dropped to fit the request size cap]"),
+                        },
+                        other => other,
+                    })
+                    .collect();
+                *bs = new;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bound the base64 image payload of an outgoing request. Two passes: (1)
+/// shrink every image toward `FIT_LONG_EDGE` / JPEG; (2) if still over budget
+/// (pathologically many images), evict the oldest image blocks — keeping the
+/// most recent ones the model is actively working with.
+fn fit_image_payload_to(messages: &mut Vec<Message>, budget: usize) {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    if outgoing_image_b64_bytes(messages) <= budget {
+        return;
+    }
+
+    // Pass 1: shrink every image in place.
+    for m in messages.iter_mut() {
+        for b in m.content.iter_mut() {
+            match b {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { media_type, data },
+                } => {
+                    if let Some(small) = shrink_b64_image(data) {
+                        *data = small;
+                        *media_type = "image/jpeg".to_string();
+                    }
+                }
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(bs),
+                    ..
+                } => {
+                    for tb in bs.iter_mut() {
+                        if let ToolResultBlock::Image {
+                            source: ImageSource::Base64 { media_type, data },
+                        } = tb
+                        {
+                            if let Some(small) = shrink_b64_image(data) {
+                                *data = small;
+                                *media_type = "image/jpeg".to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: still over budget — evict oldest images until it fits.
+    for i in 0..messages.len() {
+        if outgoing_image_b64_bytes(messages) <= budget {
+            break;
+        }
+        drop_images_in_message(&mut messages[i]);
+    }
+}
+
+/// Bound the outgoing image payload to the gateway body cap. See
+/// [`fit_image_payload_to`].
+fn fit_outgoing_image_payload(messages: &mut Vec<Message>) {
+    fit_image_payload_to(messages, OUTGOING_IMAGE_BUDGET_BYTES);
+}
+
+fn redact_consumed_images_from_history(history: &mut Vec<Message>) {
+    use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
+    for msg in history.iter_mut() {
+        if msg.role != Role::User {
+            continue;
+        }
+        for block in msg.content.iter_mut() {
+            let ContentBlock::ToolResult { content, .. } = block else {
+                continue;
+            };
+            let ToolResultContent::Blocks(blocks) = content else {
+                continue;
+            };
+            let had_image = blocks
+                .iter()
+                .any(|b| matches!(b, ToolResultBlock::Image { .. }));
+            if !had_image {
+                continue;
+            }
+            let new_blocks: Vec<ToolResultBlock> = blocks
+                .drain(..)
+                .map(|b| match b {
+                    ToolResultBlock::Image {
+                        source: ImageSource::Base64 { media_type, .. },
+                    } => ToolResultBlock::Text {
+                        text: format!("[{media_type} redacted from history to save context]"),
+                    },
+                    other => other,
+                })
+                .collect();
+            *blocks = new_blocks;
+        }
+    }
+}
+
+/// How many spill files to keep when a session opens.
+///
+/// These used to live in the system temp dir, where the OS eventually swept
+/// them; moving them inside the workspace so the model can actually READ them
+/// made their lifetime our problem. Three browse sessions left 9 files and
+/// 779 KB behind, on a cloud runner's PVC.
+///
+/// The count is not about disk — at ~87 KB a file, 20 is 1.7 MB and a PVC
+/// will not notice. It is about RESUME: `session.rs` replays stored
+/// `ToolResult` blocks into context, so a resumed session hands the model
+/// truncation footers naming paths from its earlier life. Prune too eagerly
+/// and those paths are dead. One real session produced SEVEN spills, so a
+/// keep-5 rule would have broken it on the first resume.
+const TOOL_OUTPUT_KEEP: usize = 20;
+
+/// Delete all but the newest [`TOOL_OUTPUT_KEEP`] spill files. Called once at
+/// project-open, never mid-session: the current session's own footers must
+/// keep pointing at files that exist.
+pub fn prune_tool_output_dir(thclaws_dir: &std::path::Path) {
+    let dir = thclaws_dir.join("state/tool-output");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return; // never spilled here — nothing to do
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            if !m.is_file() {
+                return None;
+            }
+            Some((m.modified().ok()?, e.path()))
+        })
+        .collect();
+    if files.len() <= TOOL_OUTPUT_KEEP {
+        return;
+    }
+    files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    for (_, path) in files.into_iter().skip(TOOL_OUTPUT_KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// If `content` exceeds `TOOL_RESULT_CONTEXT_LIMIT`, save the full content
+/// to a temp file and return a preview + file path. The model sees the preview
+/// and can reference the full file if needed.
+fn maybe_truncate_to_disk(content: &str) -> String {
+    if content.len() <= TOOL_RESULT_CONTEXT_LIMIT {
+        return content.to_string();
+    }
+    // Save full content where the model can actually READ it back.
+    //
+    // M2 (M6.17): include a UUID per truncation. Pre-fix the filename
+    // was just `tool-<pid>.txt` — every truncation in the same process
+    // overwrote the previous one, so the model's "reference the full
+    // file" affordance was a lie after the second truncation. Surface
+    // any write failure in the truncation message instead of silently
+    // promising a file that doesn't exist.
+    //
+    // The second way that affordance was a lie: the spill lived in the
+    // SYSTEM temp dir, which is outside the sandbox root, so `Read` on
+    // the advertised path answered "access denied: … is outside the
+    // workspace root". Observed live — a 108 KB Lazada snapshot spilled,
+    // the model saw 2 KB of it, asked for the rest once, was refused, and
+    // then concluded from 2% of a page that the product it was sent to
+    // find did not exist. Keep the spill INSIDE the workspace:
+    // `.thclaws/` is denied to the write tools but readable, and engine
+    // code writes it directly, so the path we advertise is one the model
+    // can open. Fall back to the temp dir only when there is no sandbox
+    // root (tests, some headless paths) — the old behaviour, unchanged.
+    let tmp_dir = match crate::sandbox::Sandbox::root() {
+        Some(root) => root.join(".thclaws/state/tool-output"),
+        None => std::env::temp_dir().join("thclaws-tool-output"),
+    };
+    let mkdir_err = std::fs::create_dir_all(&tmp_dir).err();
+    let filename = format!(
+        "tool-{}-{}.txt",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = tmp_dir.join(&filename);
+    let write_err = std::fs::write(&path, content).err();
+
+    // Preview as much as an UNtruncated result would have been allowed to
+    // carry. A flat 2,000 characters put a 25x cliff at the threshold: a
+    // 49,999-byte result arrived whole, a 50,001-byte one collapsed to 2 KB.
+    // That cliff is what made the Lazada snapshot useless — 108 KB of page
+    // reduced to 2 KB of header chrome, from which the model concluded the
+    // product was not there. Same ceiling on both sides of the threshold now,
+    // and the file still holds 100% for when the excerpt is not enough.
+    let preview_end = {
+        let mut end = content.len().min(TOOL_RESULT_CONTEXT_LIMIT);
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
+    let footer = match (mkdir_err, write_err) {
+        (None, None) => format!(
+            "... [truncated: you are seeing {} of {} bytes — {:.0}% of this result. \
+             Do NOT conclude something is absent because it is not in this excerpt; \
+             the rest may contain it. Read the full output at {}, or re-run the tool \
+             with a narrower query.]",
+            preview_end,
+            content.len(),
+            (preview_end as f64 / content.len() as f64) * 100.0,
+            path.display()
+        ),
+        (Some(e), _) | (_, Some(e)) => format!(
+            "... [truncated: {} total bytes — could not save full output to disk ({}); preview only]",
+            content.len(),
+            e
+        ),
+    };
+    format!("{}\n\n{}", &content[..preview_end], footer)
+}
+
+/// Drain an agent stream into a blocking result. Useful for tests and for
+/// non-interactive consumers.
+pub async fn collect_agent_turn<S>(stream: S) -> Result<AgentTurnOutcome>
+where
+    S: Stream<Item = Result<AgentEvent>> + Send,
+{
+    collect_agent_turn_with_cancel(stream, None).await
+}
+
+/// M6.33 SUB4: cancel-aware variant of `collect_agent_turn`. When a
+/// `CancelToken` is wired in, the loop `tokio::select!`s the next
+/// stream event against `cancel.cancelled().await` so a parent ctrl-C
+/// short-circuits the subagent's run instead of waiting for the
+/// subagent to exhaust its iteration budget.
+///
+/// Pre-fix subagents had no cancel observation: a runaway 200-iteration
+/// subagent could burn 10+ minutes uninterruptibly because the parent's
+/// cancel only reached its own retry-backoff sleeps, never propagated
+/// down to the child Agent.
+pub async fn collect_agent_turn_with_cancel<S>(
+    stream: S,
+    cancel: Option<crate::cancel::CancelToken>,
+) -> Result<AgentTurnOutcome>
+where
+    S: Stream<Item = Result<AgentEvent>> + Send,
+{
+    let mut out = AgentTurnOutcome::default();
+    let mut stream = Box::pin(stream);
+    loop {
+        let next = if let Some(c) = &cancel {
+            tokio::select! {
+                ev = stream.next() => ev,
+                _ = c.cancelled() => {
+                    return Err(Error::Agent("cancelled by user".into()));
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(ev) = next else { break };
+        match ev? {
+            AgentEvent::IterationStart { iteration } => out.iterations = iteration + 1,
+            AgentEvent::Text(s) => out.text.push_str(&s),
+            AgentEvent::Thinking(_) => {}
+            AgentEvent::ToolCallStart { name, .. } => out.tool_calls.push(name),
+            AgentEvent::ToolCallResult { .. } => {}
+            AgentEvent::ToolCallDenied { name, .. } => out.tool_denials.push(name),
+            AgentEvent::UserMessageInjected { .. } => {}
+            AgentEvent::Progress(_) => {}
+            AgentEvent::Done { stop_reason, usage } => {
+                out.stop_reason = stop_reason;
+                out.usage = Some(usage);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AgentTurnOutcome {
+    pub text: String,
+    pub tool_calls: Vec<String>,
+    pub tool_denials: Vec<String>,
+    pub stop_reason: Option<String>,
+    pub usage: Option<Usage>,
+    pub iterations: usize,
+}
+
+#[cfg(test)]
+mod browser_step_thinking_tests {
+    use super::BrowserStepThinking as B;
+    use serde_json::json;
+
+    fn call(name: &str, target: &str) -> (String, serde_json::Value) {
+        (name.to_string(), json!({ "ref": target }))
+    }
+
+    #[test]
+    fn a_browser_tool_is_recognised_under_either_name() {
+        assert!(B::is_browser_tool("browser_click"));
+        assert!(B::is_browser_tool("playwright__browser_click"));
+        assert!(!B::is_browser_tool("Read"));
+        assert!(!B::is_browser_tool("browserify"));
+    }
+
+    #[test]
+    fn a_step_after_browser_calls_costs_no_thinking() {
+        let mut b = B::default();
+        assert_eq!(
+            b.budget(Some(32_000)),
+            Some(32_000),
+            "the first turn is a plan"
+        );
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0), "the next one is a step");
+    }
+
+    #[test]
+    fn one_non_browser_call_ends_the_step() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[call("browser_click", "@22"), ("Read".into(), json!({}))]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000));
+    }
+
+    /// The signal that the page did not answer as expected. Thinking comes
+    /// back rather than the same click being tried a third time.
+    #[test]
+    fn the_same_click_twice_hands_thinking_back() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0));
+        b.observe(&[call("browser_click", "@21")]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000), "a repeat is a stall");
+    }
+
+    #[test]
+    fn a_different_target_is_progress_not_a_repeat() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[call("browser_click", "@22")]);
+        assert_eq!(b.budget(Some(32_000)), Some(0));
+    }
+
+    #[test]
+    fn a_turn_with_no_tools_is_not_a_step() {
+        let mut b = B::default();
+        b.observe(&[call("browser_click", "@21")]);
+        b.observe(&[]);
+        assert_eq!(b.budget(Some(32_000)), Some(32_000));
+    }
+
+    /// Off a browse the policy must be invisible: whatever was configured is
+    /// what goes out, including `auto`.
+    #[test]
+    fn auto_survives_when_nothing_browsed() {
+        let b = B::default();
+        assert_eq!(b.budget(None), None);
+    }
+}
+
+/// HTTP status a provider error carries as `http <code> <reason>: …`.
+fn provider_http_status(msg: &str) -> Option<u16> {
+    msg.match_indices("http ").find_map(|(i, _)| {
+        let rest = &msg[i + 5..];
+        let code = rest.get(..3)?;
+        let after_ok = rest[3..].chars().next().is_none_or(|c| !c.is_ascii_digit());
+        if code.bytes().all(|b| b.is_ascii_digit()) && after_ok {
+            code.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// A 4xx (bad model id, model not activated, auth) answers the same on every
+/// attempt; only 408 and 429 clear by waiting.
+fn is_permanent_provider_error(msg: &str) -> bool {
+    matches!(provider_http_status(msg), Some(s) if (400..500).contains(&s) && s != 408 && s != 429)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{is_permanent_provider_error, provider_http_status};
+
+    #[test]
+    fn reads_the_status_out_of_provider_errors() {
+        assert_eq!(
+            provider_http_status(
+                "provider error: http 404 Not Found: {\"error\":\"Model not exist\"}"
+            ),
+            Some(404)
+        );
+        assert_eq!(
+            provider_http_status("provider error: http 429 Too Many Requests: slow down"),
+            Some(429)
+        );
+        assert_eq!(
+            provider_http_status("provider error: http: connection refused"),
+            None
+        );
+        assert_eq!(provider_http_status("provider error: http 4040"), None);
+        assert_eq!(provider_http_status("see https://x/http 12"), None);
+    }
+
+    #[test]
+    fn only_lasting_client_errors_skip_the_retry() {
+        for permanent in [
+            "provider error: http 400 Bad Request: model not activated",
+            "provider error: http 401 Unauthorized: bad key",
+            "provider error: http 404 Not Found: Model not exist",
+            "provider error: http 422 Unprocessable Entity: nope",
+        ] {
+            assert!(is_permanent_provider_error(permanent), "{permanent}");
+        }
+        for transient in [
+            "provider error: http 408 Request Timeout: slow",
+            "provider error: http 429 Too Many Requests: slow down",
+            "provider error: http 500 Internal Server Error: oops",
+            "provider error: http 503 Service Unavailable: later",
+            "provider error: http: error sending request",
+            "provider error: stream ended early",
+        ] {
+            assert!(!is_permanent_provider_error(transient), "{transient}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// dev-plan/64 P2.1. A provider's prompt cache is a prefix cache, so
+    /// what one request said about a message, every later request must
+    /// say again, byte for byte — and history itself must never carry it.
+    #[test]
+    fn a_kms_note_stays_with_its_message_and_out_of_history() {
+        let mut notes = TurnNotes::default();
+        notes.remember("ยุคที่ความฉลาดล้นเหลือคืออะไร", "pages: a".into());
+        notes.remember("ยุคที่ความฉลาดล้นเหลือคืออะไร", "pages: CHANGED".into());
+
+        let history = vec![
+            Message::user("ยุคที่ความฉลาดล้นเหลือคืออะไร"),
+            Message::assistant("คำตอบ"),
+            Message::user("ขอบคุณ"),
+        ];
+        let mut first = history.clone();
+        notes.attach(&mut first);
+        notes.remember("ขอบคุณ", "pages: b".into());
+        let mut second = history.clone();
+        notes.attach(&mut second);
+
+        assert_eq!(first[0], second[0], "an earlier turn must not change");
+        assert_eq!(first[0].content.len(), 2);
+        let ContentBlock::Text { text } = &first[0].content[1] else {
+            panic!("note is a text block");
+        };
+        assert_eq!(text, "<system-reminder>\npages: a\n</system-reminder>");
+        assert_eq!(second[2].content.len(), 2);
+        assert_eq!(
+            history[0].content.len(),
+            1,
+            "history is what the user typed"
+        );
+        assert_eq!(first[1], history[1], "only user messages carry notes");
+    }
+
+    #[test]
+    fn turn_notes_are_bounded() {
+        let mut notes = TurnNotes::default();
+        for i in 0..(TurnNotes::MAX + 5) {
+            notes.remember(&format!("q{i}"), "n".into());
+        }
+        assert_eq!(notes.notes.len(), TurnNotes::MAX);
+        let mut m = vec![Message::user("q0"), Message::user("q68")];
+        notes.attach(&mut m);
+        assert_eq!(m[0].content.len(), 1, "the oldest went");
+        assert_eq!(m[1].content.len(), 2);
+    }
+
+    use super::*;
+    use crate::error::Error;
+    use crate::providers::{EventStream, ProviderEvent};
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::collections::VecDeque;
+    use tempfile::tempdir;
+
+    #[cfg(feature = "kms_search_index")]
+    #[test]
+    fn sanitize_kms_query_strips_metachars_and_caps() {
+        // tantivy query metacharacters must not survive into the query.
+        let q = sanitize_kms_query("what is foo:bar? (test) +x -y *z");
+        assert!(!q.contains(':'));
+        assert!(!q.contains('?'));
+        assert!(!q.contains('('));
+        assert!(!q.contains('+'));
+        assert!(!q.contains('*'));
+        // whitespace collapsed to single spaces, content preserved
+        assert!(q.contains("foo bar"));
+        assert!(q.contains("test"));
+        // length cap
+        let long = "ก".repeat(500);
+        assert!(sanitize_kms_query(&long).chars().count() <= 200);
+    }
+
+    // ── Image redaction ────────────────────────────────────────────────
+
+    /// Single Read of an image lands a base64 blob inside a ToolResult's
+    /// `Blocks` content. After the model has consumed that blob (i.e.
+    /// produced a response based on the history that contained it), we
+    /// strip the bytes so subsequent iterations don't re-ship them.
+    /// The text summary block alongside it ("image: foo.jpg · …") must
+    /// stay intact so the model retains a textual handle on what it saw.
+    #[test]
+    fn redact_consumed_images_strips_base64_keeps_summary() {
+        use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
+        let mut history = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id-1".into(),
+                content: ToolResultContent::Blocks(vec![
+                    ToolResultBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/jpeg".into(),
+                            data: "BIG_BASE64_PAYLOAD".into(),
+                        },
+                    },
+                    ToolResultBlock::Text {
+                        text: "image: foo.jpg · 234 KB · image/jpeg".into(),
+                    },
+                ]),
+                is_error: false,
+            }],
+        }];
+        redact_consumed_images_from_history(&mut history);
+
+        let ContentBlock::ToolResult { content, .. } = &history[0].content[0] else {
+            panic!("expected ToolResult");
+        };
+        let ToolResultContent::Blocks(blocks) = content else {
+            panic!("expected Blocks content");
+        };
+        assert_eq!(blocks.len(), 2);
+        // Image was replaced by a short text marker that names the
+        // media_type so the model can tell what kind of file it was.
+        match &blocks[0] {
+            ToolResultBlock::Text { text } => {
+                assert!(
+                    text.contains("image/jpeg"),
+                    "marker should name media_type: {text}"
+                );
+                assert!(
+                    text.contains("redacted"),
+                    "marker should say redacted: {text}"
+                );
+            }
+            _ => panic!("expected redacted Text marker, got {:?}", blocks[0]),
+        }
+        // Original summary must still be there.
+        match &blocks[1] {
+            ToolResultBlock::Text { text } => assert!(text.contains("foo.jpg")),
+            _ => panic!("expected original summary text"),
+        }
+    }
+
+    /// Idempotent: walking again on already-redacted history must not
+    /// touch anything. Otherwise a long-running agent loop would keep
+    /// rewriting the same blocks every iteration.
+    #[test]
+    fn redact_consumed_images_is_idempotent() {
+        use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
+        let mut history = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id-1".into(),
+                content: ToolResultContent::Blocks(vec![ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "X".into(),
+                    },
+                }]),
+                is_error: false,
+            }],
+        }];
+        redact_consumed_images_from_history(&mut history);
+        let snapshot = history.clone();
+        redact_consumed_images_from_history(&mut history);
+        assert_eq!(history, snapshot, "second pass should be a no-op");
+    }
+
+    /// Plain-text tool results pass through unchanged — only Blocks
+    /// containing Image entries are touched.
+    #[test]
+    fn redact_consumed_images_leaves_text_only_results_alone() {
+        use crate::types::{ContentBlock, Role, ToolResultContent};
+        let original = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id-1".into(),
+                content: ToolResultContent::Text("plain output, no images".into()),
+                is_error: false,
+            }],
+        }];
+        let mut history = original.clone();
+        redact_consumed_images_from_history(&mut history);
+        assert_eq!(history, original);
+    }
+
+    // ── Outgoing image payload budget ──────────────────────────────────
+
+    fn b64_png(w: u32, h: u32) -> String {
+        use base64::Engine;
+        let buf = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                (x ^ y) as u8,
+                x.wrapping_mul(7) as u8,
+                y.wrapping_mul(13) as u8,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageOutputFormat::Png,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&out)
+    }
+
+    fn img_msg(data: String) -> Message {
+        use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id".into(),
+                content: ToolResultContent::Blocks(vec![ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data,
+                    },
+                }]),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn shrink_b64_image_resizes_and_shrinks() {
+        use base64::Engine;
+        let big = b64_png(2000, 1000);
+        let small = shrink_b64_image(&big).expect("shrink ok");
+        assert!(small.len() < big.len(), "expected a smaller payload");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&small)
+            .unwrap();
+        let (w, h) = image::io::Reader::new(std::io::Cursor::new(&raw))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(
+            (w, h),
+            (1280, 640),
+            "fit to FIT_LONG_EDGE, aspect preserved"
+        );
+    }
+
+    #[test]
+    fn fit_payload_noop_when_under_budget() {
+        let original = vec![img_msg(b64_png(64, 64))];
+        let mut msgs = original.clone();
+        fit_image_payload_to(&mut msgs, OUTGOING_IMAGE_BUDGET_BYTES);
+        assert_eq!(msgs, original, "under budget → untouched");
+    }
+
+    #[test]
+    fn fit_payload_shrinks_to_fit_keeping_image() {
+        use crate::types::{ContentBlock, ToolResultBlock, ToolResultContent};
+        let big = b64_png(2000, 1000);
+        let small = shrink_b64_image(&big).unwrap();
+        assert!(small.len() < big.len());
+        // Budget strictly between the shrunk and original size: pass 1 (shrink)
+        // must run and succeed; pass 2 (evict) must NOT fire.
+        let budget = small.len() + (big.len() - small.len()) / 2;
+        let mut msgs = vec![img_msg(big)];
+        fit_image_payload_to(&mut msgs, budget);
+        assert!(
+            outgoing_image_b64_bytes(&msgs) <= budget,
+            "should fit budget"
+        );
+        let ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(bs),
+            ..
+        } = &msgs[0].content[0]
+        else {
+            panic!("expected tool-result blocks");
+        };
+        assert!(
+            matches!(bs[0], ToolResultBlock::Image { .. }),
+            "image kept (not evicted)"
+        );
+    }
+
+    /// Regression for the Lazada false negative: a 108 KB browser snapshot
+    /// spilled, the model was shown 2 KB of page chrome, and it reported that
+    /// the product the user could see on screen did not exist. Three things
+    /// have to hold for that not to repeat — the excerpt is no longer a cliff,
+    /// the text says what fraction it is, and the path it names is one the
+    /// sandbox will actually open.
+    #[test]
+    fn truncated_tool_output_is_readable_and_declares_what_it_hid() {
+        let _g = crate::kms::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("THCLAWS_PROJECT_ROOT").ok();
+        std::env::set_var("THCLAWS_PROJECT_ROOT", dir.path());
+        crate::sandbox::Sandbox::init().unwrap();
+
+        let big = "x".repeat(TOOL_RESULT_CONTEXT_LIMIT * 2);
+        let out = maybe_truncate_to_disk(&big);
+
+        crate::sandbox::Sandbox::reset();
+        match prev {
+            Some(v) => std::env::set_var("THCLAWS_PROJECT_ROOT", v),
+            None => std::env::remove_var("THCLAWS_PROJECT_ROOT"),
+        }
+
+        // The excerpt is the same ceiling an untruncated result gets, not 2 KB.
+        assert!(
+            out.len() > TOOL_RESULT_CONTEXT_LIMIT,
+            "excerpt collapsed to {} bytes — the 2 KB cliff is back",
+            out.len()
+        );
+        // It states the fraction rather than only the total.
+        assert!(
+            out.contains("you are seeing"),
+            "got: {}",
+            &out[out.len() - 400..]
+        );
+        assert!(
+            out.contains("Do NOT conclude something is absent"),
+            "must warn against reading absence into an excerpt"
+        );
+        // And the spill lands inside the workspace, where Read is allowed.
+        assert!(
+            out.contains(".thclaws/state/tool-output"),
+            "spill must sit inside the sandbox root, not the system temp dir"
+        );
+    }
+
+    /// Keeps the newest N and drops the rest. The count matters because a
+    /// resumed session replays old truncation footers into context, so a
+    /// pruned-away path becomes a dead reference the model may try to Read.
+    #[test]
+    fn tool_output_prune_keeps_the_newest_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("state/tool-output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Written oldest-first, with mtimes spread so the ordering is real
+        // rather than whatever the filesystem happens to return.
+        let n = TOOL_OUTPUT_KEEP + 5;
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let p = out.join(format!("tool-{i}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+            paths.push(p);
+        }
+
+        prune_tool_output_dir(dir.path());
+
+        let left = std::fs::read_dir(&out).unwrap().count();
+        assert_eq!(left, TOOL_OUTPUT_KEEP, "should keep exactly the cap");
+        // The newest survive, the oldest are gone.
+        assert!(paths[n - 1].exists(), "newest file must survive");
+        assert!(!paths[0].exists(), "oldest file must be pruned");
+    }
+
+    /// Under the cap, nothing is touched — and a workspace that never
+    /// spilled has no such directory at all, which must not panic.
+    #[test]
+    fn tool_output_prune_is_a_noop_below_the_cap_and_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        prune_tool_output_dir(dir.path()); // no directory — must not panic
+
+        let out = dir.path().join("state/tool-output");
+        std::fs::create_dir_all(&out).unwrap();
+        for i in 0..3 {
+            std::fs::write(out.join(format!("tool-{i}.txt")), "x").unwrap();
+        }
+        prune_tool_output_dir(dir.path());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 3);
+    }
+
+    /// A result under the limit must still pass through completely untouched.
+    #[test]
+    fn small_tool_output_is_not_truncated() {
+        let small = "just a short result".to_string();
+        assert_eq!(maybe_truncate_to_disk(&small), small);
+    }
+
+    #[test]
+    fn fit_payload_evicts_when_shrink_insufficient() {
+        use crate::types::{ContentBlock, ToolResultBlock, ToolResultContent};
+        // Budget 0 → even after shrinking nothing fits → all images evicted.
+        let mut msgs = vec![
+            img_msg(b64_png(800, 600)),
+            img_msg(b64_png(800, 600)),
+            img_msg(b64_png(800, 600)),
+        ];
+        fit_image_payload_to(&mut msgs, 0);
+        assert_eq!(outgoing_image_b64_bytes(&msgs), 0, "no image bytes remain");
+        for m in &msgs {
+            let ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(bs),
+                ..
+            } = &m.content[0]
+            else {
+                panic!("expected tool-result blocks");
+            };
+            assert!(
+                matches!(bs[0], ToolResultBlock::Text { .. }),
+                "evicted to a text placeholder"
+            );
+        }
+    }
+
+    // ── Builder semantics ──────────────────────────────────────────────
+
+    /// Issue #72: settings.json `maxTokens` was parsed but never reached
+    /// the wire because every Agent::new call site dropped to the
+    /// hardcoded 8192 default. Verify the default + that with_max_tokens
+    /// overrides it.
+    #[test]
+    fn agent_default_max_tokens_is_8192_and_with_max_tokens_overrides() {
+        struct NoopProvider;
+        #[async_trait]
+        impl Provider for NoopProvider {
+            async fn stream(&self, _req: crate::providers::StreamRequest) -> Result<EventStream> {
+                unreachable!("not invoked in this test")
+            }
+        }
+        let agent = Agent::new(
+            Arc::new(NoopProvider),
+            crate::tools::ToolRegistry::new(),
+            "test",
+            "system",
+        );
+        assert_eq!(agent.max_tokens, 8192);
+        let agent = agent.with_max_tokens(2048);
+        assert_eq!(agent.max_tokens, 2048);
+    }
+
+    // ── Layer-2 plan reminder shape tests (M4.1) ───────────────────────
+    //
+    // Pure-function tests on `build_plan_reminder` — they don't touch
+    // global state, just feed a `Plan` snapshot in and assert the
+    // resulting string mentions / hides the right things.
+
+    fn step(
+        id: &str,
+        title: &str,
+        description: &str,
+        status: crate::tools::plan_state::StepStatus,
+    ) -> crate::tools::plan_state::PlanStep {
+        crate::tools::plan_state::PlanStep {
+            id: id.into(),
+            title: title.into(),
+            description: description.into(),
+            status,
+            note: None,
+            output: None,
+        }
+    }
+
+    fn make_plan(steps: Vec<crate::tools::plan_state::PlanStep>) -> crate::tools::plan_state::Plan {
+        crate::tools::plan_state::Plan {
+            id: "plan-test".into(),
+            steps,
+        }
+    }
+
+    #[test]
+    fn reminder_layer2_hides_descriptions_for_remaining_steps() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step(
+                "s1",
+                "Scaffold project",
+                "scaffold detail",
+                StepStatus::Done,
+            ),
+            step(
+                "s2",
+                "Install deps",
+                "install detail HIDE FROM MODEL",
+                StepStatus::InProgress,
+            ),
+            step(
+                "s3",
+                "Configure Vite",
+                "vite detail SHOULD-NOT-LEAK",
+                StepStatus::Todo,
+            ),
+            step(
+                "s4",
+                "Add tests",
+                "tests detail ALSO-HIDDEN",
+                StepStatus::Todo,
+            ),
+        ]);
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan)).unwrap();
+
+        // Current step's description IS shown.
+        assert!(
+            r.contains("install detail HIDE FROM MODEL"),
+            "current step description must appear: {r}"
+        );
+
+        // Future steps' descriptions are NOT shown (titles only).
+        assert!(
+            !r.contains("vite detail SHOULD-NOT-LEAK"),
+            "step 3 description leaked: {r}"
+        );
+        assert!(
+            !r.contains("tests detail ALSO-HIDDEN"),
+            "step 4 description leaked: {r}"
+        );
+
+        // Future steps' titles ARE shown so the model knows the shape.
+        assert!(r.contains("Configure Vite"), "step 3 title missing: {r}");
+        assert!(r.contains("Add tests"), "step 4 title missing: {r}");
+
+        // Already-complete tally line.
+        assert!(r.contains("Already complete:"));
+        assert!(r.contains("1. Scaffold project"));
+
+        // Per-step protocol references the focus step's id.
+        assert!(
+            r.contains("UpdatePlanStep(\"s2\""),
+            "protocol must name the focus step id: {r}"
+        );
+    }
+
+    #[test]
+    fn reminder_layer2_picks_failed_step_as_focus() {
+        use crate::tools::plan_state::StepStatus;
+        let mut s2 = step("s2", "Install deps", "doesn't matter", StepStatus::Failed);
+        s2.note = Some("ENOTFOUND registry.npmjs.org".into());
+        let plan = make_plan(vec![
+            step("s1", "Scaffold", "", StepStatus::Done),
+            s2,
+            step("s3", "Configure", "", StepStatus::Todo),
+        ]);
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan)).unwrap();
+
+        assert!(r.contains("Failed step"), "failed status hint missing: {r}");
+        assert!(
+            r.contains("ENOTFOUND registry"),
+            "failure note missing: {r}"
+        );
+        // Model is told to wait for user retry/skip/abort, not to call UpdatePlanStep.
+        assert!(
+            r.contains("user retry / skip / abort"),
+            "retry hint missing: {r}"
+        );
+    }
+
+    #[test]
+    fn reminder_layer2_all_done_wraps_up() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "A", "", StepStatus::Done),
+            step("s2", "B", "", StepStatus::Done),
+        ]);
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan)).unwrap();
+        assert!(r.contains("all steps complete"));
+        assert!(r.contains("Wrap up"));
+        // No per-step protocol — nothing to do.
+        assert!(!r.contains("UpdatePlanStep("));
+    }
+
+    #[test]
+    fn reminder_plan_mode_with_no_plan_tells_model_to_explore() {
+        let r = build_plan_reminder(PermissionMode::Plan, None).unwrap();
+        assert!(r.contains("Plan mode is active"));
+        assert!(r.contains("Read / Grep"));
+        assert!(r.contains("SubmitPlan"));
+        assert!(r.contains("Do NOT call TodoWrite"));
+    }
+
+    #[test]
+    fn reminder_plan_mode_includes_step_quality_guidance() {
+        // The (Plan, no plan) reminder should give the model concrete
+        // guidance on what makes a good plan — this is the cure for
+        // the bug where the model wrote a single "Build and run the
+        // webapp" step that hid which half failed. Each of these
+        // checks asserts a specific guidance dimension is present.
+        let r = build_plan_reminder(PermissionMode::Plan, None).unwrap();
+
+        // M6.5: step count is no longer capped at 3–10. The
+        // split-until-atomic rule replaces it. The cap was actively
+        // making plans worse — models bundled actions to fit the
+        // window. Now the test asserts the cap is GONE and the
+        // three-rule decomposition test is present.
+        assert!(
+            !r.contains("3–10") && !r.contains("3-10"),
+            "step-count cap should be removed: {r}",
+        );
+        assert!(
+            r.contains("as many as needed"),
+            "no-cap step-count guidance missing: {r}",
+        );
+        assert!(
+            r.contains("ONE action") && r.contains("ONE shell-runnable verification"),
+            "split-until-atomic three-rule test missing: {r}",
+        );
+        assert!(
+            r.contains("PRESERVED across the next step"),
+            "preservation rule missing: {r}",
+        );
+
+        // Floor: 1-step plan isn't a plan.
+        assert!(
+            r.contains("at least 2 steps"),
+            "floor of 2 steps missing: {r}",
+        );
+
+        // No-combination rule, the user's specific ask: build and run
+        // must be separate steps.
+        assert!(
+            r.contains("Build-and-run") || r.contains("\"Build and run\" is TWO steps"),
+            "build-and-run separation rule missing: {r}",
+        );
+
+        // M6.5: Bash-runnable verifications.
+        assert!(
+            r.contains("Verifications must be shell-runnable"),
+            "shell-runnable rule missing: {r}",
+        );
+        assert!(
+            r.contains("NO human-eye checks"),
+            "no-human-eye rule missing: {r}",
+        );
+
+        // M6.5: long-running servers are not verifications.
+        assert!(
+            r.contains("Long-running processes are NOT verifications"),
+            "no-long-running-server rule missing: {r}",
+        );
+
+        // M6.5: no bootstrap-then-overwrite.
+        assert!(
+            r.contains("No bootstrap-then-overwrite"),
+            "bootstrap-overwrite rule missing: {r}",
+        );
+
+        // M6.5: default to canonical scaffolders.
+        assert!(
+            r.contains("canonical scaffolders"),
+            "canonical-scaffolder rule missing: {r}",
+        );
+        assert!(
+            r.contains("interactive TTY prompt"),
+            "interactive-prompt warning missing: {r}",
+        );
+
+        // M6.5: cross-step artifacts named.
+        assert!(
+            r.contains("Name cross-step artifacts"),
+            "cross-step-artifacts rule missing: {r}",
+        );
+
+        // ACTUALLY RUN the verification.
+        assert!(
+            r.contains("ACTUALLY RUN the verification"),
+            "must actually run verify, not just declare it: {r}",
+        );
+
+        // Failure-path guidance: don't paper over.
+        assert!(
+            r.contains("Don't paper over") || r.contains("don't paper over"),
+            "no-paper-over rule missing: {r}",
+        );
+
+        // M6.5: ask-when-stack-undetermined is REQUIRED.
+        assert!(
+            r.contains("AskUserQuestion is REQUIRED"),
+            "required-ask rule missing: {r}",
+        );
+    }
+
+    #[test]
+    fn reminder_plan_mode_includes_pre_submission_audit() {
+        // M6.5: After drafting the plan, the model should run a
+        // self-audit before calling SubmitPlan. This was added because
+        // a real test session shipped a plan that bundled actions and
+        // had un-shell-runnable verifications — the audit catches
+        // those before the user has to.
+        let r = build_plan_reminder(PermissionMode::Plan, None).unwrap();
+
+        assert!(
+            r.contains("Audit BEFORE calling SubmitPlan"),
+            "pre-submission audit section missing: {r}",
+        );
+
+        // Each of the seven audit checks should appear by name.
+        for needle in [
+            "Goal coverage",
+            "Atomic steps",
+            "Bash-runnable verifications",
+            "Cross-step dependencies named",
+            "No throwaway steps",
+            "No long-running servers as verifications",
+            "Stack decisions made",
+        ] {
+            assert!(
+                r.contains(needle),
+                "audit checklist item missing: {needle:?} not in: {r}",
+            );
+        }
+
+        // The audit should be presented as a gate, not advisory.
+        assert!(
+            r.contains("revise — don't submit a plan you wouldn't approve yourself"),
+            "audit gate framing missing: {r}",
+        );
+    }
+
+    #[test]
+    fn reminder_per_step_protocol_includes_verification_step() {
+        // The Layer-2 narrowed view used during execution should also
+        // remind the model to run the verification before marking
+        // done. Surface guidance for both InProgress and Todo states.
+        use crate::tools::plan_state::StepStatus;
+
+        let plan_in_progress = make_plan(vec![step(
+            "s1",
+            "Build the project",
+            "cargo build --release. Verify exits 0.",
+            StepStatus::InProgress,
+        )]);
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan_in_progress)).unwrap();
+        assert!(
+            r.contains("Run the verification before marking done"),
+            "verify-then-done missing for in_progress: {r}"
+        );
+        assert!(
+            r.contains("Don't paper over"),
+            "no-paper-over missing for in_progress: {r}"
+        );
+
+        let plan_todo = make_plan(vec![step(
+            "s1",
+            "Run the tests",
+            "cargo test. Verify all pass.",
+            StepStatus::Todo,
+        )]);
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan_todo)).unwrap();
+        assert!(
+            r.contains("Run the verification"),
+            "verify-step missing for todo: {r}"
+        );
+    }
+
+    #[test]
+    fn reminder_plan_mode_with_plan_tells_model_to_wait() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "A", "", StepStatus::Todo),
+            step("s2", "B", "", StepStatus::Todo),
+        ]);
+        let r = build_plan_reminder(PermissionMode::Plan, Some(&plan)).unwrap();
+        assert!(r.contains("awaiting user approval"));
+        assert!(r.contains("2 steps"));
+    }
+
+    #[test]
+    fn reminder_plan_mode_with_all_done_plan_falls_back_to_explore_reminder() {
+        // M6.9 (Bug C1): an all-done plan still in the slot when the
+        // user re-enters plan mode should NOT trigger "awaiting user
+        // approval" — that plan finished. The (Plan, all-done) case
+        // recurses to (Plan, None) and returns the
+        // explore-then-SubmitPlan reminder so the model treats it as
+        // a fresh planning phase.
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "Build", "", StepStatus::Done),
+            step("s2", "Test", "", StepStatus::Done),
+        ]);
+        let r = build_plan_reminder(PermissionMode::Plan, Some(&plan)).unwrap();
+        assert!(
+            !r.contains("awaiting user approval"),
+            "all-done plan must NOT trigger awaiting-approval reminder: {r}",
+        );
+        assert!(
+            r.contains("Plan mode is active"),
+            "must fall through to the (Plan, None) explore reminder: {r}",
+        );
+        assert!(
+            r.contains("SubmitPlan"),
+            "must invite the model to submit a fresh plan: {r}",
+        );
+    }
+
+    #[test]
+    fn reminder_no_plan_no_mode_returns_none() {
+        assert!(build_plan_reminder(PermissionMode::Auto, None).is_none());
+        assert!(build_plan_reminder(PermissionMode::Ask, None).is_none());
+    }
+
+    // ── M6.1 per-step continuation prompt shape tests ──────────────────
+
+    #[test]
+    fn step_continuation_prompt_first_attempt_is_terse_and_directive() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "Scaffold project", "", StepStatus::Done),
+            step(
+                "s2",
+                "Install deps",
+                "Run `npm install`. Verify: lockfile exists.",
+                StepStatus::Todo,
+            ),
+            step("s3", "Build", "", StepStatus::Todo),
+        ]);
+        let p = build_step_continuation_prompt(&plan, &plan.steps[1], 1);
+
+        // Names the step position and title so the model knows which
+        // step is in scope.
+        assert!(p.contains("step 2/3"), "missing position/total: {p}");
+        assert!(p.contains("Install deps"), "missing step title: {p}");
+
+        // Includes the in_progress transition for a Todo step.
+        assert!(
+            p.contains("UpdatePlanStep(\"s2\", \"in_progress\")"),
+            "missing begin transition: {p}",
+        );
+        // Mentions the done/failed terminal transitions.
+        assert!(
+            p.contains("\"done\"") && p.contains("\"failed\""),
+            "missing terminal transitions: {p}",
+        );
+
+        // First-attempt prompt should NOT include the escalation
+        // language about retry budgets — that's reserved for higher
+        // attempt counts.
+        assert!(
+            !p.contains("attempts per step"),
+            "first-attempt prompt should not warn about retry budget: {p}",
+        );
+    }
+
+    #[test]
+    fn step_continuation_prompt_in_progress_step_skips_begin_transition() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "Already running", "do work", StepStatus::InProgress),
+            step("s2", "Next", "", StepStatus::Todo),
+        ]);
+        let p = build_step_continuation_prompt(&plan, &plan.steps[0], 1);
+
+        // Don't ask the model to mark in_progress when it's already
+        // in_progress — wastes a tool call and confuses the gate.
+        assert!(
+            !p.contains("\"in_progress\""),
+            "in_progress step should not be told to begin again: {p}",
+        );
+        assert!(
+            p.contains("already on this step"),
+            "missing in-progress hint: {p}"
+        );
+        // Still mentions terminal transitions.
+        assert!(p.contains("\"done\""));
+        assert!(p.contains("\"failed\""));
+    }
+
+    #[test]
+    fn step_continuation_prompt_escalates_on_repeated_attempts() {
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![step(
+            "s1",
+            "Build release",
+            "cargo build --release",
+            StepStatus::InProgress,
+        )]);
+        let p2 = build_step_continuation_prompt(&plan, &plan.steps[0], 2);
+
+        // Escalation must mention the attempt number and the bounded
+        // retry budget — that's the whole reason this prompt exists.
+        assert!(p2.contains("attempt 2"), "missing attempt number: {p2}");
+        assert!(
+            p2.contains("attempts per step"),
+            "missing budget warning: {p2}"
+        );
+        assert!(
+            p2.contains("Failed automatically"),
+            "must tell model the driver will force-Failed: {p2}",
+        );
+        // Retry / Skip / Abort path is the user's recovery contract;
+        // the model needs to know its "failed with note" call is the
+        // honest path forward.
+        assert!(
+            p2.contains("retry / skip / abort") || p2.contains("Retry") || p2.contains("user"),
+            "must reference user recovery path: {p2}",
+        );
+    }
+
+    // ── M6.3 step-output surfacing ─────────────────────────────────────
+
+    #[test]
+    fn step_continuation_prompt_surfaces_prior_step_outputs() {
+        // A 3-step plan where steps 1 and 2 are Done with outputs;
+        // step 3 is the focus. Both prior outputs must appear in the
+        // prompt so the model can read them without relying on chat
+        // history (which gets compacted in M6.2).
+        use crate::tools::plan_state::StepStatus;
+        let mut s1 = step("s1", "Generate user id", "", StepStatus::Done);
+        s1.output = Some("user-id: abc-123".into());
+        let mut s2 = step("s2", "Hash password", "", StepStatus::Done);
+        s2.output = Some("hash: $argon2id$xyz".into());
+        let s3 = step("s3", "Persist to db", "", StepStatus::Todo);
+        let plan = make_plan(vec![s1, s2, s3]);
+
+        let p = build_step_continuation_prompt(&plan, &plan.steps[2], 1);
+
+        assert!(
+            p.contains("Outputs from prior steps"),
+            "section header missing: {p}"
+        );
+        assert!(p.contains("user-id: abc-123"), "step 1 output missing: {p}");
+        assert!(
+            p.contains("hash: $argon2id$xyz"),
+            "step 2 output missing: {p}"
+        );
+    }
+
+    #[test]
+    fn step_continuation_prompt_omits_outputs_section_when_none() {
+        // No prior outputs → no section header in the prompt (clean
+        // signal-to-noise: don't surface an empty rubric).
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "Done", "", StepStatus::Done), // no output set
+            step("s2", "Focus", "", StepStatus::Todo),
+        ]);
+        let p = build_step_continuation_prompt(&plan, &plan.steps[1], 1);
+        assert!(
+            !p.contains("Outputs from prior steps"),
+            "section should be elided when empty: {p}",
+        );
+    }
+
+    #[test]
+    fn step_continuation_prompt_excludes_failed_step_outputs() {
+        // A Failed step's `output` (if any was set before it failed)
+        // is NOT a stable cross-step contract — surface only Done
+        // step outputs.
+        use crate::tools::plan_state::StepStatus;
+        let mut s1 = step("s1", "Tried something", "", StepStatus::Failed);
+        s1.output = Some("partial-result-DO-NOT-USE".into());
+        let s2 = step("s2", "Focus", "", StepStatus::Todo);
+        let plan = make_plan(vec![s1, s2]);
+
+        let p = build_step_continuation_prompt(&plan, &plan.steps[1], 1);
+        assert!(
+            !p.contains("partial-result-DO-NOT-USE"),
+            "failed step output must not leak into prompt: {p}",
+        );
+    }
+
+    #[test]
+    fn execution_reminder_surfaces_prior_step_outputs() {
+        // Same M6.3 surfacing in the system reminder that the agent
+        // injects every turn — keeps prior outputs visible even when
+        // the user prompt slot is occupied by the current turn's
+        // dialog.
+        use crate::tools::plan_state::StepStatus;
+        let mut s1 = step("s1", "Build artifact", "", StepStatus::Done);
+        s1.output = Some("path: target/release/foo".into());
+        let s2 = step("s2", "Run tests", "", StepStatus::InProgress);
+        let plan = make_plan(vec![s1, s2]);
+
+        let r = build_plan_reminder(PermissionMode::Auto, Some(&plan)).unwrap();
+        assert!(
+            r.contains("Outputs from prior steps"),
+            "system reminder must surface outputs: {r}",
+        );
+        assert!(
+            r.contains("path: target/release/foo"),
+            "step 1 output missing in reminder: {r}",
+        );
+    }
+
+    // ── M6.6 todos.md reminder tests ───────────────────────────────────
+
+    /// Helper: run a closure with cwd switched into a temp dir so
+    /// build_todos_reminder reads from the test's controlled location.
+    /// Restores cwd afterwards. Tests are run sequentially within
+    /// agent::tests so cwd contention is bounded; if this becomes a
+    /// hot spot, we'd add a Mutex like plan_state's test_lock.
+    fn with_cwd<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        // Serialise via the crate-wide env lock (kms::test_env_lock) so
+        // we don't race against kms/plugins/context/config tests that
+        // mutate the same process-global cwd/HOME. A local Mutex here
+        // wouldn't coordinate with those modules and the prompt-builder
+        // tests would intermittently read whichever cwd happened to be
+        // active when their two refresh calls fired.
+        let _g = crate::kms::test_env_lock();
+        let prior = std::env::current_dir().expect("cwd readable");
+        std::env::set_current_dir(dir).expect("cwd to test dir");
+        let out = f();
+        std::env::set_current_dir(prior).expect("cwd restore");
+        out
+    }
+
+    #[test]
+    fn todos_reminder_returns_none_when_file_missing() {
+        let tmp = tempdir().unwrap();
+        let r = with_cwd(tmp.path(), build_todos_reminder);
+        assert!(r.is_none(), "no .thclaws/state/todos.md → no reminder");
+    }
+
+    #[test]
+    fn todos_reminder_returns_none_when_file_empty() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
+        std::fs::write(tmp.path().join(".thclaws/state/todos.md"), "").unwrap();
+        let r = with_cwd(tmp.path(), build_todos_reminder);
+        assert!(r.is_none(), "empty file → no reminder");
+    }
+
+    #[test]
+    fn todos_reminder_returns_none_when_all_completed() {
+        // A list where everything is checked off shouldn't nag the
+        // model — there's nothing to resume.
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
+        std::fs::write(
+            tmp.path().join(".thclaws/state/todos.md"),
+            "# Todos\n\n- [x] Done thing (id: 1)\n- [x] Other done thing (id: 2)\n",
+        )
+        .unwrap();
+        let r = with_cwd(tmp.path(), build_todos_reminder);
+        assert!(r.is_none(), "all-completed list → no reminder");
+    }
+
+    #[test]
+    fn todos_reminder_surfaces_pending_items() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
+        std::fs::write(
+            tmp.path().join(".thclaws/state/todos.md"),
+            "# Todos\n\n- [ ] Add tests (id: 1)\n- [-] Fix bug (id: 2)\n- [x] Old task (id: 3)\n",
+        )
+        .unwrap();
+        let r = with_cwd(tmp.path(), build_todos_reminder).expect("reminder fires");
+        // Header naming the file path so the model sees what the source is.
+        assert!(
+            r.contains(".thclaws/state/todos.md"),
+            "missing file path: {r}"
+        );
+        // Anti-ask framing — the rule that gpt-4.1 violated in the
+        // M6.6 manual test.
+        assert!(
+            r.contains("before asking the user")
+                || r.contains("before asking what")
+                || r.contains("Don't ask"),
+            "missing anti-ask framing: {r}",
+        );
+        // Surfaces the actual list contents verbatim.
+        assert!(
+            r.contains("Add tests"),
+            "pending item missing in reminder: {r}"
+        );
+        assert!(
+            r.contains("Fix bug"),
+            "in_progress item missing in reminder: {r}"
+        );
+        // Tells the model how to act — flip via TodoWrite.
+        assert!(
+            r.contains("TodoWrite"),
+            "must point at TodoWrite for the action: {r}"
+        );
+        assert!(
+            r.contains("in_progress") || r.contains("resume"),
+            "must mention resume/in_progress flow: {r}",
+        );
+    }
+
+    #[test]
+    fn todos_reminder_fires_when_only_one_in_progress_item() {
+        // Edge case: a single `[-]` (in_progress) item with everything
+        // else `[x]` should still fire — the user paused mid-task.
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
+        std::fs::write(
+            tmp.path().join(".thclaws/state/todos.md"),
+            "# Todos\n\n- [x] Done (id: 1)\n- [-] Halfway (id: 2)\n",
+        )
+        .unwrap();
+        let r = with_cwd(tmp.path(), build_todos_reminder).expect("must fire");
+        assert!(r.contains("Halfway"), "in_progress item must surface: {r}");
+    }
+
+    #[test]
+    fn step_continuation_prompt_no_op_for_done_or_failed_steps() {
+        // The driver shouldn't be calling this for Done/Failed steps,
+        // but be defensive — the prompt must not pretend to drive the
+        // model on a step it shouldn't touch.
+        use crate::tools::plan_state::StepStatus;
+        let plan = make_plan(vec![
+            step("s1", "Done step", "", StepStatus::Done),
+            step("s2", "Failed step", "", StepStatus::Failed),
+        ]);
+        let pd = build_step_continuation_prompt(&plan, &plan.steps[0], 1);
+        let pf = build_step_continuation_prompt(&plan, &plan.steps[1], 1);
+
+        // Neither prompt should issue a UpdatePlanStep("in_progress")
+        // call — Done is terminal, Failed is awaiting user action.
+        assert!(
+            !pd.contains("\"in_progress\""),
+            "Done step should not be re-started: {pd}"
+        );
+        assert!(
+            !pf.contains("\"in_progress\""),
+            "Failed step requires explicit user retry: {pf}"
+        );
+    }
+
+    /// A provider impl that plays back pre-canned event sequences, one per
+    /// call to `stream()`. Panics (via error) if the test runs out of scripts.
+    struct ScriptedProvider {
+        scripts: Arc<Mutex<VecDeque<Vec<ProviderEvent>>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(scripts: Vec<Vec<ProviderEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn stream(&self, _req: StreamRequest) -> Result<EventStream> {
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| Error::Provider("no more scripts".into()))?;
+            let events: Vec<Result<ProviderEvent>> = script.into_iter().map(Ok).collect();
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    fn text_script(chunks: &[&str]) -> Vec<ProviderEvent> {
+        let mut out = vec![ProviderEvent::MessageStart {
+            model: "test".into(),
+        }];
+        for c in chunks {
+            out.push(ProviderEvent::TextDelta((*c).to_string()));
+        }
+        out.push(ProviderEvent::ContentBlockStop);
+        out.push(ProviderEvent::MessageStop {
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+        });
+        out
+    }
+
+    fn tool_script(id: &str, name: &str, args_json: &str) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::MessageStart {
+                model: "test".into(),
+            },
+            ProviderEvent::ToolUseStart {
+                id: id.into(),
+                name: name.into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: args_json.into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ]
+    }
+
+    /// Two tool_use blocks in a single assistant message.
+    fn two_tool_script(n1: &str, id1: &str, n2: &str, id2: &str) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::MessageStart {
+                model: "test".into(),
+            },
+            ProviderEvent::ToolUseStart {
+                id: id1.into(),
+                name: n1.into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::ToolUseStart {
+                id: id2.into(),
+                name: n2.into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn parallelizable_tools_run_concurrently() {
+        use crate::tools::Tool;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// Records the high-water mark of concurrent `call()` bodies.
+        ///
+        /// The earlier version of this test timed the turn and asserted it
+        /// finished under 330 ms — a wall-clock bound on a loaded CI runner,
+        /// which is a flake waiting to happen. Counting overlap answers the
+        /// same question ("did these two actually run at the same time?")
+        /// without depending on how fast the machine is.
+        struct SleepyTool {
+            live: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for SleepyTool {
+            fn name(&self) -> &'static str {
+                "Sleep"
+            }
+            fn description(&self) -> &'static str {
+                "sleeps"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn parallelizable(&self) -> bool {
+                true
+            }
+            async fn call(&self, _input: Value) -> Result<String> {
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                // Long enough that a sequential runner could not have both
+                // bodies in flight at once, short enough not to slow the suite.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok("slept".into())
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SleepyTool {
+            live: live.clone(),
+            peak: peak.clone(),
+        }));
+        let provider = ScriptedProvider::new(vec![
+            two_tool_script("Sleep", "t1", "Sleep", "t2"),
+            text_script(&["done"]),
+        ]);
+        let agent = Agent::new(provider, reg, "test", "");
+
+        let outcome = collect_agent_turn(agent.run_turn("go".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "done");
+        assert_eq!(
+            outcome.tool_calls,
+            vec!["Sleep".to_string(), "Sleep".to_string()]
+        );
+        // Both bodies in flight at once is the whole claim. A sequential
+        // runner never gets the counter above 1, however slow the machine is.
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "peak concurrency was {} — the two Sleep calls did not overlap",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "a Sleep call never finished"
+        );
+
+        // Results land in tool_use order regardless of completion order.
+        let history = agent.history_snapshot();
+        let trmsg = &history[2];
+        let ids: Vec<String> = trmsg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn text_only_turn_returns_combined_text() {
+        let provider = ScriptedProvider::new(vec![text_script(&["Hello, ", "world!"])]);
+        let agent = Agent::new(provider, ToolRegistry::new(), "test-model", "");
+
+        let outcome = collect_agent_turn(agent.run_turn("hi".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "Hello, world!");
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(outcome.iterations, 1);
+        assert!(outcome.tool_calls.is_empty());
+
+        let history = agent.history_snapshot();
+        // user → assistant
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].role, Role::Assistant);
+    }
+
+    #[tokio::test]
+    async fn tool_use_executes_and_continues_next_iteration() {
+        // Turn 1: assistant requests Read. Turn 2: assistant returns text.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, "the contents\n").unwrap();
+
+        let args = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Read", &args),
+            text_script(&["I read: the contents."]),
+        ]);
+
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test-model", "");
+
+        let outcome = collect_agent_turn(agent.run_turn("read it".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "I read: the contents.");
+        assert_eq!(outcome.tool_calls, vec!["Read".to_string()]);
+        assert_eq!(outcome.iterations, 2);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+
+        // History: user(hi), assistant(tool_use), user(tool_result), assistant(text)
+        let history = agent.history_snapshot();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].role, Role::Assistant);
+        assert!(matches!(
+            history[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert_eq!(history[2].role, Role::User);
+        assert!(matches!(
+            history[2].content[0],
+            ContentBlock::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
+        assert_eq!(history[3].role, Role::Assistant);
+    }
+
+    /// A skill's `model:` recommendation routinely names another
+    /// backend's model — `extract-and-save` asks for `gpt-4.1-nano`
+    /// while the user sits on DeepSeek. Swapping only the model string
+    /// posted OpenAI's id to DeepSeek's endpoint, which answered "model
+    /// not found" for `deepseek/gpt-4.1-nano`.
+    #[test]
+    fn a_swapped_model_from_another_backend_needs_its_own_provider() {
+        use crate::providers::ProviderKind;
+        assert_eq!(
+            cross_provider_kind(Some(ProviderKind::DeepSeek), "gpt-4.1-nano"),
+            Some(ProviderKind::OpenAI),
+            "the reported bug: DeepSeek session, OpenAI recommendation"
+        );
+        // Same backend → nothing to build; the model string alone is right.
+        assert_eq!(
+            cross_provider_kind(Some(ProviderKind::OpenAI), "gpt-4.1-nano"),
+            None
+        );
+        assert_eq!(
+            cross_provider_kind(Some(ProviderKind::DeepSeek), "deepseek-chat"),
+            None
+        );
+        // Unrecognisable model → keep the session provider rather than
+        // guessing a backend for it.
+        assert_eq!(
+            cross_provider_kind(Some(ProviderKind::DeepSeek), "some-local-thing"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_error_surfaces_as_tool_result_is_error_and_loop_continues() {
+        // Tool is Read with a path that doesn't exist → Tool error.
+        // Then the scripted provider emits a final text turn acknowledging.
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Read", r#"{"path":"/nope/does/not/exist"}"#),
+            text_script(&["handled the error"]),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test-model", "");
+
+        let outcome = collect_agent_turn(agent.run_turn("try it".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "handled the error");
+        assert_eq!(outcome.iterations, 2);
+
+        let history = agent.history_snapshot();
+        let tool_result_msg = &history[2];
+        if let ContentBlock::ToolResult {
+            is_error, content, ..
+        } = &tool_result_msg.content[0]
+        {
+            assert!(*is_error, "expected is_error=true for failed tool");
+            let text = content.to_text();
+            assert!(text.contains("error:"), "got: {text}");
+        } else {
+            panic!("expected tool_result block");
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_mode_approves_and_runs_mutating_tool() {
+        use crate::permissions::{PermissionMode, ScriptedApprover};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "hello",
+        })
+        .to_string();
+
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Write", &args),
+            text_script(&["done"]),
+        ]);
+        let approver = ScriptedApprover::new(vec![ApprovalDecision::Allow]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Ask)
+            .with_approver(approver);
+
+        let outcome = collect_agent_turn(agent.run_turn("write it".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done");
+        assert_eq!(outcome.tool_calls, vec!["Write".to_string()]);
+        assert!(outcome.tool_denials.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn ask_mode_denies_and_surfaces_error_result() {
+        use crate::permissions::{DenyApprover, PermissionMode};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "hello",
+        })
+        .to_string();
+
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Write", &args),
+            text_script(&["ack"]),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Ask)
+            .with_approver(Arc::new(DenyApprover));
+
+        let outcome = collect_agent_turn(agent.run_turn("write it".into()))
+            .await
+            .unwrap();
+
+        // Write never executed:
+        assert!(!path.exists());
+        // Denial was surfaced:
+        assert_eq!(outcome.tool_denials, vec!["Write".to_string()]);
+        // M6.17 BUG L1: ToolCallStart fires at parse time (before the
+        // approval gate), so denied calls now appear in tool_calls
+        // alongside tool_denials. Pre-fix this asserted empty because
+        // the start event came AFTER approval; the new contract is
+        // "tool_calls = parsed-from-model", "tool_denials = of those,
+        // which were rejected".
+        assert_eq!(outcome.tool_calls, vec!["Write".to_string()]);
+
+        // The tool_result block in history should be is_error=true with a "denied" marker.
+        let history = agent.history_snapshot();
+        let tool_result_msg = history.iter().find_map(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if *is_error => Some(content.clone()),
+                _ => None,
+            })
+        });
+        let content = tool_result_msg.expect("denied tool_result not in history");
+        let text = content.to_text();
+        assert!(text.contains("denied"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn ask_mode_skips_approval_for_read_only_tools() {
+        use crate::permissions::{DenyApprover, PermissionMode};
+        use tempfile::tempdir;
+
+        // Write a file so Read has something to see.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        std::fs::write(&path, "payload").unwrap();
+        let args = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+
+        // DenyApprover would deny any tool that requires approval, but Read
+        // is read-only so the approver should never be consulted.
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Read", &args),
+            text_script(&["ok"]),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Ask)
+            .with_approver(Arc::new(DenyApprover));
+
+        let outcome = collect_agent_turn(agent.run_turn("read it".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.tool_calls, vec!["Read".to_string()]);
+        assert!(outcome.tool_denials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_bypasses_approver_entirely() {
+        use crate::permissions::{DenyApprover, PermissionMode};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto.txt");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "ok",
+        })
+        .to_string();
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Write", &args),
+            text_script(&["done"]),
+        ]);
+        // DenyApprover would veto — but Auto mode should never consult it.
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Auto)
+            .with_approver(Arc::new(DenyApprover));
+
+        let _ = collect_agent_turn(agent.run_turn("write".into()))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn ask_tools_forces_approval_under_auto() {
+        use crate::permissions::{DenyApprover, PermissionMode};
+        use tempfile::tempdir;
+
+        // Auto mode would normally never consult the approver — but a tool
+        // named in `askTools` must still hit the gate. DenyApprover vetoes,
+        // so the Write must NOT land and the call is recorded as a denial.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gated.txt");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "should-not-write",
+        })
+        .to_string();
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Write", &args),
+            text_script(&["done"]),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Auto)
+            .with_ask_tools(vec!["Write".to_string()])
+            .with_approver(Arc::new(DenyApprover));
+
+        let outcome = collect_agent_turn(agent.run_turn("write".into()))
+            .await
+            .unwrap();
+        assert!(!path.exists(), "askTools should have gated the Write");
+        assert_eq!(outcome.tool_denials, vec!["Write".to_string()]);
+    }
+
+    // M6.20 BUG M1 regression note: the TodoWrite plan-mode block
+    // (agent.rs:1133 area) now fires BEFORE the generic mutating-tool
+    // block, so the model gets the SubmitPlan-specific message instead
+    // of the generic "Use Read/Grep/Glob/Ls" one. A behavioral test
+    // would need to set `permissions::current_mode()` to Plan, which
+    // races other tests reading the same global slot — so this fix is
+    // verified by source inspection + manual repro rather than a
+    // dedicated unit test. The cross-test pollution would cause flakes
+    // in `permission_denied_in_ask_mode_emits_denial_event` and
+    // similar tests that depend on `current_mode() == Ask`.
+
+    #[tokio::test]
+    async fn max_iterations_short_circuits_runaway_loops() {
+        // Infinite tool loop: every script turn returns a tool_use.
+        let loop_script = || tool_script("toolu_loop", "Read", r#"{"path":"/nope"}"#);
+        let provider = ScriptedProvider::new(vec![
+            loop_script(),
+            loop_script(),
+            loop_script(),
+            loop_script(),
+            loop_script(),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test-model", "")
+            .with_max_iterations(2);
+
+        let outcome = collect_agent_turn(agent.run_turn("loop".into()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.iterations, 2);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("max_iterations"));
+    }
+
+    /// M6.18 BUG H1: compaction now subtracts the system-prompt size
+    /// from the budget before trimming messages, so a large system
+    /// prompt + budget-filling history can't push the total request
+    /// past the model's context window. Pre-fix `compact()` was
+    /// called with the full budget, so a 50K system prompt + 128K
+    /// "fitted" messages = 178K request that 400'd on a 128K-context
+    /// model.
+    ///
+    /// We probe the deduction via a fake provider that captures the
+    /// inbound StreamRequest's message-token total. The system prompt
+    /// is sized to consume most of the budget; messages should be
+    /// trimmed accordingly.
+    #[tokio::test]
+    async fn compact_subtracts_system_prompt_tokens_from_budget() {
+        use std::sync::Mutex;
+
+        // Capture the messages count of every StreamRequest the
+        // provider receives.
+        struct CapturingProvider {
+            captured_messages: Arc<Mutex<Vec<usize>>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(req.messages.len());
+                // Single-text response, no tool use → end of turn.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("ok".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            captured_messages: captured.clone(),
+        });
+
+        // Build an Agent with a big system prompt and small budget.
+        // budget=1000 tokens, system≈800 tokens → messages_budget ≈ 200.
+        let big_system = "x".repeat(3200); // ~800 tokens at 4 chars/token
+        let mut agent = Agent::new(provider, ToolRegistry::default(), "test-model", big_system);
+        agent.budget_tokens = 1000;
+
+        // Pre-load history with a multi-turn conversation that, naively
+        // counted, would fit in 1000 tokens but won't fit once we
+        // subtract 800 + 1024 reserve. Expect compact to drop most.
+        let pre = vec![
+            Message::user("a".repeat(200)),
+            Message::assistant("b".repeat(200)),
+            Message::user("c".repeat(200)),
+            Message::assistant("d".repeat(200)),
+            Message::user("trigger"),
+        ];
+        agent.set_history(pre);
+
+        let _ = collect_agent_turn(agent.run_turn("noop".into())).await;
+
+        let counts = captured.lock().unwrap().clone();
+        assert!(
+            !counts.is_empty(),
+            "provider should have received a request"
+        );
+        // Pre-fix this would be 6 (5 history + 1 new user msg = full
+        // history sent unchanged because compact got the full 1000-
+        // token budget). Post-fix: messages_budget is negative-clamped
+        // to 0, so compact aggressively drops to the minimum (1 msg).
+        assert!(
+            counts[0] <= 2,
+            "expected aggressive compaction (≤2 messages); got {} — system prompt deduction not applied",
+            counts[0]
+        );
+    }
+
+    /// M6.17 BUG H1 + M3: when a cancel token is wired in and gets
+    /// fired during the retry-backoff sleep, the agent stream errors
+    /// out with a "cancelled by user" message instead of waiting the
+    /// full 1+2+4 = 7 s backoff cycle. Pre-fix the sleep blocked
+    /// uninterruptibly.
+    #[tokio::test]
+    async fn cancel_during_retry_sleep_short_circuits() {
+        // Provider that always returns a transient error so the agent
+        // hits the retry path on every attempt.
+        struct AlwaysErrProvider;
+        #[async_trait]
+        impl Provider for AlwaysErrProvider {
+            async fn stream(&self, _req: crate::providers::StreamRequest) -> Result<EventStream> {
+                Err(Error::Provider("transient".into()))
+            }
+        }
+
+        let token = crate::cancel::CancelToken::new();
+        let agent = Agent::new(
+            Arc::new(AlwaysErrProvider),
+            ToolRegistry::default(),
+            "test-model",
+            "",
+        )
+        .with_cancel(token.clone());
+
+        // Fire cancel after 100 ms so it hits during the first
+        // 1-second backoff sleep (well before the would-be 7s total).
+        let token_for_cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            token_for_cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = collect_agent_turn(agent.run_turn("hi".into())).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected agent stream to error after cancellation"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("cancelled"),
+            "expected cancel message, got: {msg}"
+        );
+        // Without the fix, this would be ~7 s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel didn't short-circuit the retry backoff (took {elapsed:?})",
+        );
+    }
+
+    /// A 404 "Model not exist" is answered once, not after 1+2+4 s of
+    /// identical retries. (No 5xx case here: its backoff would hold the
+    /// process-wide gateway turn open for seconds and race
+    /// `gateway_turn::tests`; `only_lasting_client_errors_skip_the_retry`
+    /// covers the classification.)
+    #[tokio::test]
+    async fn permanent_4xx_is_not_retried() {
+        struct StatusErrProvider {
+            msg: &'static str,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for StatusErrProvider {
+            async fn stream(&self, _req: crate::providers::StreamRequest) -> Result<EventStream> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Error::Provider(self.msg.into()))
+            }
+        }
+        for (msg, want_calls) in [
+            ("http 404 Not Found: {\"error\":\"Model not exist\"}", 1),
+            ("http 400 Bad Request: model not activated", 1),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent::new(
+                Arc::new(StatusErrProvider {
+                    msg,
+                    calls: calls.clone(),
+                }),
+                ToolRegistry::default(),
+                "test-model",
+                "",
+            );
+            let result = collect_agent_turn(agent.run_turn("hi".into())).await;
+            assert!(result.is_err(), "{msg}");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                want_calls,
+                "{msg}"
+            );
+        }
+    }
+
+    /// Setting `next_turn_chunk_timeout` before `run_turn` causes the
+    /// resulting `StreamRequest` to carry that override, and the slot
+    /// is cleared once the turn ends so the next turn starts at the
+    /// global default.
+    #[tokio::test]
+    async fn next_turn_chunk_timeout_flows_into_request_and_clears() {
+        struct OverrideCapturingProvider {
+            captured: Arc<Mutex<Vec<Option<std::time::Duration>>>>,
+        }
+        #[async_trait]
+        impl Provider for OverrideCapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push(req.stream_chunk_timeout_override);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("ok".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<Option<std::time::Duration>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(OverrideCapturingProvider {
+            captured: captured.clone(),
+        });
+        let agent = Agent::new(provider, ToolRegistry::default(), "test-model", "");
+
+        // Turn 1: mark the next turn as long-running. The captured
+        // request should carry the override.
+        agent.set_next_turn_chunk_timeout(std::time::Duration::from_secs(900));
+        let _ = collect_agent_turn(agent.run_turn("first".into())).await;
+        // Turn 2: no override set — should be back to None.
+        let _ = collect_agent_turn(agent.run_turn("second".into())).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            2,
+            "expected one StreamRequest per turn, got {got:?}"
+        );
+        assert_eq!(got[0], Some(std::time::Duration::from_secs(900)));
+        assert_eq!(
+            got[1], None,
+            "override should clear after the first turn ends"
+        );
+    }
+
+    /// dev-plan/55 step 3 — the wire boundary, end to end. Unit-testing the
+    /// masker proves the helpers; this proves the choke point is in the right
+    /// place, which is the part that would actually leak. Two halves:
+    /// the provider must never see the phone number, and the user must never
+    /// see the placeholder — including when the model splits one across
+    /// stream chunks, which is the failure mode a naive per-chunk replace
+    /// would ship silently.
+    #[tokio::test]
+    async fn masking_hides_pii_from_the_provider_and_restores_it_locally() {
+        use std::sync::Mutex;
+        let _pin = crate::sensitive::pin_for_test();
+
+        struct CapturingProvider {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                let flat: String = req
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.seen.lock().unwrap().push(flat);
+                // Echo the placeholder back, split mid-token across two
+                // deltas the way a real stream would.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("โทรกลับที่ [PHO".into())),
+                    Ok(ProviderEvent::TextDelta("NE_1] ได้เลย".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::new(
+            Arc::new(CapturingProvider { seen: seen.clone() }),
+            ToolRegistry::default(),
+            "test-model",
+            "",
+        );
+
+        // Force a fresh masker so placeholder numbering is deterministic
+        // regardless of what other tests left in the process-wide map.
+        crate::sensitive::configure(false, Vec::new());
+        crate::sensitive::configure(true, Vec::new());
+        let out = collect_agent_turn(agent.run_turn("โทรหาผมที่ 081-234-5678 นะครับ".into())).await;
+        crate::sensitive::configure(false, Vec::new());
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            !sent.contains("081-234-5678"),
+            "phone number reached the provider: {sent}"
+        );
+        assert!(sent.contains("[PHONE_1]"), "not masked at all: {sent}");
+
+        let text = out.expect("turn should succeed").text;
+        assert!(
+            text.contains("081-234-5678"),
+            "reply not restored locally: {text}"
+        );
+        assert!(
+            !text.contains("PHONE_1"),
+            "placeholder leaked into the reply: {text}"
+        );
+        // The reader has to be able to tell a restored value from something
+        // the model actually knew.
+        assert!(
+            text.contains(crate::sensitive::MARK_OPEN),
+            "restored value not marked for the reader: {text}"
+        );
+
+        // History keeps plaintext, which is what makes turn 2 safe: it
+        // re-masks from the real value instead of shipping a stale copy.
+        let history = agent.history_snapshot();
+        let last = history.last().expect("assistant message");
+        let stored: String = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stored.contains("081-234-5678") && !stored.contains("PHONE_1"),
+            "history should hold plaintext, got {stored:?}"
+        );
+        assert!(
+            !stored.contains(crate::sensitive::MARK_OPEN),
+            "display marker persisted into history: {stored:?}"
+        );
+    }
+
+    /// The masker must stay off unless the user turns it on — a privacy
+    /// feature that silently rewrites prompts by default would be worse
+    /// than not shipping it.
+    #[tokio::test]
+    async fn masking_is_off_unless_configured() {
+        let _pin = crate::sensitive::pin_for_test();
+        crate::sensitive::configure(false, Vec::new());
+        assert!(crate::sensitive::active().is_none());
+        // Multiuser refuses to arm even when the setting says yes: one
+        // shared worker, one process-wide map, several members.
+        crate::workdir::set_multiuser(true);
+        crate::sensitive::configure(true, Vec::new());
+        let armed_under_multiuser = crate::sensitive::active().is_some();
+        crate::workdir::set_multiuser(false);
+        crate::sensitive::configure(false, Vec::new());
+        assert!(
+            !armed_under_multiuser,
+            "masking must not arm under multiuser"
+        );
+    }
+}

@@ -1,0 +1,2364 @@
+//! Desktop GUI mode: wry webview serving the embedded React frontend.
+//!
+//! The React dist/ is embedded at compile time via `include_str!` and
+//! served via a wry custom protocol (`thclaws://`). We intentionally
+//! avoid `with_html` because WebView2's `NavigateToString` caps payloads
+//! at 2 MB on Windows and our inlined bundle is ~3 MB — it would panic
+//! at build-time with `HRESULT(0x80070057) "parameter is incorrect"`.
+//! A single `SharedSession` (in `crate::shared_session`) owns one Agent
+//! and one Session that both the Terminal and Chat tabs render. Both
+//! tabs send user input via the `shell_input` IPC; both subscribe to a
+//! broadcast event stream that this module fans out to chat-shaped and
+//! terminal-shaped frontend dispatches.
+//!
+//! Only compiled when the `gui` feature is enabled.
+
+#![cfg(feature = "gui")]
+
+use crate::config::AppConfig;
+use crate::event_render::{
+    render_chat_dispatches, render_gui_shell_dispatch, render_terminal_ansi,
+    terminal_data_envelope, terminal_history_replaced_envelope, TerminalRenderState,
+};
+use crate::session::SessionStore;
+use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
+use std::borrow::Cow;
+use std::sync::Arc;
+use tao::dpi::LogicalSize;
+#[cfg(target_os = "macos")]
+use tao::event::ElementState;
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use tao::keyboard::{Key, ModifiersState};
+use tao::window::WindowBuilder;
+use wry::http::Response;
+use wry::WebViewBuilder;
+
+// Linux-only wry/tao extensions: WebKit2GTK can't be attached to a raw
+// window handle the way AppKit (macOS) and WebView2 (Windows) can —
+// it's a GTK widget that has to be packed into a GTK container. Without
+// these, `builder.build(&window)` panics at startup with
+// `UnsupportedWindowHandle` on every Linux build (reported on Ubuntu
+// 22.04). `default_vbox()` (from `WindowExtUnix`) gives us the GTK box
+// owned by the tao window, and `build_gtk` (from `WebViewBuilderExtUnix`)
+// is the Linux-only constructor that takes a GTK container.
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
+#[cfg(target_os = "linux")]
+use wry::WebViewBuilderExtUnix;
+
+// Native cross-platform file/dialog crates — replace the per-platform
+// shell-out paths (osascript / zenity / PowerShell) used by
+// pick_directory_native and the Windows branch of native_confirm.
+// Backported from public repo (commits 0c592ab + 7339bc0) so Windows
+// users get a working folder picker + confirm dialog via Win32 instead
+// of a brittle PowerShell escape-fest. native_dialog is only consulted
+// from the Windows branch of native_confirm; gate its import too so
+// macOS/Linux builds don't warn about unused imports.
+#[cfg(target_os = "windows")]
+use native_dialog::{DialogBuilder, MessageLevel};
+use rfd::FileDialog;
+
+/// Embed the single-file React frontend (JS+CSS inlined by vite-plugin-singlefile).
+const FRONTEND_HTML: &str = include_str!("../../../frontend/dist/index.html");
+
+enum UserEvent {
+    /// Generic frontend dispatch — payload is a complete JSON message
+    /// the frontend's `__thclaws_dispatch` will parse and route.
+    Dispatch(String),
+    SendInitialState,
+    /// Pre-M6.36 there were also `SessionListRefresh`, `FileTree`,
+    /// `SessionLoaded` variants — the consumer arms in the event
+    /// loop treated all four identically (escape + evaluate_script
+    /// the dispatch). After SERVE9k migrated their construction
+    /// sites to handle_ipc (which calls `ctx.dispatch`, wired here
+    /// to `Dispatch(String)`), only the legacy gui-only handlers
+    /// (`pick_directory`, `confirm`) still emit a typed variant —
+    /// `SessionLoaded` survives for those.
+    SessionLoaded(String),
+    FileContent(String),
+    QuitRequested,
+    /// GUI `/reload`: persist the current window size (so the re-exec
+    /// restores it, not the last size saved on a normal close) then
+    /// re-exec the binary. Routed through the loop because the size
+    /// lives here, not in the shell dispatcher that runs `/reload`.
+    ReloadRequested,
+    /// Settings → Appearance changed `guiScale`. Carries the new
+    /// (clamped) factor so the event loop can apply it via
+    /// `webview.zoom()` without re-reading config. Issue #47.
+    ZoomChanged(f64),
+}
+
+// MAX_RECENT_DIRS moved to crate::recent_dirs.
+
+// ── Event translator ────────────────────────────────────────────────
+// Subscribes to the SharedSession's broadcast channel and fans each
+// ViewEvent out to two frontend dispatches: a chat-shaped JSON message
+// (`chat_text_delta`, `chat_tool_call`, `chat_history_replaced`, …)
+// and a terminal-shaped one (`terminal_data` carrying base64 ANSI
+// bytes). Both tabs subscribe to their respective shapes and render
+// the same conversation.
+
+fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<UserEvent>) {
+    let mut rx = handle.subscribe();
+    std::thread::spawn(move || {
+        // tokio runtime so we can `.recv().await` on the broadcast.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("translator runtime");
+        rt.block_on(async move {
+            let mut term_state = TerminalRenderState::default();
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        // /quit confirmed by the worker — forward to
+                        // the tao event loop so the window runs the
+                        // same save-and-exit path as the close button
+                        // (#52). No chat / terminal rendering needed.
+                        if matches!(ev, ViewEvent::QuitRequested) {
+                            let _ = proxy.send_event(UserEvent::QuitRequested);
+                            continue;
+                        }
+                        if matches!(ev, ViewEvent::ReloadRequested) {
+                            let _ = proxy.send_event(UserEvent::ReloadRequested);
+                            continue;
+                        }
+                        for dispatch in render_chat_dispatches(&ev) {
+                            let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
+                        }
+                        // dev-plan/33 Tier 1: also emit a gui_shell_event
+                        // for any active shell iframes. The shell shares
+                        // this session in Tier 1, so this is effectively
+                        // a third rendering of the same stream — Chat and
+                        // Terminal still get their events as before.
+                        if let Some(dispatch) = render_gui_shell_dispatch(&ev) {
+                            let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
+                        }
+                        if let Some(ansi) = render_terminal_ansi(&mut term_state, &ev) {
+                            // HistoryReplaced needs a distinct envelope
+                            // so the frontend always re-renders the
+                            // prompt at the end — empty-history loads
+                            // (new session / loaded session with no
+                            // messages) otherwise leave the terminal
+                            // with no `❯ ` and the user has to press a
+                            // key before they realize it's responsive.
+                            let envelope = if matches!(ev, ViewEvent::HistoryReplaced(_)) {
+                                terminal_history_replaced_envelope(&ansi)
+                            } else {
+                                terminal_data_envelope(&ansi)
+                            };
+                            let _ = proxy.send_event(UserEvent::Dispatch(envelope));
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer dropped events; log the drop so it's
+                        // diagnosable (issue #163 Bug 1) — a full re-sync
+                        // would need agent access; the next live event keeps
+                        // state roughly in sync.
+                        eprintln!("[event_forwarder:gui] lagged: dropped {n} events");
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    });
+}
+
+// csv_table_tests moved to crate::file_preview::tests in M6.36 SERVE9k
+// alongside the function they exercise.
+
+/// Convert a markdown string to a full standalone HTML document so the
+/// Files-tab iframe can render it without any client-side markdown
+/// library. GFM extensions are enabled (tables, task lists,
+/// strikethrough, autolinks); raw HTML in the source is stripped
+/// (`render.unsafe_ = false`) so `<script>` in a `.md` file we're
+/// previewing can't escape the iframe sandbox.
+/// Convert a CSV string to a GFM markdown pipe-table so the comrak
+/// renderer (which has the `table` extension on) emits a proper grid.
+/// First row is treated as the header. Pipe characters in cells are
+/// escaped (`\|`) so they don't break the row structure. Empty input
+// csv_to_markdown_table + render_markdown_to_html + ospath migrated
+// to crate::file_preview (M6.36 SERVE9i); their gui.rs arms (file_*)
+// now live in crate::ipc::handle_ipc, so the re-imports here became
+// dead and were removed in SERVE9k.
+//
+// build_sso_state_payload migrated to crate::sso::build_state_payload
+// (M6.36 SERVE9h); same disposition.
+
+/// Show a native OS confirmation dialog. Returns `true` on affirmative.
+///
+/// Same shell-out pattern as `pick_directory_native`: osascript on macOS,
+/// zenity on Linux, PowerShell/MessageBox on Windows — no extra crate
+/// dependency. Blocks the calling thread until the user dismisses the
+/// dialog, so this MUST be called from the IPC worker thread, never
+/// from the tao event loop.
+///
+/// Windows MessageBox enforces "Yes"/"No" labels; `yes_label`/`no_label`
+/// are only honoured on macOS and Linux, with the message text carrying
+/// the intent on Windows.
+/// Trusting a folder lets its settings run code, so on the desktop it takes
+/// a native dialog: a gui-shell sharing the page's origin can press the
+/// banner's button, not this.
+fn confirm_trust(dir: &std::path::Path) -> bool {
+    native_confirm(
+        "ไว้ใจโฟลเดอร์นี้",
+        &crate::ipc::trust_prompt_text(dir),
+        "ไว้ใจ",
+        "ไม่ตอนนี้",
+    )
+}
+
+pub(crate) fn native_confirm(title: &str, message: &str, yes_label: &str, no_label: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" buttons {{\"{}\", \"{}\"}} default button \"{}\"",
+            esc(message),
+            esc(title),
+            esc(no_label),
+            esc(yes_label),
+            esc(yes_label),
+        );
+        match std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.contains(&format!("button returned:{yes_label}"))
+            }
+            _ => false,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                title,
+                "--text",
+                message,
+                "--ok-label",
+                yes_label,
+                "--cancel-label",
+                no_label,
+            ])
+            .status()
+        {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // MessageBox button labels are fixed ("Yes"/"No") by the OS; the
+        // message string has to carry the yes/no semantics. Prefix the
+        // user's label onto the message so they know which button does
+        // what. Backported from public repo (commit 7339bc0): replaces
+        // PowerShell shell-out with the `native_dialog` crate, dodging
+        // PowerShell's quote-escaping quirks.
+        let prompt = format!("{}\n\nYes = {}   No = {}", message, yes_label, no_label,);
+        DialogBuilder::message()
+            .set_level(MessageLevel::Info)
+            .set_title(title)
+            .set_text(prompt)
+            .confirm()
+            .show()
+            .unwrap_or(false)
+    }
+}
+
+/// Open a native OS directory picker dialog. Returns the selected path or
+/// `None` if the user cancelled. Backported from public repo (commit
+/// 0c592ab): replaces the per-platform shell-out (osascript / zenity /
+/// PowerShell `FolderBrowserDialog`) with the `rfd` crate, which calls
+/// the same OS APIs natively. Eliminates dependence on `osascript` /
+/// `zenity` being installed and PowerShell quote-escaping bugs.
+fn pick_directory_native(start_dir: &str, title: &str) -> Option<String> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        FileDialog::new()
+            .set_title(title)
+            .set_directory(start_dir)
+            .pick_folder()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = title;
+        None
+    }
+}
+
+// build_session_list removed in M6.36 SERVE9k — its only callers were
+// the migrated session_rename / session_delete / config_poll arms.
+// crate::shared_session::build_session_list (the worker-side variant
+// that includes current_id) is still consumed by the worker loop.
+
+// provider_has_credentials / kind_has_credentials moved to
+// crate::providers in M6.36 SERVE9e so the WS transport can share the
+// same readiness logic. Re-import here to keep gui.rs's existing call
+// sites compiling unchanged. kind_has_credentials migrated to
+// handle_ipc; the SendInitialState builder uses provider_has_credentials.
+use crate::providers::provider_has_credentials;
+
+/// Resolve the AGENTS.md path for the Settings → Instructions editor.
+/// `scope="global"` → `~/.config/thclaws/AGENTS.md`, `scope="folder"` →
+/// `./AGENTS.md` in the current working directory.
+// instructions_path moved to crate::instructions in M6.36 SERVE9d.
+// instructions_path migrated; arms removed in SERVE9k.
+
+/// Per-server tool count, populated when `McpReady` fires in the worker loop.
+/// Keyed by server name; value is the number of tools the server exposed.
+static MCP_TOOL_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn mcp_tool_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    MCP_TOOL_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the tool count for a connected MCP server. Called from the
+/// `McpReady` handler in `shared_session.rs` so `build_mcp_update_payload`
+/// can surface real counts instead of zeros.
+pub(crate) fn update_mcp_tool_count(server_name: &str, count: usize) {
+    if let Ok(mut map) = mcp_tool_counts().lock() {
+        map.insert(server_name.to_string(), count);
+    }
+}
+
+/// Wipe every stored MCP tool count. Used by `ChangeCwd` before the
+/// new project's MCP servers respawn — a same-named server in the
+/// new project would otherwise display the old project's tool count
+/// until its own `McpReady` event lands.
+pub(crate) fn clear_mcp_tool_counts() {
+    if let Ok(mut map) = mcp_tool_counts().lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.clear();
+    }
+}
+
+/// Why a configured MCP server isn't online, keyed by server name.
+/// `McpFailed` used to only print an error line into the transcript,
+/// which scrolls away — a Connectors surface has to be able to answer
+/// "this one is configured but not working, and here's why" at any
+/// later moment.
+static MCP_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn mcp_failures() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    MCP_FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record why `server_name` failed to come online.
+pub(crate) fn record_mcp_failure(server_name: &str, error: &str) {
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.insert(server_name.to_string(), error.to_string());
+    }
+}
+
+/// Forget a server's failure — it connected, or it was removed.
+pub(crate) fn clear_mcp_failure(server_name: &str) {
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.remove(server_name);
+    }
+}
+
+/// Snapshot of `(name, error)` for every server currently in a failed
+/// state.
+pub(crate) fn mcp_failure_snapshot() -> std::collections::HashMap<String, String> {
+    mcp_failures().lock().map(|m| m.clone()).unwrap_or_default()
+}
+
+/// Snapshot of `(name, tool_count)` for every server that connected.
+pub(crate) fn mcp_tool_count_snapshot() -> std::collections::HashMap<String, usize> {
+    mcp_tool_counts()
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default()
+}
+
+/// Build the `[{name, tools}]` array that the sidebar consumes for
+/// the MCP servers list. Shared by `build_mcp_update_payload` AND
+/// by both `initial_state` builders (`gui.rs` desktop bootstrap +
+/// `server.rs` serve-mode WS connect) so every surface ships real
+/// counts. Pre-fix the initial-state builders hardcoded `tools: 0`,
+/// which wiped any cached counts on every WS reconnect (issue #86).
+///
+/// `config.mcp_servers` already merges user-level
+/// (`~/.config/thclaws/mcp.json`) and project-level
+/// (`.thclaws/mcp.json` / `.mcp.json` / `.claude/mcp.json`) scopes
+/// per `AppConfig::load` — project overrides user by name. Both
+/// scopes flow through unchanged here.
+///
+/// Plugin-contributed servers are appended (config wins on a name
+/// clash), mirroring the merge the worker does before spawning. The
+/// worker has spawned them since the tool-parity fix, so omitting them
+/// here listed fewer servers than the session actually had running.
+pub(crate) fn build_mcp_servers_payload(
+    config: &crate::config::AppConfig,
+) -> Vec<serde_json::Value> {
+    let counts = mcp_tool_counts().lock().unwrap_or_else(|e| e.into_inner());
+    let mut merged = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !merged.iter().any(|s| s.name == p_mcp.name) {
+            merged.push(p_mcp);
+        }
+    }
+    merged
+        .iter()
+        .map(|s| {
+            let tool_count = counts.get(&s.name).copied().unwrap_or(0);
+            serde_json::json!({"name": s.name, "tools": tool_count})
+        })
+        .collect()
+}
+
+/// Build the `mcp_update` IPC payload: the configured MCP servers for
+/// this session (read fresh from disk so removals via `/mcp remove` are
+/// reflected immediately, not after a restart). Tool counts come from
+/// `MCP_TOOL_COUNTS`, which is updated by the `McpReady` worker event
+/// once each server successfully connects and lists its tools.
+pub(crate) fn build_mcp_update_payload() -> serde_json::Value {
+    let config = crate::config::AppConfig::load().unwrap_or_default();
+    let servers = build_mcp_servers_payload(&config);
+    serde_json::json!({
+        "type": "mcp_update",
+        "servers": servers,
+    })
+}
+
+/// Build the `kms_update` IPC payload: every discoverable KMS tagged with
+/// whether it's currently attached to this project.
+// build_kms_update_payload moved to crate::kms::build_update_payload
+// in M6.36 SERVE9c. Re-export the old name as a thin alias so existing
+// gui.rs callers (kms_list / kms_toggle / kms_new arms still here, the
+// SendInitialState builder) keep compiling unchanged.
+pub(crate) fn build_kms_update_payload() -> serde_json::Value {
+    crate::kms::build_update_payload()
+}
+
+/// Build the `research_update` IPC payload (M6.39.3). Snapshot of every
+/// research job in newest-first order, shaped for the sidebar panel.
+/// Called by the `ResearchManager` broadcaster on every state-mutating
+/// method, plus once at session bootstrap so a fresh frontend gets a
+/// non-empty payload if jobs survived a soft refresh.
+pub(crate) fn build_research_update_payload() -> serde_json::Value {
+    let jobs = crate::research::manager().list();
+    serde_json::json!({
+        "type": "research_update",
+        "jobs": jobs.iter().map(research_job_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn research_job_to_json(j: &crate::research::JobView) -> serde_json::Value {
+    serde_json::json!({
+        "id": j.id,
+        "status": j.status.as_str(),
+        "phase": j.phase,
+        "query": j.query,
+        "iterations_done": j.iterations_done,
+        "source_count": j.source_count,
+        "last_score": j.last_score,
+        "kms_target": j.kms_target,
+        "result_page": j.result_page,
+        "error": j.error,
+        "retry_command": j.retry_command,
+        "cost_usd": j.cost_usd,
+        "pages_written": j.pages_written,
+        "started_at": j.started_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok(),
+        "finished_at": j.finished_at
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+    })
+}
+
+fn escape_for_js(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\0', "\\0")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Resolve a `/gui-shell/<id>/<rel>` request against the embedded
+/// registry and return the asset bytes (HTML responses get the bridge
+/// `<script>` injected). Used by the custom-protocol handler.
+fn serve_gui_shell_asset(
+    registry: &crate::gui_shell::ShellRegistry,
+    rest: &str,
+) -> Response<Cow<'static, [u8]>> {
+    // rest = "<id>/<path>", "<id>/" or "<id>". A bare id or trailing slash
+    // (empty asset path) defaults to index.html — mirrors the cloud `--serve`
+    // route, and is what the Windows desktop hits: the WebView runs from
+    // http://thclaws.localhost/, so UIView takes the http branch and emits
+    // `gui-shell/<id>/?session=…` with no explicit index.html (#183).
+    let decoded = urlencoding::decode(rest)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| rest.to_string());
+    let mut parts = decoded.splitn(2, '/');
+    let shell_id = parts.next().unwrap_or("");
+    let rel = match parts.next().unwrap_or("") {
+        "" => "index.html",
+        r => r,
+    };
+
+    let Some(shell) = registry.resolve(shell_id) else {
+        return Response::builder()
+            .status(404)
+            .body(Cow::Borrowed(&b"unknown shell"[..]))
+            .expect("build 404");
+    };
+
+    let (bytes, mime) = match shell.read_asset(rel) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return Response::builder()
+                .status(404)
+                .body(Cow::Borrowed(&b"asset not found"[..]))
+                .expect("build 404");
+        }
+    };
+
+    let body: Cow<'static, [u8]> = if mime.starts_with("text/html") {
+        // Inline the bridge (don't `<script src="thclaws://…">` it): on Windows
+        // the WebView runs from http://thclaws.localhost/, where the `thclaws://`
+        // scheme doesn't resolve, so an external bridge script fails to load and
+        // `window.thclaws` is undefined — breaking every shell (empty model
+        // dropdowns, dead tabs; #184). Inlining works on macOS + Windows alike.
+        //
+        // The shell runs in an opaque-origin iframe (UIView's sandbox has no
+        // allow-same-origin), so its own CSS and JS are inlined here exactly
+        // as the `--serve` mount does: a module script or font loaded from
+        // `thclaws://` by a "null" origin is a CORS request.
+        let inlined = crate::gui_shell::serve::inline_shell_assets(&bytes, &shell);
+        Cow::Owned(crate::gui_shell::serve::inject_inline_bridge_with_id(
+            &inlined, shell_id,
+        ))
+    } else {
+        Cow::Owned(bytes)
+    };
+
+    Response::builder()
+        .header("Content-Type", mime)
+        .header("X-Content-Type-Options", "nosniff")
+        // What the inlining misses (an image read with fetch, a font, a
+        // dynamic import) is requested from the shell's opaque origin. These
+        // are the shell's own files, already served to the window.
+        .header("Access-Control-Allow-Origin", "*")
+        .body(body)
+        .expect("build gui-shell asset response")
+}
+
+/// Inject `<script src="thclaws://localhost/gui-shell-bridge.js"></script>`
+/// at the start of `<head>`. Superseded by the inlining path
+/// (`gui_shell::serve::inject_inline_bridge_with_id`) which also works on the
+/// Windows http://thclaws.localhost/ WebView where `thclaws://` can't load
+/// (#184); kept for reference.
+#[allow(dead_code)]
+fn inject_bridge_script(html: &[u8]) -> Vec<u8> {
+    // Bridge (external, custom-protocol asset) + the shared theme/chrome
+    // runtime inlined right after it — same head injection in every serve
+    // path (Mode A here, Mode B/C in gui_shell::serve).
+    let mut tag: Vec<u8> =
+        b"<script src=\"thclaws://localhost/gui-shell-bridge.js\"></script>".to_vec();
+    tag.extend_from_slice(crate::gui_shell::shared_chrome_head().as_bytes());
+    let tag = tag.as_slice();
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = find_subslice(&lower, b"<head>") {
+        let insert_at = idx + b"<head>".len();
+        let mut out = Vec::with_capacity(html.len() + tag.len());
+        out.extend_from_slice(&html[..insert_at]);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&html[insert_at..]);
+        out
+    } else if let Some(idx) = find_subslice(&lower, b"<head ") {
+        // Match `<head class="...">` etc. — insert after the closing >.
+        let after_open = html[idx..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| idx + p + 1)
+            .unwrap_or(idx);
+        let mut out = Vec::with_capacity(html.len() + tag.len());
+        out.extend_from_slice(&html[..after_open]);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&html[after_open..]);
+        out
+    } else {
+        // No head — prepend one. Wraps the bridge in <head> so a strict
+        // parser still treats the rest as body.
+        let mut out = Vec::with_capacity(html.len() + tag.len() + b"<head></head>".len());
+        out.extend_from_slice(b"<head>");
+        out.extend_from_slice(tag);
+        out.extend_from_slice(b"</head>");
+        out.extend_from_slice(html);
+        out
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersState) -> bool {
+    if event.state != ElementState::Pressed || !modifiers.super_key() {
+        return false;
+    }
+    match event.key_without_modifiers() {
+        Key::Character(ch) => ch.eq_ignore_ascii_case("q") || ch.eq_ignore_ascii_case("w"),
+        _ => false,
+    }
+}
+
+/// Whitelist external URLs to `http://` / `https://` only. Tool output is
+/// untrusted, so this rejects `file://`, `javascript:`, custom schemes,
+/// and anything that doesn't parse as a real URL — preventing a hostile
+/// MCP server from getting the user to launch arbitrary local handlers
+/// just because they clicked a link in chat.
+// is_safe_external_url + open_external_url moved to crate::external_url
+// in M6.36 SERVE9h.
+// external_url helpers migrated; open_external arm removed in SERVE9k.
+
+/// Assemble the cross-provider model list payload for the sidebar's
+/// inline picker dropdown (#49). Catalogue rows for every known
+/// provider, plus a live Ollama probe so models added via `ollama pull`
+/// after launch are visible without restart. The Ollama probe uses a
+/// short timeout — failure just falls back to whatever rows are in the
+/// baseline catalogue.
+// build_all_models_payload moved to crate::providers in M6.36 SERVE9g
+// so the WS transport's request_all_models IPC arm can call it from
+// the always-on dispatch table.
+// build_all_models_payload migrated; request_all_models removed in SERVE9k.
+
+// Persist the latest window size so the next launch restores it. Only
+// writes when the size actually changed from what's on disk — avoids a
+// no-op rewrite that would touch the file's mtime. Shared by the normal
+// close path and `/reload` (which re-execs and must save first).
+fn persist_window_size(latest_window_size: Option<(f64, f64)>) {
+    // No folder has been chosen yet — an icon launch whose picker is still
+    // unanswered. `save()` creates `.thclaws/` before it writes, so saving a
+    // window size here would leave a workspace in whatever folder the OS
+    // started us in. A size is not worth that; drop it.
+    if !crate::util::picker_answered() {
+        return;
+    }
+    if let Some((w, h)) = latest_window_size {
+        let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+        if project.window_width != Some(w) || project.window_height != Some(h) {
+            project.window_width = Some(w);
+            project.window_height = Some(h);
+            let _ = project.save();
+        }
+    }
+}
+
+fn request_gui_shutdown(
+    shared: &SharedSessionHandle,
+    control_flow: &mut ControlFlow,
+    latest_window_size: Option<(f64, f64)>,
+) {
+    persist_window_size(latest_window_size);
+    let _ = shared.input_tx.send(ShellInput::SaveAndQuit);
+    // Kill ONLY this session's teammate processes (scoped by absolute
+    // --team-dir). The old broad `pkill -f team-agent` killed teammates of
+    // other thClaws sessions/projects. Teammates run in tmux-server-owned
+    // panes, so they are NOT reclaimed when the GUI process exits — the
+    // explicit scoped kill is required.
+    crate::team::kill_my_teammates();
+    crate::audit::shutdown();
+    // Snapshot browser cookies and kill the engine-managed Chromium so
+    // it doesn't orphan — a surviving orphan breaks the next launch's
+    // playwright-mcp CDP attach ("Browser context management is not
+    // supported").
+    crate::browser_cdp::shutdown();
+    // #209/#210: agents are child processes logging into this process's pipes.
+    // Leaving first kills those pipes under them, and their next log line takes
+    // them down with an abort. Stop them and wait; a host that is not running
+    // any is a no-op.
+    if !crate::server::stop_host_agents(std::time::Duration::from_secs(5)) {
+        crate::util::log_line(
+            "\x1b[33m[host] agents did not stop within 5s — leaving anyway\x1b[0m",
+        );
+    }
+    *control_flow = ControlFlow::Exit;
+}
+/// Window size and zoom: the user's stored values, else a default picked from
+/// the primary monitor's logical resolution — roomy on workstation-class
+/// displays (>=1920x1080), conservative on laptop screens.
+fn window_geometry(monitor: Option<tao::monitor::MonitorHandle>) -> (f64, f64, f64) {
+    let big = monitor
+        .map(|m| {
+            let size = m.size();
+            let scale = m.scale_factor().max(0.0001);
+            let logical_w = size.width as f64 / scale;
+            let logical_h = size.height as f64 / scale;
+            logical_w >= 1920.0 && logical_h >= 1080.0
+        })
+        .unwrap_or(false);
+    let (default_w, default_h) = if big {
+        (1760.0, 962.0)
+    } else {
+        (1200.0, 800.0)
+    };
+    crate::config::ProjectConfig::load()
+        .map(|c| {
+            (
+                c.window_width.unwrap_or(default_w),
+                c.window_height.unwrap_or(default_h),
+                c.gui_scale.unwrap_or(1.0),
+            )
+        })
+        .unwrap_or((default_w, default_h, 1.0))
+}
+pub fn run_gui() {
+    run_gui_inner(None, None);
+}
+
+/// dev-plan/59 §7.6 step 3: the desktop window over a workspace host.
+///
+/// Everything about the window is what shipped — the `thclaws://` scheme, the
+/// IPC bridge, `FRONTEND_HTML` untouched. Only the far end of the bridge
+/// moves: the page's frames go to a bot's `--serve`, and the bot's frames
+/// come back the way the in-process engine's did. Two attempts at replacing
+/// the window's page delivery instead produced a black screen (§7.6).
+pub fn run_gui_host(addr: std::net::SocketAddr, token: &str, slug: &str) {
+    run_gui_inner(None, Some((addr, token.to_string(), slug.to_string())));
+}
+
+/// Combo entry point for `--serve --gui`: builds the desktop window and
+/// the HTTP/WebSocket server in the same process, sharing one engine.
+/// Browser tabs and the desktop window see the same conversation; tool
+/// approvals raised on the desktop apply to both.
+///
+/// Note: GuiApprover's approval-request channel is owned by the desktop
+/// window's forwarder, so today the browser surface does not get its
+/// own `approval_request` dispatches. Same trade-off as `--serve` alone,
+/// where approval forwarding is also unwired (the rx is dropped). For
+/// the combo, this means: approve on the desktop window, the action
+/// applies to whichever surface triggered it.
+pub fn run_gui_with_serve(config: crate::server::ServeConfig) {
+    run_gui_inner(Some(config), None);
+}
+
+/// M6.42: Pin WebView2's user data folder to %LOCALAPPDATA% before any wry
+/// init. The WebView2 Runtime checks this env var when creating its
+/// environment; without it, wry falls back to a `<exe>.WebView2/` sibling dir
+/// next to thclaws.exe. That sibling path is read-only when the MSI installs
+/// into C:\Program Files\, making the GUI silently SIGTERM on first launch
+/// (the binary itself runs fine — `thclaws --cli` works — but wry's webview
+/// creation fails when it can't write the user data folder). The folder is
+/// created lazily by WebView2; we just point at a writable location.
+fn pin_webview2_data_folder() {
+    #[cfg(windows)]
+    {
+        let local = std::env::var("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let data_dir = local.join(crate::profile::app_dir_name()).join("WebView2");
+        let _ = std::fs::create_dir_all(&data_dir);
+        // SAFETY: `set_var` is only unsafe in multi-threaded contexts;
+        // we're single-threaded here at process start before any tokio
+        // runtime / wry thread pool exists.
+        unsafe {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
+        }
+    }
+}
+
+/// The frame that tells the page a newer release exists.
+fn update_frame(up: &crate::update_check::Update) -> String {
+    serde_json::json!({
+        "type": "update_available",
+        "version": up.version,
+        "url": up.url,
+    })
+    .to_string()
+}
+
+/// Tell the page about a newer release.
+///
+/// Called from BOTH modes' "the page is listening now" signal, because they
+/// are not the same signal. In the classic window that is
+/// `UserEvent::SendInitialState`; in host mode it never fires at all, since
+/// the frame that would trigger it is forwarded straight to the bot — so the
+/// host watches for the page's own `frontend_ready` instead.
+///
+/// **Sent on every ready, not once per launch.** `BotShell` renders one
+/// `<App/>` while the bot list is still loading and then a different set —
+/// one per bot — when it arrives, so React unmounts the first App and mounts
+/// others in its place. A notice delivered once goes to the App that is about
+/// to be thrown away, and the replacements never learn about it. Firing per
+/// ready is also what `ipc.rs` already does with the initial-state snapshot,
+/// for exactly this reason.
+///
+/// The cached read is a file read, so the window is never waiting on the
+/// network to appear; the refresh behind it has its own once-a-day gate.
+fn dispatch_update_notice(proxy: &EventLoopProxy<UserEvent>) {
+    // Whether this fired, and what it decided, is otherwise invisible: a
+    // notice that never reaches the page looks exactly like no new release.
+    // Three launches were spent guessing between those two.
+    let debug = std::env::var("THCLAWS_UPDATE_DEBUG").ok().as_deref() == Some("1");
+    match crate::update_check::cached() {
+        Some(up) => {
+            if debug {
+                eprintln!("[update] dispatching notice for {}", up.version);
+            }
+            let _ = proxy.send_event(UserEvent::Dispatch(update_frame(&up)));
+        }
+        None if debug => eprintln!(
+            "[update] nothing cached to announce (enabled={})",
+            crate::update_check::enabled()
+        ),
+        None => {}
+    }
+    let proxy_update = proxy.clone();
+    tokio::spawn(async move {
+        if let Some(up) = crate::update_check::refresh().await {
+            let _ = proxy_update.send_event(UserEvent::Dispatch(update_frame(&up)));
+        }
+    });
+}
+
+/// Whether a bridge frame's top-level `type` is exactly `want`.
+///
+/// Structural on purpose. The frames arriving from a bot have been through
+/// `desktop::tag`, which stamps `_bot` in front of every key, so their text is
+/// `{"_bot":"main","type":…}` and no fixed string compares equal to them. A
+/// `contains` test would compare equal to a chat envelope quoting the type in
+/// the user's own text, which on this path means "anyone who types the right
+/// words restarts the host".
+fn frame_type_is(frame: &str, want: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(|t| t == want))
+        .unwrap_or(false)
+}
+
+fn run_gui_inner(
+    serve: Option<crate::server::ServeConfig>,
+    // dev-plan/59: `Some((host addr, token, bot slug))` points the IPC bridge
+    // at a bot instead of at this process's own engine.
+    host: Option<(std::net::SocketAddr, String, String)>,
+) {
+    pin_webview2_data_folder();
+
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    let (win_w, win_h, initial_zoom) = window_geometry(event_loop.primary_monitor());
+    let window = WindowBuilder::new()
+        .with_title(&crate::branding::current().name)
+        .with_inner_size(LogicalSize::new(win_w, win_h))
+        .build(&event_loop)
+        .expect("window build");
+
+    let proxy_for_ipc = proxy.clone();
+    // The desktop window is one client for the life of the process — the
+    // `dispatch` closure below is rebuilt per message, so it cannot stand in
+    // for one. The live browser view is ref-counted per viewer.
+    let gui_viewer_id = crate::ipc::next_viewer_id();
+
+    // Single shared session backing both Terminal + Chat tabs. The
+    // worker owns one Agent + Session + AppConfig and broadcasts every
+    // ViewEvent to subscribers; the event translator below fans those
+    // out as chat-shaped and terminal-shaped frontend dispatches.
+    //
+    // GuiApprover bridges the Agent's async `approve()` call to the
+    // frontend: requests go out on `approval_rx` → dispatched as
+    // `approval_request` JSON; responses come back via the
+    // `approval_response` IPC and are pushed into the approver's
+    // internal oneshot responders.
+    let (approver, mut approval_rx) = crate::permissions::GuiApprover::new();
+    let approver_for_ipc = approver.clone();
+    let shared = Arc::new(crate::shared_session::spawn_with_approver(approver.clone()));
+    // In host mode the frames come from a bot's socket, not from an engine
+    // in this process, so the translator that fans out this process's own
+    // ViewEvents must not also be running.
+    // Swappable: switching bots drops this link and opens another, which is
+    // what makes the window follow the rail without the page changing
+    // transport.
+    let bot_link: Arc<std::sync::Mutex<Option<crate::bots::desktop::BotBridge>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let host_conn = host.map(|(addr, token, slug)| {
+        let proxy_for_bot = proxy.clone();
+        *bot_link.lock().expect("bot link") = Some(crate::bots::desktop::connect(
+            addr,
+            token.clone(),
+            slug,
+            move |frame| {
+                // A bot cannot restart the host. `/reload` typed in chat is
+                // dispatched in the bot process, which has no event loop, so
+                // its ReloadRequested went nowhere. The bot marks it on the
+                // bridge and the host — the only process that can re-exec —
+                // does the work.
+                //
+                // Decided on the parsed `type`, never on a substring: every
+                // other frame is a chat envelope carrying user text, and a
+                // `contains` test would let anyone restart the host by typing
+                // the magic word. The substring is only a cheap gate so the
+                // parse stays off the hot path — `desktop::tag` has already
+                // stamped `_bot` into every frame by the time it gets here, so
+                // an exact string compare can never match.
+                if frame.contains(crate::event_render::HOST_RELOAD_FRAME_TYPE)
+                    && frame_type_is(&frame, crate::event_render::HOST_RELOAD_FRAME_TYPE)
+                {
+                    let _ = proxy_for_bot.send_event(UserEvent::ReloadRequested);
+                    return;
+                }
+                let _ = proxy_for_bot.send_event(UserEvent::Dispatch(frame));
+            },
+        ));
+        (addr, token)
+    });
+    if host_conn.is_none() {
+        spawn_event_translator(&shared, proxy.clone());
+    }
+    let bridge_for_ipc = bot_link.clone();
+    // The protocol handler serves shells and files for the bot the window
+    // is attached to. The host's cwd is the shelf — a bot's default shell
+    // (`guiShell.tabDefault`) lives under the bot, and resolving it against
+    // the shelf gave a 404 and a blank iframe the moment such a bot was
+    // opened.
+    let bridge_for_proto = bot_link.clone();
+    let host_root_for_proto = host_conn
+        .as_ref()
+        .map(|_| std::env::current_dir().unwrap_or_default());
+    let bridge_for_files = bot_link.clone();
+    let host_root_for_files = host_conn
+        .as_ref()
+        .map(|_| std::env::current_dir().unwrap_or_default());
+    let active_bot_dir = move || -> Option<std::path::PathBuf> {
+        let root = host_root_for_proto.as_ref()?;
+        let slug = bridge_for_proto
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|b| b.slug.clone())?;
+        Some(crate::bots::resolve_agent_dir(root, &slug))
+    };
+    // Where the USER's files are, which is the workspace the agent runs in —
+    // not the agent's own folder. A chapter's `../images/…` lives here, and
+    // serving it from the agent folder is how the previews came up broken.
+    let active_workspace = move || -> Option<std::path::PathBuf> {
+        let root = host_root_for_files.as_ref()?;
+        let slug = bridge_for_files
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|b| b.slug.clone())?;
+        Some(crate::bots::resolve_agent(root, &slug).0)
+    };
+    // The workspace the host serves — what the folder picker offers to
+    // change, and what a pick inside it leaves alone.
+    let host_root_for_ipc = host_conn
+        .as_ref()
+        .map(|_| std::env::current_dir().unwrap_or_default());
+    // The picker is offered once per window, not once per bot: every bot's
+    // tree asks `get_cwd` when it is first shown.
+    // #211: seeded from the answer this process chain already has, so a pick
+    // that re-execs the app does not ask again on the other side.
+    let picker_offered = Arc::new(std::sync::atomic::AtomicBool::new(
+        crate::util::picker_answered(),
+    ));
+    let picker_offered_for_ipc = picker_offered.clone();
+    let host_for_ipc = host_conn;
+    let proxy_for_bots = proxy.clone();
+    let shared_for_ipc = shared.clone();
+    let shared_for_events = shared.clone();
+    let (ask_tx, mut ask_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::tools::AskUserRequest>();
+    crate::tools::set_gui_ask_sender(Some(ask_tx));
+    let pending_asks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        u64,
+        tokio::sync::oneshot::Sender<String>,
+    >::new()));
+    let pending_asks_for_ipc = pending_asks.clone();
+
+    // Combo mode: spin up the HTTP/WS server on the active tokio runtime
+    // sharing the same engine (approver, shared session, pending asks)
+    // as the desktop window. Browser tabs land in the same conversation
+    // the user is looking at on the desktop. Errors print to stderr and
+    // the GUI keeps running — losing the server is degraded, not fatal.
+    // Per-connection ask-user broadcast for WS browsers in `--serve
+    // --gui` combo mode. Created unconditionally so the field on the
+    // server's `ServeState` is always populated; gui's ask-forwarder
+    // below ALSO publishes to it (in addition to `UserEvent::Dispatch`
+    // for wry's webview) so connected browser tabs see the question
+    // too. With no `--serve`, the channel exists but no one
+    // subscribes — harmless.
+    let (ask_broadcast, _) = tokio::sync::broadcast::channel::<String>(16);
+    let ask_broadcast_for_fwd = ask_broadcast.clone();
+
+    if let Some(serve_config) = serve {
+        let approver_for_serve = approver.clone();
+        let shared_for_serve = shared.clone();
+        let pending_asks_for_serve = pending_asks.clone();
+        let ask_broadcast_for_serve = ask_broadcast.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::server::run_with_engine(
+                serve_config,
+                approver_for_serve,
+                shared_for_serve,
+                pending_asks_for_serve,
+                ask_broadcast_for_serve,
+                None,
+            )
+            .await
+            {
+                eprintln!("\x1b[31m[serve] error: {e}\x1b[0m");
+            }
+        });
+    }
+
+    // Forwarder: AskUserQuestion tool calls -> frontend composer handoff.
+    let proxy_for_ask = proxy.clone();
+    let pending_asks_for_forwarder = pending_asks.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("ask-user forwarder runtime");
+        rt.block_on(async move {
+            while let Some(req) = ask_rx.recv().await {
+                let id = req.id;
+                let question = req.question.clone();
+                if let Ok(mut pending) = pending_asks_for_forwarder.lock() {
+                    pending.insert(id, req.response);
+                }
+                let payload = serde_json::json!({
+                    "type": "ask_user_question",
+                    "id": id,
+                    "question": question,
+                });
+                let payload_str = payload.to_string();
+                let _ = proxy_for_ask.send_event(UserEvent::Dispatch(payload_str.clone()));
+                // Also broadcast to any browser tab connected via
+                // `--serve --gui` combo mode. No-op (zero subscribers
+                // → Err dropped) when running pure desktop. This
+                // mirrors the standalone `--serve` forwarder so
+                // browsers see the question regardless of whether
+                // the desktop window is also up.
+                let _ = ask_broadcast_for_fwd.send(payload_str);
+
+                // Also render the question as ANSI in the terminal tab
+                // so users on the Terminal surface aren't left wondering
+                // why a tool stalled silently. Cyan banner + the full
+                // question body, then a "↩ switch to Chat tab to reply"
+                // hint since we don't have an inline answer affordance
+                // in the terminal yet.
+                let terminal_block = format!(
+                    "\r\n\x1b[36m─── assistant asks ─────────────────────\x1b[0m\r\n\x1b[36m{}\x1b[0m\r\n\x1b[36m─── reply via the Chat tab ─────────────\x1b[0m\r\n",
+                    question.replace('\n', "\r\n"),
+                );
+                let _ = proxy_for_ask.send_event(UserEvent::Dispatch(
+                    terminal_data_envelope(&terminal_block),
+                ));
+            }
+        });
+    });
+
+    // Forwarder: approval requests → frontend dispatches. Spawned on a
+    // dedicated tokio runtime thread so we can `await` the mpsc without
+    // blocking the main event loop.
+    let proxy_for_approval = proxy.clone();
+    let approver_for_redispatch = approver.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("approval forwarder runtime");
+        rt.block_on(async move {
+            let proxy_inner = proxy_for_approval.clone();
+            let approver_inner = approver_for_redispatch.clone();
+            // Periodic redispatch: the initial `evaluate_script` can
+            // fire before the webview finishes its first React mount,
+            // at which point `window.__thclaws_dispatch` is undefined
+            // and the call silently drops. Re-sending every second
+            // until the user responds (tracked by id on the backend)
+            // is a cheap race-proof backstop.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    let pending = approver_inner.unresolved_requests();
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    for req in pending {
+                        let payload = req.frame(true);
+                        let _ = proxy_inner.send_event(UserEvent::Dispatch(payload.to_string()));
+                    }
+                }
+            });
+            while let Some(req) = approval_rx.recv().await {
+                let payload = req.frame(true);
+                let _ = proxy_for_approval.send_event(UserEvent::Dispatch(payload.to_string()));
+            }
+        });
+    });
+
+    // Enable devtools when the env opt-in is set — lets users diagnose
+    // a blank/black screen (Inspect → Console) without us shipping a
+    // different build. Set THCLAWS_DEVTOOLS=1 and relaunch.
+    let devtools_on = std::env::var("THCLAWS_DEVTOOLS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // Windows (WebView2) exposes custom protocols as `http://<scheme>.<host>`;
+    // mac/Linux use the raw `<scheme>://<host>` form.
+    //
+    // M6.43: We tried `with_html` and `file://` workarounds for an
+    // Intel macOS 13 blank-page bug — both regressed Apple Silicon
+    // worse than they fixed Intel. The custom scheme path works on
+    // macOS 15+ (any arch) and on Apple Silicon at all recent
+    // versions. Drop pre-15 macOS support (LSMinimumSystemVersion
+    // = 15.0 in the .dmg packaging step) instead of fighting
+    // WKWebView's older module-script restrictions.
+    #[cfg(windows)]
+    let start_url = "http://thclaws.localhost/";
+    #[cfg(not(windows))]
+    let start_url = "thclaws://localhost/";
+
+    let builder = WebViewBuilder::new()
+        .with_url(start_url)
+        .with_custom_protocol("thclaws".into(), move |_webview_id, request| {
+            // File-asset route: serves on-disk files so previewed HTML
+            // can load its sibling CSS/JS with relative URLs. Example:
+            // `thclaws://localhost/file-asset/Users/jimmy/site/index.html`
+            // → reads `/Users/jimmy/site/index.html`. Every request is
+            // validated through the sandbox before hitting disk.
+            let req_path = request.uri().path();
+
+            // GUI Shell bridge runtime — served at a fixed path so every
+            // shell's injected <script src="…/gui-shell-bridge.js"> hits
+            // the same well-known URL regardless of which shell is loaded.
+            if req_path == "/gui-shell-bridge.js" {
+                return Response::builder()
+                    .header("Content-Type", "application/javascript; charset=utf-8")
+                    .body(Cow::Borrowed(crate::gui_shell::BRIDGE_RUNTIME.as_bytes()))
+                    .expect("build bridge-runtime response");
+            }
+
+            // GUI Shell asset route — `/gui-shell/<id>/<rel>`. Rebuild
+            // the registry per request so newly-installed agents and
+            // workspace cwd switches are picked up live (matches the
+            // fresh-scan the `gui_shell_list` IPC does — without this
+            // the picker would list a project shell that the protocol
+            // handler 404s, producing a blank iframe). Each shell load
+            // triggers a handful of asset requests, so the per-request
+            // FS scan stays well under the human-perceptible threshold.
+            if let Some(rest) = req_path.strip_prefix("/gui-shell/") {
+                let registry = match active_bot_dir() {
+                    Some(dir) => crate::gui_shell::ShellRegistry::new_in(&dir),
+                    None => crate::gui_shell::ShellRegistry::new(),
+                };
+                return serve_gui_shell_asset(&registry, rest);
+            }
+
+            if let Some(rest) = req_path.strip_prefix("/file-asset/") {
+                let decoded = urlencoding::decode(rest)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| rest.to_string());
+                // Before the `is_file` probe below: on Windows that probe
+                // alone sends the user's NTLM hash to a `\\host\share`.
+                if crate::sandbox::is_remote_or_device_path(&decoded)
+                    || crate::sandbox::is_remote_or_device_path(&format!("/{decoded}"))
+                {
+                    return Response::builder()
+                        .status(403)
+                        .body(Cow::Borrowed(&b"forbidden"[..]))
+                        .expect("build 403");
+                }
+                // Two URL shapes both reach this route — match the
+                // dual-path lookup in server.rs::serve_project_asset:
+                //   - FilesView builds absolute paths (`/Users/.../foo.png`);
+                //     the URL pathname strips the leading slash, so we
+                //     re-add it and try Sandbox::check (cwd-or-absolute).
+                //   - GUI shells (image-batch's Gallery, speech-studio,
+                //     video-studio) build workspace-relative paths
+                //     (`images/<slug>/<file>.png`); the absolute attempt
+                //     resolves to `/images/...` and 404s, so we fall back
+                //     to passing `decoded` directly and let Sandbox::check
+                //     join it with cwd.
+                //
+                // Cloud (`server.rs`) had this fallback since the early
+                // shells shipped; desktop was stuck on the absolute-only
+                // path, which is why image-generator's Gallery worked in
+                // hosted workspaces but rendered broken thumbnails in the
+                // desktop GUI.
+                let abs_first = format!("/{decoded}");
+                // Under a host a relative path is relative to the bot's
+                // folder, not the shelf; the shelf never holds a bot's
+                // `images/…`, so it is tried last rather than first.
+                // Two candidates under a host, and they are different
+                // folders: the user's files live in the workspace the agent
+                // runs in, while an asset the agent ships is in its own. The
+                // workspace comes first — a chapter's images are the common
+                // case — and the shelf the window holds is tried last, since
+                // it holds neither.
+                let candidates: Vec<String> = [active_workspace(), active_bot_dir()]
+                    .into_iter()
+                    .flatten()
+                    .map(|dir| dir.join(&decoded).to_string_lossy().into_owned())
+                    .collect();
+                let resolved = crate::sandbox::Sandbox::check(&abs_first)
+                    .or_else(|e| {
+                        candidates
+                            .iter()
+                            .find(|p| std::path::Path::new(p).is_file())
+                            .map_or(Err(e), |p| crate::sandbox::Sandbox::check(p))
+                    })
+                    .or_else(|_| crate::sandbox::Sandbox::check(&decoded));
+                // HTTP Range support — <video>/<audio> in shells stream large
+                // media (a chapter mp4 is tens of MB); without 206 responses
+                // the WebView pulls the whole file per request and playback
+                // stutters + seeking restarts the download.
+                let range_hdr = request
+                    .headers()
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                match resolved {
+                    Ok(resolved) => match crate::gui_shell::serve::read_asset_maybe_range(&resolved, range_hdr.as_deref()) {
+                        Ok((bytes, range_meta)) => {
+                            let ext = resolved.extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            let mime = match ext.as_str() {
+                                "html" | "htm" => "text/html; charset=utf-8",
+                                "css" => "text/css; charset=utf-8",
+                                "js" | "mjs" => "application/javascript; charset=utf-8",
+                                "json" => "application/json; charset=utf-8",
+                                "svg" => "image/svg+xml",
+                                "png" => "image/png",
+                                "jpg" | "jpeg" => "image/jpeg",
+                                "gif" => "image/gif",
+                                "webp" => "image/webp",
+                                "ico" => "image/x-icon",
+                                // PDFs render in an <iframe src=/file-asset>;
+                                // the WebView only invokes its built-in PDF
+                                // viewer when the Content-Type is correct —
+                                // octet-stream gave a blank/black pane.
+                                "pdf" => "application/pdf",
+                                "epub" => "application/epub+zip",
+                                "woff" => "font/woff",
+                                "woff2" => "font/woff2",
+                                "ttf" => "font/ttf",
+                                "otf" => "font/otf",
+                                // Audio
+                                "mp3" => "audio/mpeg",
+                                "wav" => "audio/wav",
+                                "m4a" | "aac" => "audio/mp4",
+                                "ogg" | "oga" => "audio/ogg",
+                                "opus" => "audio/opus",
+                                "flac" => "audio/flac",
+                                "weba" => "audio/webm",
+                                // Video
+                                "mp4" | "m4v" => "video/mp4",
+                                "webm" => "video/webm",
+                                "mov" => "video/quicktime",
+                                "mkv" => "video/x-matroska",
+                                "ogv" => "video/ogg",
+                                _ => "application/octet-stream",
+                            };
+                            let mut rb = Response::builder()
+                                .header("Content-Type", mime)
+                                .header("Accept-Ranges", "bytes");
+                            if let Some((start, end, total)) = range_meta {
+                                rb = rb.status(206).header(
+                                    "Content-Range",
+                                    format!("bytes {start}-{end}/{total}"),
+                                );
+                            }
+                            return rb
+                                .body(Cow::Owned(bytes))
+                                .expect("build file-asset response");
+                        }
+                        Err(_) => {
+                            return Response::builder()
+                                .status(404)
+                                .body(Cow::Borrowed(&b"not found"[..]))
+                                .expect("build 404");
+                        }
+                    },
+                    Err(_) => {
+                        return Response::builder()
+                            .status(403)
+                            .body(Cow::Borrowed(&b"forbidden"[..]))
+                            .expect("build 403");
+                    }
+                }
+            }
+            Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(Cow::Borrowed(FRONTEND_HTML.as_bytes()))
+                .expect("build frontend response")
+        })
+        .with_devtools(devtools_on)
+        .with_ipc_handler(move |req| {
+            let body = req.body();
+            // Only the window's own page talks to the engine. wry delivers
+            // messages from subframes too (a gui-shell, an MCP-App widget,
+            // an HTML file previewed in Files), and every one of those is
+            // page content: none of our own iframes sends IPC directly (the
+            // gui-shell bridge goes through the parent's postMessage
+            // allowlist). Letting them through gave any such page
+            // `approval_response`, `shell_input` and browser takeover.
+            if !crate::ipc::is_top_frame_uri(&req.uri().to_string()) {
+                eprintln!("[ipc] refused a message from a subframe: {}", req.uri());
+                return;
+            }
+            // dev-plan/59 §7.6 step 3: in host mode every frame belongs to a
+            // bot. Forwarded verbatim — the host does not parse the protocol,
+            // and a frame it does not recognise is an agent frame, which is
+            // the safe direction to guess.
+            if let Some((host_addr, host_token)) = &host_for_ipc {
+                // Two frames belong to the window, not to any bot: which bots
+                // exist, and which one to talk to. Everything else is an agent
+                // frame and goes through verbatim.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                let kind = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                // The folder picker is the window's, as it always was: a bot's
+                // `--serve` has no dialog to open, and a bot changing ITS cwd
+                // is not what "open another workspace" means. A pick inside
+                // this workspace dismisses the picker; any other folder is
+                // handed to a fresh process, which opens it the way a launch
+                // there would — as a host if it is (or upgrades to) v3, as
+                // the classic window otherwise.
+                // `get_cwd` is the page's first frame, and its "no reply in
+                // 3s" check reads silence as a broken bridge. Forwarded, it
+                // waited inside the host until the bot finished starting,
+                // which on a release build with a GUI shell took longer than
+                // that, so the window opened on "couldn't reach its backend".
+                // The window knows the answer, so it gives it at once.
+                // Host mode's stand-in for `SendInitialState`, which never
+                // fires here. Observed on its way past, not consumed — the
+                // bot wants this frame too.
+                //
+                // `frontend_ready` and NOT `get_cwd`, even though get_cwd is
+                // the earlier frame and the host answers it directly: the
+                // page sends get_cwd from its bootstrap, before the component
+                // holding the update subscriber exists, and
+                // `dispatchToSubscribers` has no buffer — a frame that early
+                // is dropped and never seen again. The ready beacon is
+                // mounted only once the startup modals are gone, by which
+                // point someone is listening.
+                if kind == "frontend_ready" {
+                    dispatch_update_notice(&proxy_for_ipc);
+                    if let Some(root) = host_root_for_ipc.as_ref() {
+                        for frame in crate::bots::migrate::workspace_notice_frames(root) {
+                            let _ = proxy_for_bots.send_event(UserEvent::Dispatch(frame));
+                        }
+                    } else if let Some(frame) = std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| crate::bots::migrate::stuck_migration_notice(&cwd))
+                    {
+                        let _ = proxy_for_bots.send_event(UserEvent::Dispatch(frame));
+                    }
+                }
+                if kind == "get_cwd" {
+                    let slug = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let root = host_root_for_ipc.clone().unwrap_or_default();
+                    // The agent that actually runs, which a doubly-migrated
+                    // workspace puts a level further down — its settings are
+                    // what carry `guiShell.tabDefault`.
+                    let dir = crate::bots::resolve_agent_dir(&root, &slug);
+                    // The picker picks a WORKSPACE — a folder that may hold
+                    // several agents — so that is what the box shows. Answering
+                    // with the bot's folder rewrote what the user had typed,
+                    // and the page asks again for every bot it mounts, so the
+                    // box kept jumping back to `…/.thclaws/bots/<slug>` while
+                    // they were still choosing.
+                    let shown = if root.as_os_str().is_empty() {
+                        dir.clone()
+                    } else {
+                        root.clone()
+                    };
+                    let initial_tab = std::fs::read_to_string(dir.join(".thclaws/settings.json"))
+                        .ok()
+                        .filter(|_| crate::config::trust::is_folder_trusted(&dir))
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                        .and_then(|v| v.get("guiShell").cloned())
+                        .and_then(|g| {
+                            serde_json::from_value::<crate::config::GuiShellSetting>(g).ok()
+                        })
+                        .and_then(|g| g.tab_default().map(|_| "ui"));
+                    // Offered until the user ANSWERS it, not just once: the
+                    // page renders a lone app first and swaps in one tree
+                    // per bot when the list arrives. Marking "offered" on the
+                    // first ask gave the picker to the tree that was about to
+                    // be replaced, and the tree that stayed opened without it.
+                    let first = !picker_offered_for_ipc.load(std::sync::atomic::Ordering::SeqCst);
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({
+                            "type": "current_cwd",
+                            "path": shown.to_string_lossy(),
+                            "needs_modal": first,
+                            "recent_dirs": crate::recent_dirs::load_recent_dirs(),
+                            "initial_tab": initial_tab,
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+                // A confirmation dialog belongs to the window, like the folder
+                // picker above it: it opens a native OS panel, which a bot's
+                // `--serve` has none of. Forwarded, it reached a process with
+                // no `confirm` arm at all, so nothing replied, the page's
+                // promise never settled, and the action it guarded — deleting
+                // a KMS, among others — did nothing at all with no error to
+                // show for it. `--serve` in a browser was unaffected: no
+                // `window.ipc` there, so it uses the browser's own dialog.
+                if kind == "confirm" {
+                    let id = parsed
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = parsed
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Confirm");
+                    let message = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let yes_label = parsed
+                        .get("yes_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("OK");
+                    let no_label = parsed
+                        .get("no_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Cancel");
+                    let ok = native_confirm(title, message, yes_label, no_label);
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({ "type": "confirm_result", "id": id, "ok": ok })
+                            .to_string(),
+                    ));
+                    return;
+                }
+                // Trust belongs to the window too: the bot's `--serve` takes
+                // it only from a browser, and this bridge isn't one. The
+                // agent's folder is what its process loads settings from.
+                if kind == "workspace_trust" {
+                    let slug = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let Some(root) = host_root_for_ipc.as_ref().filter(|_| !slug.is_empty())
+                    else {
+                        return;
+                    };
+                    let dir = crate::bots::resolve_agent_dir(root, &slug);
+                    if !confirm_trust(&dir) {
+                        let _ = proxy_for_bots
+                            .send_event(UserEvent::Dispatch(crate::ipc::trust_declined_frame()));
+                        return;
+                    }
+                    let (ok, frame) = crate::ipc::trust_workspace(&dir);
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(frame.to_string()));
+                    if ok {
+                        if let Ok(link) = bridge_for_ipc.lock() {
+                            if let Some(bridge) = link.as_ref() {
+                                bridge.send(r#"{"type":"workspace_trust_apply"}"#.to_string());
+                            }
+                        }
+                    }
+                    return;
+                }
+                if kind == "pick_directory" {
+                    let start_dir = parsed
+                        .get("start")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| ".".into())
+                        });
+                    let picked = pick_directory_native(&start_dir, "Select working directory");
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                        serde_json::json!({ "type": "directory_picked", "path": picked })
+                            .to_string(),
+                    ));
+                    return;
+                }
+                if kind == "set_cwd" {
+                    let path = parsed
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let target = std::path::Path::new(&path);
+                    let inside = host_root_for_ipc
+                        .as_ref()
+                        .is_some_and(|root| crate::util::is_inside(root, target));
+                    let reply = if inside {
+                        // Answered: other bots' trees open without it now.
+                        picker_offered_for_ipc.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // This pick keeps the cwd, so it never re-execs and
+                        // the marker would otherwise stay unset for the life
+                        // of the process — which is what lets the window size
+                        // be saved and the bootstrap run.
+                        crate::util::mark_picker_answered();
+                        serde_json::json!({ "type": "cwd_changed", "path": path, "ok": true })
+                    } else if target.is_dir() {
+                        crate::recent_dirs::save_recent_dir(&path);
+                        match std::env::set_current_dir(target) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "\x1b[36m[thclaws] opening workspace {} — restarting\x1b[0m",
+                                    target.display()
+                                );
+                                let _ = proxy_for_bots.send_event(UserEvent::ReloadRequested);
+                                return;
+                            }
+                            Err(e) => serde_json::json!({
+                                "type": "cwd_changed", "path": path, "ok": false,
+                                "error": format!("cannot enter '{path}': {e}"),
+                            }),
+                        }
+                    } else {
+                        serde_json::json!({
+                            "type": "cwd_changed", "path": path, "ok": false,
+                            "error": format!("'{path}' is not a valid directory"),
+                        })
+                    };
+                    let _ = proxy_for_bots.send_event(UserEvent::Dispatch(reply.to_string()));
+                    return;
+                }
+                if kind == "bots_list" {
+                    let (addr, token) = (*host_addr, host_token.clone());
+                    let active = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let proxy_list = proxy_for_bots.clone();
+                    tokio::spawn(async move {
+                        let payload = crate::bots::desktop::list_frame(addr, &token, &active).await;
+                        let _ = proxy_list.send_event(UserEvent::Dispatch(payload));
+                    });
+                    return;
+                }
+                if kind == "bots_templates" {
+                    let (addr, token) = (*host_addr, host_token.clone());
+                    let proxy_tpl = proxy_for_bots.clone();
+                    tokio::spawn(async move {
+                        let frame = crate::bots::desktop::templates_frame(addr, &token).await;
+                        let _ = proxy_tpl.send_event(UserEvent::Dispatch(frame));
+                    });
+                    return;
+                }
+                if matches!(kind, "bots_add" | "bots_remove" | "bots_restart") {
+                    // Host mutations from the panel. Over the bridge rather
+                    // than `fetch`, because the page's `/bots` fetch would go
+                    // to the `thclaws://` protocol handler, which serves files,
+                    // not the host. The answer is one frame, then a fresh list
+                    // so the rail catches up without a poll.
+                    let (addr, token) = (*host_addr, host_token.clone());
+                    let slug = parsed
+                        .get("slug")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let purge = parsed.get("purge").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let blank = parsed.get("blank").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let (method, path, body) = match kind {
+                        "bots_add" => (
+                            "POST",
+                            "/bots".to_string(),
+                            Some(serde_json::json!({ "slug": slug, "blank": blank })),
+                        ),
+                        "bots_remove" => (
+                            "DELETE",
+                            format!(
+                                "/bots/{}?purge={purge}",
+                                urlencoding::encode(&slug)
+                            ),
+                            None,
+                        ),
+                        _ => (
+                            "POST",
+                            format!("/bots/{}/restart", urlencoding::encode(&slug)),
+                            None,
+                        ),
+                    };
+                    let active = bridge_for_ipc
+                        .lock()
+                        .ok()
+                        .and_then(|b| b.as_ref().map(|b| b.slug.clone()))
+                        .unwrap_or_default();
+                    let proxy_act = proxy_for_bots.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            crate::bots::desktop::action_frame(addr, &token, method, &path, body)
+                                .await;
+                        let _ = proxy_act.send_event(UserEvent::Dispatch(result));
+                        let list = crate::bots::desktop::list_frame(addr, &token, &active).await;
+                        let _ = proxy_act.send_event(UserEvent::Dispatch(list));
+                    });
+                    return;
+                }
+                if kind == "bot_switch" {
+                    let slug = parsed
+                        .get("slug")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !slug.is_empty() {
+                        let (addr, token) = (*host_addr, host_token.clone());
+                        let proxy_for_bot = proxy_for_bots.clone();
+                        let link = crate::bots::desktop::connect(
+                            addr,
+                            token,
+                            slug.clone(),
+                            move |frame| {
+                                let _ = proxy_for_bot.send_event(UserEvent::Dispatch(frame));
+                            },
+                        );
+                        // Dropping the old bridge closes its socket, so the
+                        // bot we left keeps running but stops streaming here.
+                        if let Ok(mut cur) = bridge_for_ipc.lock() {
+                            *cur = Some(link);
+                        }
+                        let _ = proxy_for_bots.send_event(UserEvent::Dispatch(
+                            serde_json::json!({"type": "bot_switched", "slug": slug}).to_string(),
+                        ));
+                    }
+                    return;
+                }
+                if let Ok(link) = bridge_for_ipc.lock() {
+                    if let Some(bridge) = link.as_ref() {
+                        bridge.send(body.to_string());
+                    }
+                }
+                return;
+            }
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) else {
+                return;
+            };
+
+            // M6.36 SERVE9: delegate to the transport-agnostic dispatch
+            // first. Migrated arms (plan-sidebar, app_close, etc.) are
+            // handled there; if `handle_ipc` returns true we're done.
+            // Anything not yet migrated returns false and falls through
+            // to the wry-only match below.
+            //
+            // The wry-flavored IpcContext built here mirrors what
+            // server.rs::handle_socket builds for WebSocket clients —
+            // same dispatch table, transport-specific bridges only
+            // differ in their callback bodies.
+            {
+                let proxy_dispatch = proxy_for_ipc.clone();
+                let dispatch: crate::ipc::DispatchFn = Arc::new(move |payload: String| {
+                    let _ = proxy_dispatch.send_event(UserEvent::Dispatch(payload));
+                });
+                let proxy_quit = proxy_for_ipc.clone();
+                let on_quit: crate::ipc::QuitFn = Arc::new(move || {
+                    let _ = proxy_quit.send_event(UserEvent::QuitRequested);
+                });
+                let proxy_init = proxy_for_ipc.clone();
+                let on_send_initial_state: crate::ipc::SendInitialStateFn = Arc::new(move || {
+                    let _ = proxy_init.send_event(UserEvent::SendInitialState);
+                });
+                // Zoom is wry-specific — the on_zoom callback fires
+                // via the existing `gui_set_zoom` arm below (not yet
+                // migrated), so this stub closure is never called from
+                // the shared dispatch path today.
+                let on_zoom: crate::ipc::ZoomFn = Arc::new(|_scale: f64| {});
+                let ipc_ctx = crate::ipc::IpcContext {
+                    // The window is ONE viewer for the life of the app. It
+                    // cannot be derived from `dispatch`, which is rebuilt
+                    // above on every message.
+                    viewer_id: gui_viewer_id,
+                    is_serve_mode: false,
+                    shared: shared_for_ipc.clone(),
+                    approver: approver_for_ipc.clone(),
+                    pending_asks: pending_asks_for_ipc.clone(),
+                    dispatch,
+                    on_quit,
+                    on_send_initial_state,
+                    on_zoom,
+                    workflow_approver: shared_for_ipc.workflow_approver.clone(),
+                };
+                // dev-plan/59: a folder picked at startup that is a multi-bot
+                // workspace — or a v2 agent this app would upgrade — is not
+                // something the in-process engine can be pointed at: it
+                // would load the migration tombstone as its instructions.
+                // Such a pick restarts the app there, and the launch path
+                // does what it does for any folder.
+                if msg.get("type").and_then(|t| t.as_str()) == Some("set_cwd") {
+                    if let Some(path) = msg.get("path").and_then(|v| v.as_str()) {
+                        let target = std::path::Path::new(path);
+                        if target.is_dir() && crate::bots::migrate::opens_as_host(target) {
+                            crate::recent_dirs::save_recent_dir(path);
+                            if std::env::set_current_dir(target).is_ok() {
+                                eprintln!(
+                                    "\x1b[36m[thclaws] opening workspace {} — restarting\x1b[0m",
+                                    target.display()
+                                );
+                                let _ = proxy_for_bots.send_event(UserEvent::ReloadRequested);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if msg.get("type").and_then(|t| t.as_str()) == Some("workspace_trust") {
+                    let dir = std::env::current_dir().unwrap_or_default();
+                    if confirm_trust(&dir) {
+                        crate::ipc::trust_and_apply(&ipc_ctx, &dir);
+                    } else {
+                        (ipc_ctx.dispatch)(crate::ipc::trust_declined_frame());
+                    }
+                    return;
+                }
+                if crate::ipc::handle_ipc(msg.clone(), &ipc_ctx) {
+                    return;
+                }
+            }
+
+            let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match ty {
+                // Note: app_close, shell_input, frontend_ready,
+                // approval_response, shell_cancel, new_session,
+                // plan_approve, plan_cancel, plan_retry_step,
+                // plan_skip_step, plan_stalled_continue all migrated to
+                // crate::ipc::handle_ipc and handled above. Remaining
+                // arms continue to live here pending SERVE9 follow-ups.
+                "gui_scale_get" => {
+                    // Settings menu asking for the persisted zoom on
+                    // mount so the dropdown shows the right preset.
+                    let scale = crate::config::ProjectConfig::load()
+                        .and_then(|c| c.gui_scale)
+                        .unwrap_or(1.0);
+                    let payload = serde_json::json!({
+                        "type": "gui_scale_value",
+                        "scale": scale,
+                    });
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                }
+                "gui_set_zoom" => {
+                    // Settings panel slider / hotkey reset asking us to
+                    // change the GUI zoom factor. Persist to project
+                    // config and apply live; webview.zoom() is on the
+                    // event-loop side, so emit a UserEvent the loop
+                    // picks up below. Issue #47.
+                    let scale = msg.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+                    project.set_gui_scale(scale);
+                    let _ = project.save();
+                    let clamped = project.gui_scale.unwrap_or(scale);
+                    let _ = proxy_for_ipc.send_event(UserEvent::ZoomChanged(clamped));
+                }
+                // ─── EE Phase 4: org-policy SSO (IPC surface for sidebar) ─
+                // get_cwd migrated to crate::ipc::handle_ipc.
+                "pick_directory" => {
+                    let start_dir = msg.get("start").and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| std::env::current_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| ".".into()));
+                    let result = pick_directory_native(&start_dir, "Select working directory");
+                    let payload = match result {
+                        Some(path) => serde_json::json!({
+                            "type": "directory_picked",
+                            "path": path,
+                        }),
+                        None => serde_json::json!({
+                            "type": "directory_picked",
+                            "path": null,
+                        }),
+                    };
+                    let _ = proxy_for_ipc.send_event(
+                        UserEvent::SessionLoaded(payload.to_string()),
+                    );
+                }
+                // OKF (Open Knowledge Format) import/export for a KMS,
+                // driven from the sidebar "Knowledge" header context menu.
+                // GUI-only: both open a native folder picker (rfd), so they
+                // can't live in the transport-agnostic handle_ipc path. The
+                // picker blocks the event loop the same way `pick_directory`
+                // above does.
+                "kms_export_okf" => {
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let start_dir = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    let payload = if name.is_empty() {
+                        serde_json::json!({
+                            "type": "kms_okf_result", "ok": false,
+                            "message": "Export failed: no KMS selected.",
+                        })
+                    } else {
+                        match pick_directory_native(
+                            &start_dir,
+                            &format!("Export '{name}' — choose a destination folder"),
+                        ) {
+                            None => serde_json::json!({
+                                "type": "kms_okf_result", "ok": false,
+                                "message": "Export cancelled.",
+                            }),
+                            Some(dir) => {
+                                let out = std::path::Path::new(&dir).join(format!("{name}-okf"));
+                                match crate::kms::export_okf(&name, &out) {
+                                    Ok(r) => serde_json::json!({
+                                        "type": "kms_okf_result", "ok": true,
+                                        "message": format!(
+                                            "Exported '{name}' → {} ({} page(s), {} reference(s)).",
+                                            r.out_dir.display(), r.pages, r.sources,
+                                        ),
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "kms_okf_result", "ok": false,
+                                        "message": format!("Export failed: {e}"),
+                                    }),
+                                }
+                            }
+                        }
+                    };
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                }
+                "kms_import_okf" => {
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let scope = match msg.get("scope").and_then(|v| v.as_str()) {
+                        Some("project") => crate::kms::KmsScope::Project,
+                        _ => crate::kms::KmsScope::User,
+                    };
+                    let start_dir = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    let mut imported = false;
+                    let payload = if name.is_empty() {
+                        serde_json::json!({
+                            "type": "kms_okf_result", "ok": false,
+                            "message": "Import failed: name the new KMS first.",
+                        })
+                    } else {
+                        match pick_directory_native(
+                            &start_dir,
+                            "Import OKF bundle — choose the bundle folder",
+                        ) {
+                            None => serde_json::json!({
+                                "type": "kms_okf_result", "ok": false,
+                                "message": "Import cancelled.",
+                            }),
+                            Some(dir) => match crate::kms::import_okf(
+                                std::path::Path::new(&dir),
+                                &name,
+                                scope,
+                            ) {
+                                Ok(r) => {
+                                    imported = true;
+                                    serde_json::json!({
+                                        "type": "kms_okf_result", "ok": true,
+                                        "message": format!(
+                                            "Imported OKF bundle → KMS '{name}' ({} page(s), {} source(s)). Tick it to attach.",
+                                            r.pages, r.sources,
+                                        ),
+                                    })
+                                }
+                                Err(e) => serde_json::json!({
+                                    "type": "kms_okf_result", "ok": false,
+                                    "message": format!("Import failed: {e}"),
+                                }),
+                            },
+                        }
+                    };
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                    if imported {
+                        // Refresh the sidebar's KMS list so the new one shows.
+                        let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
+                            crate::kms::build_update_payload().to_string(),
+                        ));
+                    }
+                }
+                "confirm" => {
+                    // Native OS confirmation dialog. Frontend sends an
+                    // `id` so it can match the async reply; we echo it
+                    // back in the result event. Default labels are
+                    // "OK"/"Cancel" if the caller doesn't override.
+                    let id = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = msg.get("title").and_then(|v| v.as_str()).unwrap_or("Confirm");
+                    let message = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let yes_label = msg
+                        .get("yes_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("OK");
+                    let no_label = msg
+                        .get("no_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Cancel");
+                    let ok = native_confirm(title, message, yes_label, no_label);
+                    let payload = serde_json::json!({
+                        "type": "confirm_result",
+                        "id": id,
+                        "ok": ok,
+                    });
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::FileContent(payload.to_string()));
+                }
+                // set_cwd migrated to crate::ipc::handle_ipc.
+                // shell_input / chat_prompt / pty_write (incl. image
+                // attachments) migrated to crate::ipc::handle_ipc.
+                "pty_spawn" => {
+                    // Legacy ack: the frontend sends this on Terminal-tab
+                    // mount to trigger initial sidebar state. The shared
+                    // session is already running by this point.
+                    let _ = proxy_for_ipc.send_event(UserEvent::SendInitialState);
+                }
+                // shell_cancel + frontend_ready + approval_response
+                // migrated to crate::ipc::handle_ipc and handled at the
+                // top of this closure via the delegate.
+                "pty_kill" | "pty_resize" | "restart" => {
+                    // PTY-era hooks. The shared in-process session has
+                    // no PTY to kill or resize; ignore quietly so the
+                    // frontend can keep emitting them during transition.
+                }
+                // new_session migrated to crate::ipc::handle_ipc.
+                // instructions_get + instructions_save migrated to crate::ipc::handle_ipc.
+                // kms_list migrated to crate::ipc::handle_ipc.
+                // theme_get + theme_set migrated to crate::ipc::handle_ipc.
+                _ => {}
+            }
+        })
+        .with_navigation_handler(|url: String| {
+            // Allow any http(s) target. wry's macOS navigation delegate
+            // fires for iframe `src` loads as well as top-level
+            // navigations — and the closure signature hides which —
+            // so blocking http(s) here would also block the lightbox
+            // iframe used to render MCP preview viewer pages
+            // (e.g. `https://pinn.ai/mcp/preview/<uuid>`).
+            //
+            // Top-level navigation away from the chat is prevented at
+            // the React layer (ChatView.handleChatLinkClick calls
+            // preventDefault on every link click and routes to the
+            // in-app lightbox). The only role left for this handler
+            // is rejecting clearly-out-of-scope schemes — `file://`,
+            // `javascript:`, custom protocols — so a hostile MCP
+            // server can't smuggle one in via injected HTML.
+            url.starts_with("thclaws://")
+                || url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("about:")
+                || url.starts_with("data:")
+                || url.starts_with("blob:")
+        });
+    // wry exposes a different constructor on Linux because WebKit2GTK
+    // mounts as a GTK widget rather than over a raw window handle.
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build(&window).expect("webview build");
+    #[cfg(target_os = "linux")]
+    let webview = builder
+        .build_gtk(window.default_vbox().unwrap())
+        .expect("webview build (gtk)");
+
+    // Apply persisted GUI zoom so HiDPI / 4K users get the scale they
+    // last picked instead of the WebView's native 1.0 every launch.
+    // Skips the call when `guiScale` is exactly 1.0 — saves the
+    // round-trip on the common case. Issue #47.
+    if (initial_zoom - 1.0).abs() > f64::EPSILON {
+        let _ = webview.zoom(initial_zoom);
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut macos_modifiers = ModifiersState::empty();
+
+    // Latest logical window size, updated on every WindowEvent::Resized
+    // and persisted to .thclaws/settings.json on shutdown so the next
+    // launch restores it.
+    let mut latest_window_size: Option<(f64, f64)> = None;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::UserEvent(UserEvent::Dispatch(json)) => {
+                let escaped = escape_for_js(&json);
+                let _ = webview.evaluate_script(&format!(
+                    "window.__thclaws_dispatch('{escaped}')"
+                ));
+            }
+            Event::UserEvent(UserEvent::FileContent(json))
+            | Event::UserEvent(UserEvent::SessionLoaded(json)) => {
+                let escaped = escape_for_js(&json);
+                let _ = webview.evaluate_script(&format!(
+                    "window.__thclaws_dispatch('{escaped}')"
+                ));
+            }
+            Event::UserEvent(UserEvent::SendInitialState) => {
+                // The classic window's "the page is listening" signal. Host
+                // mode has its own — see `dispatch_update_notice`.
+                dispatch_update_notice(&proxy);
+                let config = AppConfig::load().unwrap_or_default();
+                // No auto-switch here. This used to rewrite settings.json to
+                // a local runtime whenever the active provider had no key —
+                // without checking that the runtime was installed, and while
+                // dropping the user's `--model` override. Most users have no
+                // local runtime, so the swap only moved the failure from an
+                // actionable "no API key" to a connection refused on the
+                // first prompt. `provider_ready` below reports the state
+                // honestly instead; the startup path
+                // (`build_provider_with_fallback`) still offers a local
+                // fallback, but only after probing that it answers.
+                let provider_name = config.detect_provider().unwrap_or("unknown");
+                let provider_ready = provider_has_credentials(&config);
+                let mcp_servers = build_mcp_servers_payload(&config);
+                let sessions: Vec<serde_json::Value> = SessionStore::default_path()
+                    .map(SessionStore::new)
+                    .and_then(|store| store.list().ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(20)
+                    .map(|s| serde_json::json!({
+                        "id": s.id,
+                        "model": s.model,
+                        "messages": s.message_count,
+                        "title": s.title,
+                    }))
+                    .collect();
+                let kms_update = build_kms_update_payload();
+                // #95(c): mirror server.rs's initial_state so GUI mode
+                // ships team_enabled too. wry IPC is synchronous (no
+                // CONNECTING race), but keeping the two builders in
+                // lockstep avoids drift across the GUI / --serve split.
+                let team_enabled = crate::config::ProjectConfig::load()
+                    .and_then(|c| c.team_enabled)
+                    .unwrap_or(false);
+                let state = serde_json::json!({
+                    "type": "initial_state",
+                    "provider": provider_name,
+                    "model": config.model,
+                    "thinking": crate::providers::ThinkingLevel::json(config.thinking_budget),
+                    "provider_ready": provider_ready,
+                    "mcp_servers": mcp_servers,
+                    "sessions": sessions,
+                    "kmss": kms_update.get("kmss").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                    "team_enabled": team_enabled,
+                    "version": crate::version::VERSION,
+                });
+                let cwd = std::env::current_dir().unwrap_or_default();
+                for frame in [
+                    state.to_string(),
+                    crate::tools::todo::todo_update_frame(&cwd),
+                ] {
+                    let js = format!("window.__thclaws_dispatch('{}')", escape_for_js(&frame));
+                    let _ = webview.evaluate_script(&js);
+                }
+            }
+            Event::UserEvent(UserEvent::QuitRequested) => {
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
+            }
+            Event::UserEvent(UserEvent::ReloadRequested) => {
+                // #211: a restart keeps its working directory, so the folder is
+                // already decided — it must never re-open the startup picker.
+                // Marking here covers `/reload` too, not just a folder pick.
+                crate::util::mark_picker_answered();
+                persist_window_size(latest_window_size);
+                // A reload IS a restart, so it owes everything a quit does.
+                // Without this the re-exec left the engine-managed Chromium
+                // and this session's tmux teammates orphaned — and
+                // `request_gui_shutdown` notes that a surviving Chromium
+                // breaks the next launch's CDP attach. Flush the session
+                // first, so "on-disk sessions survive" is actually true.
+                let _ = shared_for_events.input_tx.send(ShellInput::SaveAndQuit);
+                crate::team::kill_my_teammates();
+                crate::audit::shutdown();
+                crate::browser_cdp::shutdown();
+                // #209/#210: agents log into this process's pipes, and an
+                // exec pulls those out from under them. Stop and wait BEFORE
+                // arming the exec below — not in parallel with it, or the
+                // 400ms timer fires while agents are still being stopped and
+                // we reproduce the crash that fix removed.
+                if !crate::server::stop_host_agents(std::time::Duration::from_secs(5)) {
+                    crate::util::log_line(
+                        "\x1b[33m[reload] agents did not stop within 5s — re-execing anyway\x1b[0m",
+                    );
+                }
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let err = crate::util::reexec_self();
+                    eprintln!("[reload] re-exec failed: {err}");
+                });
+            }
+            Event::UserEvent(UserEvent::ZoomChanged(scale)) => {
+                let _ = webview.zoom(scale);
+            }
+            #[cfg(target_os = "macos")]
+            Event::WindowEvent {
+                event: WindowEvent::ModifiersChanged(modifiers),
+                ..
+            } => {
+                macos_modifiers = modifiers;
+            }
+            #[cfg(target_os = "macos")]
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event, .. },
+                ..
+            } if is_macos_close_shortcut(&event, macos_modifiers) => {
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(physical_size),
+                ..
+            } => {
+                let scale_factor = window.scale_factor();
+                let logical = physical_size.to_logical::<f64>(scale_factor);
+                latest_window_size = Some((logical.width, logical.height));
+            }
+            _ => {}
+        }
+    });
+}
+
+#[cfg(test)]
+mod gui_shell_asset_tests {
+    use super::*;
+
+    // #183: on Windows the WebView runs from http://thclaws.localhost/, so
+    // UIView takes the http branch and emits `gui-shell/<id>/` with no
+    // explicit index.html. An empty asset path (bare id or trailing slash)
+    // must resolve to index.html, not 404 "asset not found".
+    #[test]
+    fn empty_asset_path_defaults_to_index_html() {
+        let reg = crate::gui_shell::ShellRegistry::builtin_only();
+        for rest in ["media-studio", "media-studio/"] {
+            let res = serve_gui_shell_asset(&reg, rest);
+            assert_eq!(res.status(), 200, "rest {rest:?} should serve index.html");
+            // #184: the html branch now inlines the bridge (Windows can't load
+            // the thclaws:// external script), so assert on the inline marker.
+            assert!(
+                String::from_utf8_lossy(res.body()).contains("__thclaws_shell_id"),
+                "rest {rest:?} should be the inline-bridge-injected index.html",
+            );
+        }
+    }
+
+    /// The desktop shell iframe has an opaque origin, so the shell's own
+    /// `style.css` / `main.js` are inlined (as on `--serve`) and what is
+    /// still fetched carries a CORS header.
+    #[test]
+    fn desktop_shell_html_is_self_contained_for_an_opaque_origin() {
+        let reg = crate::gui_shell::ShellRegistry::builtin_only();
+        let res = serve_gui_shell_asset(&reg, "media-studio/");
+        let html = String::from_utf8_lossy(res.body()).to_string();
+        assert!(
+            !html.contains(r#"src="main.js""#),
+            "main.js should be inlined"
+        );
+        assert!(
+            !html.contains(r#"href="style.css""#),
+            "style.css should be inlined"
+        );
+        assert_eq!(
+            res.headers()
+                .get("Access-Control-Allow-Origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*")
+        );
+        let css = serve_gui_shell_asset(&reg, "media-studio/style.css");
+        assert_eq!(css.status(), 200);
+        assert!(css.headers().contains_key("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn explicit_asset_served_and_missing_or_unknown_still_404() {
+        let reg = crate::gui_shell::ShellRegistry::builtin_only();
+        assert_eq!(
+            serve_gui_shell_asset(&reg, "media-studio/index.html").status(),
+            200,
+        );
+        assert_eq!(
+            serve_gui_shell_asset(&reg, "media-studio/nope.html").status(),
+            404,
+        );
+        assert_eq!(serve_gui_shell_asset(&reg, "unknown-shell/").status(), 404);
+    }
+}
+
+#[cfg(test)]
+mod tool_coalesce_tests {
+    use super::*;
+
+    fn start(label: &str) -> ViewEvent {
+        ViewEvent::ToolCallStart {
+            name: label.to_string(),
+            label: label.to_string(),
+            input: serde_json::Value::Null,
+        }
+    }
+
+    fn ok() -> ViewEvent {
+        ViewEvent::ToolCallResult {
+            name: "Ls".to_string(),
+            output: String::new(),
+            ui_resource: None,
+        }
+    }
+
+    #[test]
+    fn first_tool_call_renders_normally() {
+        let mut s = TerminalRenderState::default();
+        let out = render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        assert!(out.contains("[tool: Ls]"));
+        assert!(out.starts_with("\r\n"));
+        let res = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert!(res.starts_with(" \x1b[32m✓"));
+        assert!(res.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn repeated_tool_coalesces_with_count() {
+        let mut s = TerminalRenderState::default();
+        // First call: full line + ✓ (no trailing CRLF, parked).
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        // Second call: start suppressed, result rewrites with ×2.
+        assert!(render_terminal_ansi(&mut s, &start("Ls")).is_none());
+        let merged = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert!(merged.starts_with("\r\x1b[2K"));
+        assert!(merged.contains("×2"));
+        // Third call: ×3.
+        assert!(render_terminal_ansi(&mut s, &start("Ls")).is_none());
+        let merged3 = render_terminal_ansi(&mut s, &ok()).unwrap();
+        assert!(merged3.contains("×3"));
+    }
+
+    #[test]
+    fn different_tool_breaks_coalesce_and_flushes_newline() {
+        let mut s = TerminalRenderState::default();
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        // Different tool: leading \r\n acts as the line break.
+        let next = render_terminal_ansi(&mut s, &start("Read")).unwrap();
+        assert!(next.starts_with("\r\n"));
+        assert!(next.contains("[tool: Read]"));
+    }
+
+    #[test]
+    fn text_after_tool_starts_on_fresh_line() {
+        let mut s = TerminalRenderState::default();
+        render_terminal_ansi(&mut s, &start("Ls")).unwrap();
+        render_terminal_ansi(&mut s, &ok()).unwrap();
+        let text =
+            render_terminal_ansi(&mut s, &ViewEvent::AssistantTextDelta("Done.".to_string()))
+                .unwrap();
+        assert!(text.starts_with("\r\n"));
+        assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn chat_dispatch_carries_tool_name_and_input_for_todowrite() {
+        // Frontend keys on `tool_name === "TodoWrite"` to render the
+        // checklist card. The IPC envelope must carry the unmangled
+        // tool name and a redacted copy of the input so the renderer has
+        // everything it needs without leaking secrets.
+        let ev = ViewEvent::ToolCallStart {
+            name: "TodoWrite".to_string(),
+            label: "TodoWrite".to_string(),
+            input: serde_json::json!({
+                "todos": [
+                    { "id": "1", "content": "Investigate bug", "status": "in_progress" },
+                    { "id": "2", "content": "Write fix", "status": "pending" },
+                ],
+                "note": "Authorization: Bearer sk-123",
+            }),
+        };
+        let dispatches = render_chat_dispatches(&ev);
+        assert_eq!(dispatches.len(), 1);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&dispatches[0]).expect("valid JSON envelope");
+        assert_eq!(envelope["type"], "chat_tool_call");
+        assert_eq!(
+            envelope["tool_name"], "TodoWrite",
+            "frontend keys on tool_name to pick the custom render path",
+        );
+        let todos = &envelope["input"]["todos"];
+        assert!(todos.is_array(), "todos array missing in input: {envelope}");
+        assert_eq!(todos[0]["content"], "Investigate bug");
+        assert_eq!(todos[0]["status"], "in_progress");
+        assert_eq!(
+            envelope["input"]["note"],
+            "Authorization: Bearer <redacted>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_frame_tests {
+    use super::frame_type_is;
+    use crate::bots::desktop::tag;
+    use crate::event_render::HOST_RELOAD_FRAME_TYPE;
+
+    /// The regression: the host used to compare the reload frame against a
+    /// fixed string, but every frame reaches it through `tag`, which stamps
+    /// `_bot` in front of the object. Nothing ever matched, so `/reload` in
+    /// host mode printed its message and did nothing. Built with the real
+    /// `tag` rather than a hand-written copy of its output — writing that
+    /// copy from memory is what produced the bug.
+    #[test]
+    fn a_tagged_reload_frame_is_recognised() {
+        let raw = serde_json::json!({ "type": HOST_RELOAD_FRAME_TYPE }).to_string();
+        assert!(frame_type_is(&raw, HOST_RELOAD_FRAME_TYPE));
+        assert!(frame_type_is(&tag("main", &raw), HOST_RELOAD_FRAME_TYPE));
+    }
+
+    /// And the reason it is decided on the parsed `type`: a bot streams the
+    /// user's own words back as chat envelopes, so a substring test would
+    /// hand every user a way to restart the host by typing the frame name.
+    #[test]
+    fn user_text_quoting_the_frame_name_is_not_a_reload() {
+        let chat = serde_json::json!({
+            "type": "chat_text_delta",
+            "text": r#"{"type":"host_reload_requested"}"#,
+        })
+        .to_string();
+        assert!(chat.contains(HOST_RELOAD_FRAME_TYPE));
+        assert!(!frame_type_is(&chat, HOST_RELOAD_FRAME_TYPE));
+        assert!(!frame_type_is(&tag("main", &chat), HOST_RELOAD_FRAME_TYPE));
+    }
+}

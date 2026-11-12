@@ -1,0 +1,618 @@
+//! OS-keychain–backed storage for LLM API keys.
+//!
+//! Backend: macOS Keychain, Windows Credential Manager, or Linux Secret
+//! Service (via the `keyring` crate). Service name is `"thclaws"`, account
+//! is the provider short name (`"anthropic"`, `"openai"`,
+//! `"gemini"`, `"dashscope"`).
+//!
+//! Keys are decrypted only when read. At startup [`load_into_env`] pulls
+//! any stored keys and sets the matching env var *if it isn't already
+//! set*, preserving the precedence: shell export > keychain > dotenv file.
+
+use crate::error::{Error, Result};
+use crate::providers::ProviderKind;
+
+/// Single-item account name used by the "one bundle, one ACL" layout.
+/// All provider keys live inside one JSON blob at
+/// service="thclaws", account="api-keys" so macOS only asks once for
+/// the whole set. Legacy per-provider entries are still migrated
+/// lazily into the bundle on first read for backwards compat.
+const BUNDLE_ACCOUNT: &str = "api-keys";
+
+/// Where the user has chosen to store API keys. Picked once via the
+/// Settings UI's initial prompt and persisted so we never ping the OS
+/// keychain for users who opted out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Keychain,
+    Dotenv,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Keychain => "keychain",
+            Backend::Dotenv => "dotenv",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BackendFile {
+    backend: Option<Backend>,
+}
+
+fn backend_path() -> Option<std::path::PathBuf> {
+    crate::util::home_dir().map(|h| {
+        h.join(format!(
+            ".config/{}/secrets.json",
+            crate::profile::app_dir_name()
+        ))
+    })
+}
+
+/// Read the user's stored backend preference. `None` means the user
+/// hasn't been asked yet.
+pub fn get_backend() -> Option<Backend> {
+    let path = backend_path()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let parsed: BackendFile = serde_json::from_str(&contents).ok()?;
+    parsed.backend
+}
+
+/// Persist the user's choice. Callers should invoke this before the
+/// first `set` / `get` so keychain prompts are skipped for dotenv
+/// users.
+pub fn set_backend(backend: Backend) -> Result<()> {
+    let path =
+        backend_path().ok_or_else(|| Error::Config("cannot locate user home directory".into()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = BackendFile {
+        backend: Some(backend),
+    };
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| Error::Config(format!("serialize: {e}")))?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Resolve the backend to use *right now*. When the user hasn't
+/// picked yet we return `Dotenv`, which effectively blocks every
+/// keychain-touching path (`get` / `set` / `clear` / `status` /
+/// `load_into_env`) until the Settings UI prompts the user to
+/// choose. This is the whole point — a fresh launch must not cause
+/// keychain access prompts.
+///
+/// Every writer of a secret (provider keys, the cloud and remote-agent
+/// tokens) must route by this, not by `get_backend()` with its own default:
+/// a writer that assumed Keychain while `set` refused it failed every
+/// sign-in made before the storage question was answered.
+pub fn resolved_backend() -> Backend {
+    get_backend().unwrap_or(Backend::Dotenv)
+}
+
+/// One bundle entry read straight from the keychain, past this process's
+/// cache — for diagnosis: another process may have written it since.
+/// `Err` is the keychain's own error (denied, locked, unreadable).
+pub fn bundle_get_uncached(provider: &str) -> std::result::Result<Option<String>, String> {
+    let entry = bundle_entry().map_err(|e| e.to_string())?;
+    match entry.get_password() {
+        Ok(json) => serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
+            .map(|m| m.get(provider).cloned())
+            .map_err(|e| format!("bundle is not valid JSON: {e}")),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Providers whose keys thClaws manages in the keychain.
+///
+/// Excludes `Ollama`, `OllamaAnthropic`, `AgentSdk` (no API key), and the
+/// variants that share an env var with another provider (we dedupe by env
+/// var name in the UI layer).
+const MANAGED: &[ProviderKind] = &[
+    ProviderKind::Anthropic,
+    ProviderKind::OpenAI,
+    ProviderKind::OpenRouter,
+    ProviderKind::TokenRouter,
+    ProviderKind::AtlasCloud,
+    ProviderKind::Unifically,
+    ProviderKind::Requesty,
+    ProviderKind::MetaAi,
+    ProviderKind::NineRouter,
+    ProviderKind::Gemini,
+    ProviderKind::DashScope,
+    ProviderKind::QwenCloud,
+    ProviderKind::Sis,
+    ProviderKind::OllamaCloud,
+    ProviderKind::ZAi,
+    ProviderKind::AzureAIFoundry,
+    ProviderKind::OpenAICompat,
+    // Optional master / virtual key — the proxy is usable without one, but
+    // installs that set `master_key` need somewhere to keep it.
+    ProviderKind::LiteLlm,
+    ProviderKind::DeepSeek,
+    ProviderKind::ThaiLLM,
+    ProviderKind::Nvidia,
+    ProviderKind::OpenCodeGo,
+    ProviderKind::Moonshot,
+    ProviderKind::XAi,
+    ProviderKind::Minimax,
+    ProviderKind::Groq,
+];
+
+/// Non-LLM service keys we surface in the same Settings modal as the
+/// LLM provider keys. Each entry: `(account_name, env_var)`. The
+/// account name is what we use as the bundle/keychain key and as the
+/// `provider` field over IPC; the env var is what the running process
+/// reads at runtime (e.g. WebSearchTool). Kept deliberately small —
+/// only services that the agent loop / tools rely on at runtime.
+pub const SERVICE_KEYS: &[(&str, &str)] = &[
+    ("tavily", "TAVILY_API_KEY"),
+    ("brave-search", "BRAVE_SEARCH_API_KEY"),
+    ("serpapi", "SERPAPI_API_KEY"),
+    ("youcom", "YDC_API_KEY"),
+    ("serply", "SERPLY_API_KEY"),
+    ("hal", "HAL_API_KEY"),
+    // VideoGen's native LTX path + the filmscript harness both read
+    // LTX_API_KEY off the process env (`media::provider::resolve_endpoint`),
+    // so it has to reach env the same way the search keys do.
+    ("ltx", "LTX_API_KEY"),
+    // iApp image generation is BYOK-only (no gateway route), so the key
+    // has to reach the process env for `IappImageProvider::generate` to
+    // find it — same path as LTX above.
+    ("iapp", "IAPP_API_KEY"),
+];
+
+/// Look up the env var for a non-LLM service key by account name.
+/// Returns `None` for unknown names so callers can chain with
+/// `ProviderKind::from_name(...).api_key_env()` via `or_else`.
+pub fn service_env_var(name: &str) -> Option<&'static str> {
+    SERVICE_KEYS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, env)| *env)
+}
+
+fn entry(provider: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(crate::profile::keychain_service(), provider)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))
+}
+
+fn bundle_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(crate::profile::keychain_service(), BUNDLE_ACCOUNT)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))
+}
+
+/// In-memory cache of the bundle contents for the lifetime of this
+/// process. Populated on the first read; subsequent `get` / `set`
+/// calls never touch the keychain again, so N providers = 1 macOS
+/// prompt per launch.
+fn bundle_cache() -> &'static std::sync::RwLock<Option<std::collections::HashMap<String, String>>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::RwLock<Option<std::collections::HashMap<String, String>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Read (and cache) the bundle. On first access, also migrate any
+/// legacy per-provider entries into the bundle so users who set keys
+/// before this change don't lose them.
+fn read_bundle() -> std::collections::HashMap<String, String> {
+    {
+        let guard = bundle_cache().read().unwrap();
+        if let Some(map) = &*guard {
+            return map.clone();
+        }
+    }
+    let mut map: std::collections::HashMap<String, String> =
+        match bundle_entry().ok().and_then(|e| e.get_password().ok()) {
+            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+            None => std::collections::HashMap::new(),
+        };
+    // Migrate legacy per-provider entries. One-shot per process.
+    let mut migrated = false;
+    for p in MANAGED {
+        let name = p.name();
+        if map.contains_key(name) {
+            continue;
+        }
+        if let Some(key) = entry(name).ok().and_then(|e| e.get_password().ok()) {
+            map.insert(name.to_string(), key);
+            migrated = true;
+        }
+    }
+    if migrated {
+        let _ = write_bundle(&map);
+    }
+    *bundle_cache().write().unwrap() = Some(map.clone());
+    map
+}
+
+fn write_bundle(map: &std::collections::HashMap<String, String>) -> Result<()> {
+    let json =
+        serde_json::to_string(map).map_err(|e| Error::Config(format!("serialize bundle: {e}")))?;
+    bundle_entry()?
+        .set_password(&json)
+        .map_err(|e| Error::Config(format!("keychain write failed: {e}")))?;
+    *bundle_cache().write().unwrap() = Some(map.clone());
+    Ok(())
+}
+
+/// Direct keychain write that **bypasses** the user's
+/// `Backend::Dotenv` preference. SSO tokens (access / refresh /
+/// id) are short-lived secrets that explicitly never want to land
+/// in `.env`, so they go to keychain regardless of how the user
+/// configured provider-API-key storage. Each caller picks its own
+/// account name (typically a hash, so the entry doesn't leak
+/// what's inside).
+pub fn keychain_set_raw(account: &str, value: &str) -> Result<()> {
+    keyring::Entry::new(crate::profile::keychain_service(), account)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?
+        .set_password(value)
+        .map_err(|e| Error::Config(format!("keychain write failed: {e}")))
+}
+
+/// Whether the OS keychain is off for this process.
+///
+/// `THCLAWS_DISABLE_KEYCHAIN` decides it when set, by VALUE — the check used
+/// to be presence-based, so `=0` silently disabled the thing it looks like it
+/// enables.
+///
+/// Otherwise the answer is "am I somewhere with a user session", and the
+/// honest signal for that is the container, not the surface. `--serve` used
+/// to force it off on the theory that serving means a headless server; that
+/// is not true of `--serve` on a laptop, and it is not true of a bot
+/// (dev-plan/59), which is a `--serve` in the user's own login session. The
+/// result was that the same user, on the same machine, with the same
+/// credential in the keychain, got "no API key" from `--serve` and a working
+/// agent from the desktop — two surfaces that differ only in how the
+/// frontend is delivered. Both container images set `THCLAWS_INSIDE_DOCKER`,
+/// so the deployments that really are headless still say so.
+pub fn keychain_disabled() -> bool {
+    match std::env::var("THCLAWS_DISABLE_KEYCHAIN") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => std::env::var("THCLAWS_INSIDE_DOCKER").ok().as_deref() == Some("1"),
+    }
+}
+
+/// Direct keychain read counterpart to [`keychain_set_raw`]. Same
+/// rationale — SSO storage uses this, not [`get`], so a Dotenv-
+/// preferring user can still sign in.
+pub fn keychain_get_raw(account: &str) -> Option<String> {
+    if keychain_disabled() {
+        return None;
+    }
+    keyring::Entry::new(crate::profile::keychain_service(), account)
+        .ok()
+        .and_then(|e| e.get_password().ok())
+}
+
+/// Direct keychain delete. Used by SSO logout to clear stored
+/// sessions on Dotenv-preferring installs.
+pub fn keychain_clear_raw(account: &str) -> Result<()> {
+    let entry = keyring::Entry::new(crate::profile::keychain_service(), account)
+        .map_err(|e| Error::Config(format!("keychain open failed: {e}")))?;
+    // `delete_credential` errors when the entry is absent — fine,
+    // treat as a no-op so logout is idempotent.
+    let _ = entry.delete_credential();
+    Ok(())
+}
+
+/// Store a key in the keychain. Respects the user's backend choice —
+/// when they picked `Dotenv`, returns an error up front instead of
+/// touching the keychain (which would trigger an OS prompt on macOS
+/// even if we then fall back). All provider keys live inside a
+/// single keychain entry so the user only sees one ACL prompt per
+/// launch regardless of how many providers they've configured.
+pub fn set(provider: &str, key: &str) -> Result<()> {
+    if resolved_backend() == Backend::Dotenv {
+        return Err(Error::Config("keychain disabled by user preference".into()));
+    }
+    let mut map = read_bundle();
+    map.insert(provider.to_string(), key.to_string());
+    write_bundle(&map)
+}
+
+/// Retrieve a key from the keychain. Goes through the single
+/// `api-keys` bundle entry (cached for the lifetime of the process)
+/// so N providers = 1 macOS prompt per launch.
+pub fn get(provider: &str) -> Option<String> {
+    if keychain_disabled() {
+        log_trace(&format!(
+            "get({provider}) → blocked by THCLAWS_DISABLE_KEYCHAIN"
+        ));
+        return None;
+    }
+    if resolved_backend() == Backend::Dotenv {
+        log_trace(&format!(
+            "get({provider}) → backend=dotenv, skipping keychain"
+        ));
+        return None;
+    }
+    log_trace(&format!("get({provider}) → bundle lookup"));
+    let map = read_bundle();
+    let result = map.get(provider).cloned();
+    log_trace(&format!(
+        "get({provider}) → returned {}",
+        if result.is_some() { "<key>" } else { "None" }
+    ));
+    result
+}
+
+fn log_trace(msg: &str) {
+    if std::env::var("THCLAWS_KEYCHAIN_TRACE").is_ok() {
+        let pid = std::process::id();
+        let loaded = std::env::var("THCLAWS_KEYCHAIN_LOADED").is_ok();
+        eprintln!("\x1b[35m[keychain pid={pid} loaded_flag={loaded}] {msg}\x1b[0m");
+    }
+}
+
+/// Delete a provider's key from the keychain bundle. Also cleans up
+/// the legacy per-provider entry if it still exists. Silently
+/// succeeds when neither store has anything to remove.
+pub fn clear(provider: &str) -> Result<()> {
+    if resolved_backend() == Backend::Dotenv {
+        return Ok(());
+    }
+    let mut map = read_bundle();
+    map.remove(provider);
+    if map.is_empty() {
+        if let Ok(entry) = bundle_entry() {
+            let _ = entry.delete_credential();
+        }
+        *bundle_cache().write().unwrap() = Some(map);
+    } else {
+        write_bundle(&map)?;
+    }
+    // Legacy single-item cleanup — harmless if already absent.
+    if let Ok(entry) = entry(provider) {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
+}
+
+/// Source of an env var's current value, for UI display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// Env var is set but we can't tell where from (shell export, previous
+    /// dotenv load, or prior keychain injection).
+    Environment,
+    /// No key is configured anywhere.
+    None,
+}
+
+/// Status entry for one provider, suitable for rendering in the UI.
+#[derive(Debug, Clone)]
+pub struct KeyStatus {
+    pub provider: &'static str,
+    pub env_var: &'static str,
+    pub configured_in_keychain: bool,
+    pub env_source: KeySource,
+    /// Length of the effective key in the process env (0 if unset). The UI
+    /// renders an asterisk string of this length as a sentinel, giving the
+    /// user a visual confirmation that a real key is loaded without ever
+    /// exposing its contents.
+    pub key_length: usize,
+    /// `"provider"` for LLM provider keys, `"service"` for non-LLM
+    /// service keys (web search, etc.). Lets the UI group them
+    /// separately even though they flow through the same modal /
+    /// IPC.
+    pub kind: &'static str,
+    /// `true` for a Featured-tier (gateway-routable) provider. The Settings
+    /// modal groups providers into "Featured (gateway-routable)" vs
+    /// "Additional (bring your own key)" using this. Always false for services.
+    pub featured: bool,
+    /// The provider's representative default model (e.g. `gpt-4.1`), shown as a
+    /// hint in the modal — mirrors the `/providers` output. Empty for services.
+    pub default_model: &'static str,
+}
+
+/// Snapshot the current state of every managed provider's API key. Used by
+/// the UI to render "configured / not configured" and decide button state.
+pub fn status() -> Vec<KeyStatus> {
+    // Iterate in display order (Featured tier first, then Additional) so the
+    // Settings modal groups exactly like `/providers`. Only emit MANAGED
+    // providers (the ones whose key we store).
+    let mut out: Vec<KeyStatus> = crate::providers::ProviderKind::display_ordered()
+        .into_iter()
+        .filter(|p| MANAGED.contains(p))
+        .filter_map(|p| {
+            let env_var = p.api_key_env()?;
+            let configured = get(p.name()).is_some();
+            let env_value = std::env::var(env_var).ok();
+            let env_source = if env_value.is_some() {
+                KeySource::Environment
+            } else {
+                KeySource::None
+            };
+            Some(KeyStatus {
+                provider: p.name(),
+                env_var,
+                configured_in_keychain: configured,
+                env_source,
+                key_length: env_value.as_deref().map(str::len).unwrap_or(0),
+                kind: "provider",
+                featured: p.tier() == crate::providers::ProviderTier::Featured,
+                default_model: p.default_model(),
+            })
+        })
+        .collect();
+    for (name, env_var) in SERVICE_KEYS {
+        let configured = get(name).is_some();
+        let env_value = std::env::var(env_var).ok();
+        let env_source = if env_value.is_some() {
+            KeySource::Environment
+        } else {
+            KeySource::None
+        };
+        out.push(KeyStatus {
+            provider: name,
+            env_var,
+            configured_in_keychain: configured,
+            env_source,
+            key_length: env_value.as_deref().map(str::len).unwrap_or(0),
+            kind: "service",
+            featured: false,
+            default_model: "",
+        });
+    }
+    out
+}
+
+/// Inject keychain-stored keys into the process environment, skipping any
+/// env var that's already set. Call **before** [`crate::dotenv::load_dotenv`]
+/// so the precedence shakes out as: shell export > keychain > dotenv.
+pub fn load_into_env() {
+    log_trace("load_into_env() enter");
+    match get_backend() {
+        Some(Backend::Keychain) => {}
+        other => {
+            log_trace(&format!(
+                "load_into_env() → backend={:?}, returning early",
+                other
+            ));
+            return;
+        }
+    }
+    if std::env::var("THCLAWS_KEYCHAIN_LOADED").is_ok() {
+        log_trace("load_into_env() → THCLAWS_KEYCHAIN_LOADED already set, returning early");
+        return;
+    }
+    log_trace("load_into_env() → walking MANAGED providers");
+    for p in MANAGED {
+        let Some(env_var) = p.api_key_env() else {
+            continue;
+        };
+        if std::env::var(env_var).is_ok() {
+            log_trace(&format!(
+                "load_into_env() → {} already in env, skip",
+                env_var
+            ));
+            continue;
+        }
+        if let Some(key) = get(p.name()) {
+            std::env::set_var(env_var, key);
+        }
+    }
+    log_trace("load_into_env() → walking SERVICE_KEYS");
+    for (name, env_var) in SERVICE_KEYS {
+        if std::env::var(env_var).is_ok() {
+            log_trace(&format!(
+                "load_into_env() → {} already in env, skip",
+                env_var
+            ));
+            continue;
+        }
+        if let Some(key) = get(name) {
+            std::env::set_var(env_var, key);
+        }
+    }
+    std::env::set_var("THCLAWS_KEYCHAIN_LOADED", "1");
+    log_trace("load_into_env() → done, exported THCLAWS_KEYCHAIN_LOADED=1");
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// dev-plan/59: `--serve` and the desktop differ only in how the frontend
+    /// is delivered. They must not differ in whether a user's keychain
+    /// credential is readable — that produced "no API key" on one surface and
+    /// a working agent on the other, same machine, same user, same key.
+    #[test]
+    fn the_keychain_is_off_for_containers_and_by_explicit_value_only() {
+        let _g = crate::kms::test_env_lock();
+        let prev_dis = std::env::var("THCLAWS_DISABLE_KEYCHAIN").ok();
+        let prev_doc = std::env::var("THCLAWS_INSIDE_DOCKER").ok();
+        std::env::remove_var("THCLAWS_DISABLE_KEYCHAIN");
+        std::env::remove_var("THCLAWS_INSIDE_DOCKER");
+
+        // A user's own machine — desktop, `--serve`, or a bot alike.
+        assert!(!keychain_disabled());
+
+        // The deployments that really are headless say so themselves; both
+        // container images set this.
+        std::env::set_var("THCLAWS_INSIDE_DOCKER", "1");
+        assert!(keychain_disabled());
+        std::env::remove_var("THCLAWS_INSIDE_DOCKER");
+
+        // Explicit beats everything, and is read by VALUE: `=0` used to
+        // disable the very thing it reads as enabling.
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "1");
+        assert!(keychain_disabled());
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "true");
+        assert!(keychain_disabled());
+        std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", "0");
+        assert!(!keychain_disabled());
+        std::env::set_var("THCLAWS_INSIDE_DOCKER", "1");
+        assert!(
+            !keychain_disabled(),
+            "an explicit 0 wins inside a container too"
+        );
+
+        match prev_dis {
+            Some(v) => std::env::set_var("THCLAWS_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("THCLAWS_DISABLE_KEYCHAIN"),
+        }
+        match prev_doc {
+            Some(v) => std::env::set_var("THCLAWS_INSIDE_DOCKER", v),
+            None => std::env::remove_var("THCLAWS_INSIDE_DOCKER"),
+        }
+    }
+    use super::*;
+
+    #[test]
+    fn status_lists_known_providers() {
+        let s = status();
+        let names: Vec<_> = s.iter().map(|k| k.provider).collect();
+        assert!(names.contains(&"anthropic"));
+        assert!(names.contains(&"openai"));
+        assert!(names.contains(&"gemini"));
+        assert!(names.contains(&"dashscope"));
+        assert!(names.contains(&"openai-compat"));
+        // Service keys (web search) surface in the same modal.
+        assert!(names.contains(&"tavily"));
+        assert!(names.contains(&"brave-search"));
+        // …and so do non-search runtime services like the LTX video key
+        // and the iApp image key.
+        assert!(names.contains(&"ltx"));
+        assert!(names.contains(&"iapp"));
+    }
+
+    #[test]
+    fn status_marks_kind_per_entry() {
+        let s = status();
+        let tavily = s.iter().find(|k| k.provider == "tavily").unwrap();
+        assert_eq!(tavily.kind, "service");
+        assert_eq!(tavily.env_var, "TAVILY_API_KEY");
+        let brave = s.iter().find(|k| k.provider == "brave-search").unwrap();
+        assert_eq!(brave.kind, "service");
+        assert_eq!(brave.env_var, "BRAVE_SEARCH_API_KEY");
+        let ltx = s.iter().find(|k| k.provider == "ltx").unwrap();
+        assert_eq!(ltx.kind, "service");
+        assert_eq!(ltx.env_var, "LTX_API_KEY");
+        let iapp = s.iter().find(|k| k.provider == "iapp").unwrap();
+        assert_eq!(iapp.kind, "service");
+        assert_eq!(iapp.env_var, "IAPP_API_KEY");
+        let anthropic = s.iter().find(|k| k.provider == "anthropic").unwrap();
+        assert_eq!(anthropic.kind, "provider");
+    }
+
+    #[test]
+    fn service_env_var_resolves_known_services() {
+        assert_eq!(service_env_var("tavily"), Some("TAVILY_API_KEY"));
+        assert_eq!(
+            service_env_var("brave-search"),
+            Some("BRAVE_SEARCH_API_KEY")
+        );
+        assert_eq!(service_env_var("ltx"), Some("LTX_API_KEY"));
+        assert_eq!(service_env_var("anthropic"), None);
+        assert_eq!(service_env_var(""), None);
+    }
+}

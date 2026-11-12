@@ -1,0 +1,288 @@
+import { useEffect, useState } from "react";
+import { basePath, botQuery, send, subscribe, type IPCMessage } from "../hooks/useIPC";
+import { currentBranding } from "../hooks/useBranding";
+import type { BotStatus } from "./BotRail";
+
+// dev-plan/59 §6.3: the workspace's own surface — what belongs to no single
+// bot. It hangs off the rail rather than the tab strip, because tabs belong
+// to a bot.
+//
+// Installing a bot is a HOST action, not something an agent does for you: a
+// bot's sandbox root is its own folder, so it cannot write a sibling's. That
+// is the trust model working, and it is why this is a form rather than a
+// chat request.
+
+type ActionResult = { log?: string[] };
+
+type Template = { slug: string; name: string; description: string };
+type Templates = { templates: Template[]; error?: string };
+
+/** The catalogue's Agent Templates, through the host (it holds the cloud URL
+ * and token `/cloud get` installs with). Same bridge split as `hostAction`. */
+async function fetchTemplates(): Promise<Templates> {
+  if (typeof window !== "undefined" && window.ipc) {
+    return new Promise<Templates>((resolve) => {
+      const off = subscribe((msg: IPCMessage) => {
+        if (msg.type !== "bots_templates_result") return;
+        off();
+        resolve({
+          templates: Array.isArray(msg.templates) ? (msg.templates as Template[]) : [],
+          error: msg.ok === false && typeof msg.error === "string" ? msg.error : undefined,
+        });
+      });
+      send({ type: "bots_templates" });
+    });
+  }
+  try {
+    const res = await fetch(`${basePath()}bots/templates${botQuery(null)}`);
+    const v = (await res.json()) as Record<string, unknown>;
+    return {
+      templates: Array.isArray(v.templates) ? (v.templates as Template[]) : [],
+      error: v.ok === false && typeof v.error === "string" ? v.error : undefined,
+    };
+  } catch (e) {
+    return { templates: [], error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * One host mutation. In a browser it is an HTTP call to the host; on the
+ * desktop it goes over the IPC bridge, because a `fetch` there would reach
+ * the `thclaws://` protocol handler — which serves files, not the host — and
+ * the window answers with a `bots_action_result` frame instead.
+ */
+async function hostAction(
+  kind: "bots_add" | "bots_remove" | "bots_restart",
+  slug: string,
+  purge = false,
+  blank = false,
+): Promise<ActionResult> {
+  if (typeof window !== "undefined" && window.ipc) {
+    return new Promise<ActionResult>((resolve, reject) => {
+      const off = subscribe((msg: IPCMessage) => {
+        if (msg.type !== "bots_action_result") return;
+        off();
+        if (msg.ok === true) {
+          resolve({ log: Array.isArray(msg.log) ? (msg.log as string[]) : [] });
+        } else {
+          reject(new Error(typeof msg.error === "string" ? msg.error : "failed"));
+        }
+      });
+      send({ type: kind, slug, purge, blank });
+    });
+  }
+  const [method, path, body] =
+    kind === "bots_add"
+      ? ["POST", "bots", JSON.stringify({ slug, blank })]
+      : kind === "bots_remove"
+        ? ["DELETE", `bots/${encodeURIComponent(slug)}`, undefined]
+        : ["POST", `bots/${encodeURIComponent(slug)}/restart`, undefined];
+  const res = await fetch(`${basePath()}${path}${botQuery(null)}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body,
+  });
+  const parsed = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok || parsed.ok === false) {
+    throw new Error(
+      typeof parsed.error === "string" ? parsed.error : `HTTP ${res.status}`,
+    );
+  }
+  return { log: Array.isArray(parsed.log) ? (parsed.log as string[]) : [] };
+}
+
+export function HostPanel({
+  bots,
+  onClose,
+  onChanged,
+}: {
+  bots: BotStatus[];
+  onClose: () => void;
+  onChanged: () => void | Promise<unknown>;
+}) {
+  // One "add an agent" form: blank is the default — it needs only a name —
+  // and a template is picked from the catalogue's list, never typed. Two
+  // free-text boxes side by side read as "type a name here", and a name typed
+  // into the template box went off to the catalogue and came back a 404.
+  const [mode, setMode] = useState<"blank" | "template">("blank");
+  const [name, setName] = useState("");
+  const [template, setTemplate] = useState("");
+  const [templates, setTemplates] = useState<Templates | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [log, setLog] = useState<string[]>([]);
+
+  useEffect(() => {
+    let live = true;
+    void fetchTemplates().then((t) => {
+      if (live) setTemplates(t);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const run = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      await onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const canAdd = !busy && (mode === "blank" ? !!name.trim() : !!template);
+  const addAgent = () =>
+    run(async () => {
+      const done =
+        mode === "blank"
+          ? await hostAction("bots_add", name.trim(), false, true)
+          : await hostAction("bots_add", template);
+      setLog(done.log ?? []);
+      setName("");
+      setTemplate("");
+    });
+
+  const remove = (s: string) => run(() => hostAction("bots_remove", s));
+  const restart = (s: string) => run(() => hostAction("bots_restart", s));
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--modal-backdrop)]"
+      onClick={onClose}
+    >
+      <div
+        className="w-[520px] max-w-[92vw] max-h-[80vh] overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-4 text-sm"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-semibold">Agents in this workspace</h2>
+          <button
+            onClick={onClose}
+            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          >
+            ✕
+          </button>
+        </div>
+
+        <ul className="mb-4 divide-y divide-[var(--border)]">
+          {bots.map((b) => (
+            <li key={b.slug} className="flex items-center gap-2 py-2">
+              <span className="flex-1 min-w-0 truncate">{b.name}</span>
+              <span className="text-xs text-[var(--text-secondary)]">
+                {b.state}
+              </span>
+              <button
+                disabled={busy}
+                onClick={() => restart(b.slug)}
+                title={
+                  b.state === "crash_looped"
+                    ? `${currentBranding().name} stopped retrying this agent; try again`
+                    : "Stop and start this agent"
+                }
+                className="px-2 py-0.5 rounded text-xs border border-[var(--border)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)]"
+              >
+                Restart
+              </button>
+              <button
+                disabled={busy || bots.length < 2}
+                onClick={() => remove(b.slug)}
+                title={
+                  bots.length < 2
+                    ? "A workspace always has at least one agent"
+                    : "Remove from this workspace. Its folder — sessions, logins — stays on disk."
+                }
+                className="px-2 py-0.5 rounded text-xs border border-[var(--border)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)]"
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+
+        <h3 className="font-semibold mb-2">Add an agent</h3>
+        <div className="flex gap-4 mb-2">
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input
+              type="radio"
+              checked={mode === "blank"}
+              onChange={() => setMode("blank")}
+            />
+            Blank agent
+          </label>
+          <label
+            className={`flex items-center gap-1.5 ${
+              templates?.templates.length ? "cursor-pointer" : "opacity-50"
+            }`}
+          >
+            <input
+              type="radio"
+              checked={mode === "template"}
+              disabled={!templates?.templates.length}
+              onChange={() => setMode("template")}
+            />
+            From an Agent Template
+          </label>
+        </div>
+
+        {mode === "blank" ? (
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && canAdd) void addAgent();
+            }}
+            placeholder="name for the new agent, e.g. scratch"
+            className="w-full px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)]"
+          />
+        ) : (
+          <select
+            value={template}
+            onChange={(e) => setTemplate(e.target.value)}
+            className="w-full px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)]"
+          >
+            <option value="">Choose a template…</option>
+            {templates?.templates.map((t) => (
+              <option key={t.slug} value={t.slug} title={t.description}>
+                {t.name} ({t.slug})
+              </option>
+            ))}
+          </select>
+        )}
+        <p className="mt-1 text-xs text-[var(--text-secondary)]">
+          {mode === "template"
+            ? (templates?.templates.find((t) => t.slug === template)?.description ??
+              "The template is copied into the workspace as a new agent.")
+            : templates && !templates.templates.length
+              ? "An empty agent, like opening thClaws on a new folder. No Agent Templates are available here yet."
+              : "An empty agent, like opening thClaws on a new folder."}
+        </p>
+
+        <div className="flex justify-end mt-3">
+          <button
+            disabled={!canAdd}
+            onClick={() => void addAgent()}
+            className="px-3 py-1 rounded bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40"
+          >
+            {busy ? "Working…" : mode === "blank" ? "Create agent" : "Add template"}
+          </button>
+        </div>
+
+        {error && (
+          <pre className="mt-3 whitespace-pre-wrap text-xs text-[var(--danger)]">
+            {error}
+          </pre>
+        )}
+        {log.length > 0 && (
+          <pre className="mt-3 whitespace-pre-wrap text-xs text-[var(--text-secondary)]">
+            {log.join("\n")}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}

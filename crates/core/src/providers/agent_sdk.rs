@@ -1,0 +1,937 @@
+//! Claude Agent SDK provider — runs Claude Code as a local subprocess over
+//! the Agent SDK control protocol.
+//!
+//! Spawns:
+//!   `claude --output-format stream-json --input-format stream-json --verbose
+//!    --permission-mode bypassPermissions --system-prompt <sys> [--model <m>]
+//!    [--session-id <sid>]`
+//!
+//! Protocol (matches anthropics/claude-agent-sdk-python):
+//!
+//!   1. We send an `initialize` control_request on stdin:
+//!        `{"type":"control_request","request_id":"req_<n>","request":{"subtype":"initialize","hooks":null}}`
+//!   2. CLI replies with a matching `control_response` on stdout. We wait for
+//!      it before anything else — otherwise the CLI ignores user input.
+//!   3. We write a user message envelope on stdin:
+//!        `{"type":"user","session_id":"","message":{"role":"user","content":"..."},"parent_tool_use_id":null}`
+//!   4. We keep stdin open when the SDK MCP bridge is wired, because the
+//!      CLI drives that bridge over it — including DURING step 2, before
+//!      our own ack arrives. Only a bridge-less provider drops stdin
+//!      here (that path relies on EOF to commit the session file).
+//!   5. We stream stdout lines and parse events. Terminal event is
+//!      `{"type":"result",...}` — emit MessageStop with usage.
+//!
+//! Model prefix: `agent/` (e.g. `agent/claude-sonnet-4-6`). Billing goes
+//! through the user's Claude subscription — no ANTHROPIC_API_KEY required.
+//!
+//! Session persistence: we capture `session_id` from whichever frame
+//! surfaces it first, store it in an `Arc<Mutex<Option<String>>>` owned by
+//! the provider, and pass `--session-id <uuid>` on subsequent turns so the
+//! CLI resumes the same conversation server-side.
+
+use super::{EventStream, ModelInfo, Provider, ProviderEvent, StreamRequest};
+use crate::error::{Error, Result};
+use crate::tools::ToolRegistry;
+use async_stream::try_stream;
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdout, Command};
+
+pub struct AgentSdkProvider {
+    /// Path to the `claude` CLI binary.
+    claude_bin: String,
+    /// Reusable session ID for context persistence.
+    session_id: Arc<Mutex<Option<String>>>,
+    /// Monotonic request id counter for control_request messages.
+    next_req: Arc<Mutex<u64>>,
+    /// Tools to expose to the subprocess via the in-process SDK MCP
+    /// server (`crate::sdk_mcp`). `None` → no bridge: built-ins stay
+    /// enabled and the subprocess can't see thClaws's tools.
+    tools: Option<Arc<ToolRegistry>>,
+}
+
+/// `CLAUDE_BIN`, unless it is a relative path: that resolves against the
+/// project folder, so a cloned repo could name its own binary.
+pub fn claude_bin() -> String {
+    match std::env::var("CLAUDE_BIN") {
+        Ok(b)
+            if !b.is_empty()
+                && (std::path::Path::new(&b).is_absolute() || !b.contains(['/', '\\'])) =>
+        {
+            b
+        }
+        _ => "claude".to_string(),
+    }
+}
+
+impl AgentSdkProvider {
+    pub fn new() -> Self {
+        Self {
+            claude_bin: claude_bin(),
+            session_id: Arc::new(Mutex::new(None)),
+            next_req: Arc::new(Mutex::new(0)),
+            tools: None,
+        }
+    }
+
+    pub fn with_bin(mut self, bin: impl Into<String>) -> Self {
+        self.claude_bin = bin.into();
+        self
+    }
+
+    /// Wire up the SDK MCP bridge: Claude Code's built-in tools are
+    /// disabled, thClaws's tools are exposed via in-process MCP.
+    pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Default bridge registry: every always-on tool registered in
+    /// the standard built-in set plus the KMS + Memory + Todo
+    /// surfaces. Excluded-from-bridge tools (Task, Team*, AskUser,
+    /// plan-mode tools) are filtered at `sdk_mcp::handle_mcp_message`
+    /// time. Used by `build_provider` so the bridge stands up
+    /// without the caller threading their own registry.
+    ///
+    /// Returns it unwrapped so the caller can still apply the operator's
+    /// `--allowed-tools` / `--disallowed-tools` before handing it over —
+    /// the bridge is a separate registry from the agent's, and skipping
+    /// that step let a restricted run reach unrestricted tools.
+    pub fn default_bridge_registry() -> ToolRegistry {
+        let mut r = ToolRegistry::with_builtins();
+        r.register(Arc::new(crate::tools::KmsReadTool));
+        r.register(Arc::new(crate::tools::KmsSearchTool));
+        r.register(Arc::new(crate::tools::KmsWriteTool));
+        r.register(Arc::new(crate::tools::KmsWriteSourceTool));
+        r.register(Arc::new(crate::tools::KmsAppendTool));
+        r.register(Arc::new(crate::tools::KmsEditTool));
+        r.register(Arc::new(crate::tools::KmsDeleteTool));
+        r.register(Arc::new(crate::tools::KmsCreateTool));
+        r
+    }
+
+    fn next_request_id(&self) -> String {
+        let mut n = self.next_req.lock().unwrap();
+        *n += 1;
+        // Random-ish suffix to avoid collisions across runs of the same
+        // provider instance.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!("req_{}_{:08x}", *n, nanos)
+    }
+}
+
+impl Default for AgentSdkProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolve the `claude` CLI to a spawnable path.
+///
+/// - An explicit `configured` value (anything other than the bare
+///   `"claude"` default — i.e. a `CLAUDE_BIN`/`with_bin` override) is
+///   respected verbatim.
+/// - Otherwise, if `claude` is found on the current `PATH`, use the bare
+///   name (lets the OS resolve it — the terminal-launch happy path).
+/// - Otherwise fall back to the well-known install locations a
+///   GUI/launchd launch misses (its PATH is `/usr/bin:/bin:…`). Returns
+///   the first that exists; if none, returns `"claude"` unchanged so the
+///   caller's not-found error still fires with a helpful message.
+fn resolve_claude_bin(configured: &str) -> String {
+    if configured != "claude" {
+        return configured.to_string();
+    }
+    if let Some(p) = find_on_path("claude") {
+        return p.to_string_lossy().into_owned();
+    }
+    let home = crate::util::home_dir();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        for rel in [
+            ".claude/local/claude", // Claude Code's native installer
+            ".local/bin/claude",
+            ".npm-global/bin/claude",
+            ".volta/bin/claude",
+            ".bun/bin/claude",
+            ".yarn/bin/claude",
+        ] {
+            candidates.push(h.join(rel));
+        }
+    }
+    for abs in [
+        "/opt/homebrew/bin/claude", // Apple-Silicon Homebrew
+        "/usr/local/bin/claude",    // Intel Homebrew / manual
+        "/usr/bin/claude",
+    ] {
+        candidates.push(std::path::PathBuf::from(abs));
+    }
+    for c in candidates {
+        if c.is_file() {
+            return c.to_string_lossy().into_owned();
+        }
+    }
+    "claude".to_string()
+}
+
+/// First `<dir>/<name>` on `PATH` that is a file. `None` if `PATH` is
+/// unset or the binary isn't found (the GUI/launchd case).
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let p = dir.join(name);
+        p.is_file().then_some(p)
+    })
+}
+
+/// Answer one `control_request` from the CLI on the SDK MCP bridge.
+///
+/// Shared by the initialize-ack wait and the main stream loop: the CLI
+/// can drive the bridge from the moment it has read `initialize`, so
+/// both windows have to be able to reply. Anything that isn't an
+/// `mcp_message` for our server is left alone — the CLI treats an
+/// unanswered request as a timeout, but answering one we don't
+/// understand would be worse.
+async fn answer_bridge_request(
+    v: &Value,
+    stdin: &mut tokio::process::ChildStdin,
+    tools: Option<&Arc<ToolRegistry>>,
+) {
+    if v.pointer("/request/subtype").and_then(Value::as_str) != Some("mcp_message") {
+        return;
+    }
+    if v.pointer("/request/server_name").and_then(Value::as_str)
+        != Some(crate::sdk_mcp::SERVER_NAME)
+    {
+        return;
+    }
+    let req_id = v
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mcp_msg = v
+        .pointer("/request/message")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mcp_resp = match tools {
+        Some(reg) => crate::sdk_mcp::handle_mcp_message(reg.clone(), &mcp_msg).await,
+        None => json!({
+            "jsonrpc": "2.0",
+            "id": mcp_msg.get("id").cloned().unwrap_or(Value::Null),
+            "error": { "code": -32601, "message": "no tools registry attached" },
+        }),
+    };
+    let envelope = json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": req_id,
+            "response": { "mcp_response": mcp_resp },
+        },
+    });
+    if let Err(e) = stdin.write_all(envelope.to_string().as_bytes()).await {
+        eprintln!("[agent-sdk] mcp bridge (init window): stdin write failed: {e}");
+        return;
+    }
+    let _ = stdin.write_all(b"\n").await;
+    let _ = stdin.flush().await;
+}
+
+/// The `message.content` we hand the CLI for this turn.
+///
+/// Prior history lives server-side under `--session-id`, so only the new
+/// user message travels. It used to travel as the first text block and
+/// nothing else, which silently dropped a pasted or dragged image —
+/// under `agent/*` the model answered as if none had been attached
+/// (public issue #185, reported by HelloMAF).
+///
+/// A text-only turn still serializes as a bare string, which is what the
+/// CLI has always received; a turn carrying an image switches to the
+/// block array. `ContentBlock`'s serde tagging already emits the
+/// Anthropic wire shape the CLI accepts, so the blocks pass through
+/// as-is. Non-user-authored blocks (thinking, tool_use, tool_result) are
+/// history, not input, and stay out.
+fn user_turn_content(last: Option<&crate::types::Message>) -> Value {
+    use crate::types::ContentBlock;
+    let Some(msg) = last else {
+        return Value::String(String::new());
+    };
+    let carries_image = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
+    if !carries_image {
+        let text = msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return Value::String(text);
+    }
+    let blocks: Vec<Value> = msg
+        .content
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. }))
+        .filter_map(|b| serde_json::to_value(b).ok())
+        .collect();
+    Value::Array(blocks)
+}
+
+/// Tool flags for the `claude` subprocess, which runs under
+/// `bypassPermissions`. `--allowedTools` only auto-approves; it does not
+/// remove anything, so Claude Code's own Bash/Write/Edit/WebFetch stayed
+/// callable with no prompt, sandbox, hook or audit (#5). `--tools ""` turns
+/// every built-in off, and `--strict-mcp-config` keeps the project's own
+/// `.mcp.json` from starting servers outside thClaws. What is left is
+/// thClaws's bridge (`bridged`), an MCP server and so not a built-in.
+fn tool_args(bridged: Option<Vec<String>>) -> Vec<String> {
+    let mut args = vec![
+        "--tools".to_string(),
+        String::new(),
+        "--strict-mcp-config".to_string(),
+    ];
+    if let Some(patterns) = bridged {
+        args.push("--mcp-config".into());
+        args.push(crate::sdk_mcp::mcp_config_value().to_string());
+        args.push("--allowedTools".into());
+        args.push(patterns.join(","));
+    }
+    args
+}
+
+#[async_trait]
+impl Provider for AgentSdkProvider {
+    async fn stream(&self, req: StreamRequest) -> Result<EventStream> {
+        // Pull the user's latest turn. Prior history lives server-side under
+        // --session-id, so we only send the new user message.
+        let user_content = user_turn_content(req.messages.last());
+
+        // Build the CLI command. Resolve `claude` robustly: a GUI /
+        // launchd-launched app inherits a minimal PATH (no ~/.local/bin,
+        // Homebrew, npm, …) so a bare `claude` spawn ENOENTs even when it
+        // works from a terminal (public issues #174/#176).
+        let bin = resolve_claude_bin(&self.claude_bin);
+        let mut cmd = Command::new(&bin);
+
+        // Windows gives a console-subsystem child its own window, and this
+        // one is spawned per turn — so a normal back-and-forth flashes a
+        // black box that steals focus on every message (public issue #186,
+        // reported by HelloMAF). Same flag `context.rs` and `schedule.rs`
+        // already pass; this spawn was simply missed.
+        #[cfg(target_os = "windows")]
+        {
+            // tokio's Command has `creation_flags` itself; no trait import.
+            cmd.creation_flags(0x08000000);
+        }
+
+        cmd.arg("--output-format")
+            .arg("stream-json")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            // Don't block on permission prompts — thClaws is the surface the
+            // user interacts with; let Claude just run.
+            .arg("--permission-mode")
+            .arg("bypassPermissions");
+
+        // Write system prompt to a temp file to avoid OS ARG_MAX limits.
+        // With MCP tools + CLAUDE.md + skills, the prompt can exceed 128KB
+        // which hits MAX_ARG_STRLEN when passed as a CLI argument.
+        // Uses tempfile for: unique name (no race), mode 0600 (no leak),
+        // O_EXCL (no symlink attack). Kept alive until after spawn.
+        let system = req.system.clone().unwrap_or_default();
+        let _prompt_guard: Option<tempfile::TempPath> = if system.is_empty() {
+            cmd.arg("--system-prompt").arg("");
+            None
+        } else {
+            use std::io::Write as _;
+            let mut tmp = tempfile::Builder::new()
+                .prefix("thclaws-sdk-prompt-")
+                .suffix(".txt")
+                .tempfile()
+                .map_err(|e| Error::Provider(format!("failed to create prompt temp file: {e}")))?;
+            tmp.write_all(system.as_bytes()).map_err(|e| {
+                Error::Provider(format!(
+                    "failed to write system prompt file {}: {e}",
+                    tmp.path().display()
+                ))
+            })?;
+            let prompt_path = tmp.into_temp_path();
+            cmd.arg("--system-prompt-file").arg(prompt_path.as_os_str());
+            Some(prompt_path)
+        };
+
+        // Strip the `agent/` prefix for the actual model name.
+        let model = req.model.strip_prefix("agent/").unwrap_or(&req.model);
+        if !model.is_empty() {
+            cmd.arg("--model").arg(model);
+        }
+
+        // Resume the previous session when we have one. `--resume <uuid>`
+        // reattaches to an existing session; `--session-id` is for *setting*
+        // a new session's id and errors with "Session ID is already in use"
+        // if we re-pass it on turn 2.
+        {
+            let guard = self.session_id.lock().unwrap();
+            if let Some(ref sid) = *guard {
+                cmd.arg("--resume").arg(sid);
+            }
+        }
+
+        cmd.args(tool_args(
+            self.tools
+                .as_ref()
+                .map(|t| crate::sdk_mcp::allowed_tool_patterns(t)),
+        ));
+
+        // Mirror the Python SDK env hygiene: identify ourselves via
+        // CLAUDE_CODE_ENTRYPOINT, and scrub CLAUDECODE so the child doesn't
+        // think it's nested inside another Claude Code session.
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", "sdk-thclaws");
+        cmd.env_remove("CLAUDECODE");
+
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Provider(format!(
+                    "spawn claude: '{bin}' not found. The Claude Code CLI (`claude`) isn't on \
+                     this process's PATH — common when thClaws is launched from the macOS \
+                     Finder/Dock (or a scheduled job), which don't inherit your shell PATH. \
+                     Fix: install Claude Code, or set CLAUDE_BIN to its full path (e.g. \
+                     `~/.claude/local/claude`), or use a native provider model instead of \
+                     `agent/*`."
+                ))
+            } else {
+                Error::Provider(format!("spawn claude: {e}"))
+            }
+        })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Provider("no stdin handle".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Provider("no stdout handle".into()))?;
+        let stderr = child.stderr.take();
+
+        // Pipe child stderr to our stderr for visibility. Warnings about
+        // outdated CLI version, auth problems, etc. surface here.
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 {
+                        break;
+                    }
+                    eprint!("\x1b[2m[claude] {}\x1b[0m", line);
+                    line.clear();
+                }
+            });
+        }
+
+        let mut reader = BufReader::new(stdout);
+
+        // ── 1. Send initialize ────────────────────────────────────────────
+        let init_id = self.next_request_id();
+        let init_req = json!({
+            "type": "control_request",
+            "request_id": init_id,
+            "request": { "subtype": "initialize", "hooks": null }
+        });
+        stdin
+            .write_all(init_req.to_string().as_bytes())
+            .await
+            .map_err(|e| Error::Provider(format!("write initialize: {e}")))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| Error::Provider(format!("write initialize: {e}")))?;
+
+        // ── 2. Wait for initialize response ──────────────────────────────
+        // Anything that arrives before the response is discarded — the CLI
+        // shouldn't emit anything else prior to it, but we stay defensive.
+        let mut ack_line = String::new();
+        loop {
+            ack_line.clear();
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                reader.read_line(&mut ack_line),
+            )
+            .await
+            .map_err(|_| {
+                Error::Provider(
+                    "claude agent SDK: timed out waiting for initialize response. \
+                     Is the claude CLI version current? (`claude --version`)"
+                        .into(),
+                )
+            })?
+            .map_err(|e| Error::Provider(format!("read initialize: {e}")))?;
+            if n == 0 {
+                return Err(Error::Provider(
+                    "claude agent SDK: process exited before initialize response".into(),
+                ));
+            }
+            let trimmed = ack_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            // Claude Code opens its side of the SDK MCP bridge as soon as
+            // it has processed `initialize` — so its own `control_request`
+            // lands in this window, BEFORE our ack arrives. Skipping it
+            // (which this loop used to do) left the CLI waiting on a reply
+            // that never came: it burned its full 60s control timeout,
+            // then re-drove the bridge and answered normally. That is the
+            // whole of public issue #188 — a flat ~60s on every single
+            // agent/* turn, independent of prompt size, tool count and
+            // model, which is why it reproduced under Ollama too.
+            if v.get("type").and_then(Value::as_str) == Some("control_request") {
+                answer_bridge_request(&v, &mut stdin, self.tools.as_ref()).await;
+                continue;
+            }
+            if v.get("type").and_then(Value::as_str) != Some("control_response") {
+                continue;
+            }
+            if v.pointer("/response/request_id").and_then(Value::as_str) == Some(&init_id) {
+                break;
+            }
+        }
+
+        // ── 3. Send user message ─────────────────────────────────────────
+        let user_msg = json!({
+            "type": "user",
+            "session_id": "",
+            "message": { "role": "user", "content": user_content },
+            "parent_tool_use_id": null,
+        });
+        stdin
+            .write_all(user_msg.to_string().as_bytes())
+            .await
+            .map_err(|e| Error::Provider(format!("write user message: {e}")))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| Error::Provider(format!("write user message: {e}")))?;
+
+        // Keep stdin open when the SDK MCP bridge is wired up: Claude
+        // Code sends `control_request { subtype: "mcp_message" }`
+        // back to us for every `tools/list` and `tools/call`. Drop
+        // stdin only when no bridge is configured — preserves the
+        // pre-bridge behavior of letting the CLI commit the session
+        // file on EOF.
+        let stdin_for_stream = if self.tools.is_some() {
+            Some(stdin)
+        } else {
+            drop(stdin);
+            None
+        };
+
+        // ── 4. Stream stdout until `result` ──────────────────────────────
+        let session_for_stream = self.session_id.clone();
+        let tools_for_stream = self.tools.clone();
+        let raw_dump = super::RawDump::new(format!("agent-sdk {}", req.model));
+        let event_stream = try_stream! {
+            // Hold the child handle so the subprocess is reaped when the
+            // stream is dropped.
+            let _child = child;
+            let mut reader: BufReader<ChildStdout> = reader;
+            let mut stdin_handle = stdin_for_stream;
+            let bridge_tools = tools_for_stream;
+            let mut line_buf = String::new();
+            let mut seen_start = false;
+            let mut first_text_yielded = false;
+            let mut raw = raw_dump;
+            let mut active_tools: std::collections::HashMap<String, crate::tool_display::ActiveToolDisplay> =
+                std::collections::HashMap::new();
+            // Fallback counter for tool_use blocks the CLI emits without an id.
+            let mut anon_counter: u32 = 0;
+            loop {
+                line_buf.clear();
+
+                let heartbeat_delay = if !active_tools.is_empty() {
+                    crate::tool_display::next_heartbeat_delay(&active_tools)
+                } else {
+                    std::time::Duration::from_secs(300)
+                };
+
+                let got_line: std::result::Result<Option<usize>, std::io::Error> =
+                    tokio::select! {
+                        biased;
+                        result = reader.read_line(&mut line_buf) => { result.map(Some) }
+                        _ = tokio::time::sleep(heartbeat_delay) => { Ok(None) }
+                    };
+                let got_line = got_line
+                    .map_err(|e| Error::Provider(format!("read stdout: {e}")))?;
+
+                if let Some(0) = got_line { break; } // EOF
+
+                if got_line.is_none() {
+                    yield ProviderEvent::Progress(super::ProgressKind::Thinking);
+                    continue;
+                }
+
+                let trimmed = line_buf.trim();
+                if trimmed.is_empty() { continue; }
+                let Ok(v) = serde_json::from_str::<Value>(trimmed) else { continue };
+                let msg_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+
+                // Capture the session id the first time it appears so the
+                // next turn can pass --session-id <uuid>.
+                if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
+                    if !sid.is_empty() {
+                        *session_for_stream.lock().unwrap() = Some(sid.to_string());
+                    }
+                }
+
+                if !seen_start {
+                    yield ProviderEvent::MessageStart { model: req.model.clone() };
+                    seen_start = true;
+                }
+
+                match msg_type {
+                    // Full assistant message (claude -p emits one per reply,
+                    // not per token). Content is an array of typed blocks.
+                    "assistant" => {
+                        if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
+                            for block in blocks {
+                                let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+                                match btype {
+                                    "text" => {
+                                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                            if !text.is_empty() {
+                                                raw.push(text);
+                                                let s = if first_text_yielded {
+                                                    format!("\n\n{text}")
+                                                } else {
+                                                    first_text_yielded = true;
+                                                    text.to_string()
+                                                };
+                                                yield ProviderEvent::TextDelta(s);
+                                            }
+                                        }
+                                    }
+                                    "tool_use" => {
+                                        let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                                        let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                                        let label = crate::tool_display::tool_label(name, &input);
+                                        let tracking_id = if id.is_empty() {
+                                            anon_counter += 1;
+                                            format!("__anon_{anon_counter}")
+                                        } else {
+                                            id
+                                        };
+                                        yield ProviderEvent::Progress(super::ProgressKind::ToolStart {
+                                            id: tracking_id.clone(),
+                                            label: label.clone(),
+                                        });
+                                        active_tools.insert(
+                                            tracking_id,
+                                            crate::tool_display::ActiveToolDisplay::new(label),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    "user" => {
+                        if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
+                            for block in blocks {
+                                let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+                                if btype == "tool_result" {
+                                    let tu_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                                    let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                                    if let Some(td) = active_tools.remove(tu_id) {
+                                        yield ProviderEvent::Progress(super::ProgressKind::ToolDone {
+                                            id: tu_id.to_string(),
+                                            label: td.label.clone(),
+                                            is_error,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // no-op: active_tools draining handled above
+                    }
+                    "control_request" => {
+                        let req_id = v.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let subtype = v.pointer("/request/subtype").and_then(Value::as_str).unwrap_or("");
+                        if subtype == "mcp_message" {
+                            let server_name = v.pointer("/request/server_name").and_then(Value::as_str).unwrap_or("");
+                            if server_name == crate::sdk_mcp::SERVER_NAME {
+                                let mcp_msg = v.pointer("/request/message").cloned().unwrap_or(Value::Null);
+                                let mcp_resp = match &bridge_tools {
+                                    Some(reg) => crate::sdk_mcp::handle_mcp_message(reg.clone(), &mcp_msg).await,
+                                    None => json!({
+                                        "jsonrpc":"2.0",
+                                        "id": mcp_msg.get("id").cloned().unwrap_or(Value::Null),
+                                        "error": { "code": -32601, "message": "no tools registry attached" },
+                                    }),
+                                };
+                                let envelope = json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": req_id,
+                                        "response": { "mcp_response": mcp_resp },
+                                    },
+                                });
+                                if let Some(stdin) = stdin_handle.as_mut() {
+                                    if let Err(e) = stdin.write_all(envelope.to_string().as_bytes()).await {
+                                        eprintln!("[agent-sdk] mcp bridge: stdin write failed: {e}");
+                                    } else {
+                                        let _ = stdin.write_all(b"\n").await;
+                                        let _ = stdin.flush().await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "control_response" => {}
+                    // Terminal frame: the turn is done.
+                    "result" => {
+                        let usage = v.get("usage").map(|u| super::Usage {
+                            input_tokens: u.get("input_tokens")
+                                .and_then(Value::as_u64).unwrap_or(0) as u32,
+                            output_tokens: u.get("output_tokens")
+                                .and_then(Value::as_u64).unwrap_or(0) as u32,
+                            cache_creation_input_tokens: u.get("cache_creation_input_tokens")
+                                .and_then(Value::as_u64).map(|v| v as u32),
+                            cache_read_input_tokens: u.get("cache_read_input_tokens")
+                                .and_then(Value::as_u64).map(|v| v as u32),
+                            reasoning_output_tokens: None,
+                        });
+                        yield ProviderEvent::MessageStop {
+                            stop_reason: Some("end_turn".into()),
+                            usage,
+                        };
+                        break;
+                    }
+                    // Known non-terminal events we don't need to surface.
+                    "system" | "rate_limit_event" | "keep_alive"
+                    | "stream_event" | "task_started" | "task_progress"
+                    | "task_notification" => {}
+                    _ => {}
+                }
+            }
+
+            // Stream closed without a `result` frame — emit a stop anyway so
+            // the agent's turn doesn't hang.
+            if seen_start {
+                yield ProviderEvent::MessageStop {
+                    stop_reason: Some("end_turn".into()),
+                    usage: None,
+                };
+            }
+        };
+
+        Ok(Box::pin(event_stream))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+            let anthropic = crate::providers::anthropic::AnthropicProvider::new(api_key);
+            let mut models = anthropic.list_models().await?;
+            for m in &mut models {
+                m.id = format!("agent/{}", m.id);
+                if let Some(ref name) = m.display_name {
+                    m.display_name = Some(format!("{} (Agent SDK)", name));
+                }
+            }
+            Ok(models)
+        } else {
+            Err(crate::error::Error::Provider(
+                "set ANTHROPIC_API_KEY to list models (or hard-code a `agent/<name>` in settings)"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Expose the captured Claude-side session UUID so the worker can
+    /// persist it to the session JSONL after every turn. Pre-fix this
+    /// value only lived in the `Arc<Mutex<>>` for the lifetime of the
+    /// provider instance — process restart or `/load` lost it and the
+    /// SDK started a fresh conversation that saw only the latest
+    /// user message.
+    fn provider_session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Rehydrate the Claude-side session UUID from a previously
+    /// persisted value (typically a freshly-loaded session JSONL).
+    /// The next `stream()` call will pass `--resume <uuid>` to the
+    /// subprocess and the SDK restores its server-side history.
+    /// `None` clears the slot (used on provider switch or explicit
+    /// reset).
+    fn set_provider_session_id(&self, id: Option<String>) {
+        if let Ok(mut g) = self.session_id.lock() {
+            *g = id;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_claude_bin_falls_back_to_path_lookup() {
+        let saved = std::env::var("CLAUDE_BIN").ok();
+        std::env::set_var("CLAUDE_BIN", "./tools/claude");
+        assert_eq!(claude_bin(), "claude");
+        std::env::set_var("CLAUDE_BIN", "/opt/claude/bin/claude");
+        assert_eq!(claude_bin(), "/opt/claude/bin/claude");
+        std::env::set_var("CLAUDE_BIN", "claude-dev");
+        assert_eq!(claude_bin(), "claude-dev");
+        match saved {
+            Some(v) => std::env::set_var("CLAUDE_BIN", v),
+            None => std::env::remove_var("CLAUDE_BIN"),
+        }
+    }
+
+    /// #5: `--allowedTools` only auto-approves, so the built-ins must be
+    /// switched off outright, bridge or no bridge.
+    #[test]
+    fn built_in_tools_are_always_disabled() {
+        for args in [
+            tool_args(None),
+            tool_args(Some(vec!["mcp__thclaws__Read".into()])),
+        ] {
+            let i = args.iter().position(|a| a == "--tools").expect("--tools");
+            assert_eq!(args[i + 1], "");
+            assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+        }
+        let args = tool_args(Some(vec![
+            "mcp__thclaws__Read".into(),
+            "mcp__thclaws__Bash".into(),
+        ]));
+        let i = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[i + 1], "mcp__thclaws__Read,mcp__thclaws__Bash");
+        assert!(args.iter().any(|a| a == "--mcp-config"));
+        assert!(!tool_args(None).iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn user_turn_carries_images_alongside_text() {
+        use crate::types::{ContentBlock, ImageSource, Message, Role};
+
+        let text_only = Message {
+            role: Role::User,
+            content: vec![ContentBlock::text("just words")],
+        };
+        assert_eq!(
+            user_turn_content(Some(&text_only)),
+            Value::String("just words".into()),
+            "a text-only turn keeps the bare-string shape the CLI always got"
+        );
+
+        let with_image = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::text("what is in this image?"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                },
+            ],
+        };
+        let v = user_turn_content(Some(&with_image));
+        let blocks = v
+            .as_array()
+            .expect("image turn serializes as a block array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "what is in this image?");
+        // The Anthropic wire shape the CLI accepts, straight off the
+        // ContentBlock derive.
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "iVBORw0KGgo=");
+
+        // History-only blocks are input to nothing — they must not ride along.
+        let noisy = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::text("hi"),
+                ContentBlock::Thinking {
+                    content: "hmm".into(),
+                    signature: None,
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "AA==".into(),
+                    },
+                },
+            ],
+        };
+        let blocks = user_turn_content(Some(&noisy));
+        let blocks = blocks.as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "thinking block dropped: {blocks:?}");
+
+        assert_eq!(user_turn_content(None), Value::String(String::new()));
+    }
+
+    #[test]
+    fn explicit_override_is_respected_verbatim() {
+        // A CLAUDE_BIN / with_bin override is never second-guessed.
+        assert_eq!(
+            resolve_claude_bin("/custom/path/claude"),
+            "/custom/path/claude"
+        );
+        assert_eq!(resolve_claude_bin("my-claude-wrapper"), "my-claude-wrapper");
+    }
+
+    // `falls_back_to_bare_name_when_nothing_found` removes the process-global
+    // PATH; serialize it with every test that reads PATH so they don't race
+    // (the parallel runner otherwise intermittently flaked `find_on_path`).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn falls_back_to_bare_name_when_nothing_found() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // With an empty PATH and (almost certainly) none of the fallback
+        // locations present in the test env, we still return "claude" so
+        // the caller's not-found error fires with the helpful message
+        // rather than a wrong path.
+        let prev = std::env::var_os("PATH");
+        std::env::remove_var("PATH");
+        let got = resolve_claude_bin("claude");
+        if let Some(p) = prev {
+            std::env::set_var("PATH", p);
+        }
+        // Either a real install exists on this machine (full path) or we
+        // fall back to the bare name — never empty, never a nonexistent
+        // fabricated path.
+        assert!(got == "claude" || std::path::Path::new(&got).is_file());
+    }
+
+    #[test]
+    fn find_on_path_locates_a_ubiquitous_binary() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // `sh` is on PATH in every CI/dev env; prove the PATH walk works.
+        assert!(find_on_path("sh").is_some());
+        assert!(find_on_path("definitely-not-a-real-binary-xyzzy").is_none());
+    }
+}

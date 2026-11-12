@@ -1,0 +1,234 @@
+# บทที่ 10 — Slash commands
+
+Slash commands คือ control plane ของ thClaws พิมพ์ `/` ตามด้วยชื่อ
+คำสั่งเพื่อรันคำสั่งนั้น แทนที่จะส่งบรรทัดดังกล่าวให้โมเดล พิมพ์
+`/help` ได้ตลอดเวลาเพื่อดูรายการทั้งหมด
+
+![พิมพ์ `/` ในกล่อง Chat แล้ว command palette จะเปิดขึ้น — จัดกลุ่มตามสิ่งที่คำสั่งไปแตะ พร้อมคำอธิบายของแต่ละคำสั่ง](../user-manual-img/ch-10/slash-palette.png)
+
+
+> **CLI กับ GUI ใช้ได้เหมือนกัน** ทุกคำสั่งในบทนี้ทำงานเหมือนกันทั้ง
+> จาก CLI REPL, แท็บ Terminal ของ GUI และแท็บ Chat ของ GUI —
+> input `/<word>` วิ่งผ่าน dispatcher ตัวเดียวกันในทั้งสามที่ คำสั่ง
+> ที่ mutate tool state บางตัว (`/mcp add`, `/skill install`,
+> `/plugin install`, `/kms use`) ยังเปิดใช้ผลลัพธ์ใน session ปัจจุบัน
+> ได้เลยโดยไม่ต้อง restart ด้วย
+
+## ลำดับการตีความคำสั่ง {#resolution-order}
+
+เมื่อคุณพิมพ์ `/<word>` thClaws จะตีความตามลำดับนี้:
+
+1. **Built-in command** — จากตารางด้านล่าง
+2. **Installed skill** — เขียนบรรทัดใหม่เป็นการเรียก `Skill(name: "word")`
+   ([บทที่ 12](ch12-skills.md))
+3. **Legacy prompt command** — เทมเพลต `.md` จากไดเรกทอรี `commands/`
+   โดยแทน `$ARGUMENTS` ด้วยข้อความที่ผู้ใช้ป้อน (อธิบายในบทนี้)
+4. **Unknown** — แสดง error สีเหลือง
+
+รายการที่ match เป็นอันดับแรกจะถูกเลือกใช้ ดังนั้น skill จึงไม่สามารถ
+บดบัง built-in ได้ เพราะ built-in ถูกตรวจก่อนเสมอ
+
+## เอกสารอ้างอิง Built-in command
+
+### Session และ model
+
+| Command | ทำอะไร |
+|---|---|
+| `/help` | แสดง built-in commands ทั้งหมด |
+| `/model [NAME]` | แสดงโมเดลปัจจุบัน หรือสลับไปใช้ NAME (ตรวจสอบความถูกต้องให้ ถ้าพิมพ์ผิดจะย้อนกลับอัตโนมัติ) |
+| `/models` | แสดงรายการโมเดลที่ใช้ได้จาก provider ปัจจุบัน |
+| `/models refresh` | ดาวน์โหลด model catalogue (context window ของแต่ละโมเดล) จาก thclaws.ai และอัปเดต cache (ดู[บทที่ 6](ch06-providers-models-api-keys.md)) |
+| `/provider [NAME]` | แสดง provider ปัจจุบัน หรือสลับไปใช้ตัวอื่น |
+| `/providers` | แสดง provider ทั้งหมดพร้อมโมเดลดีฟอลต์ |
+| `/save` | บังคับบันทึก session ปัจจุบันลงดิสก์ |
+| `/load ID\|NAME` | โหลด session ด้วย id, id-prefix หรือชื่อเรื่อง |
+| `/sessions` | แสดงรายการ session ที่บันทึกไว้ (เรียงจากใหม่สุด) |
+| `/rename [NAME]` | เปลี่ยนชื่อ session ปัจจุบัน (หากไม่ใส่ argument จะล้างชื่อเรื่องออก) |
+| `/fork` | บันทึก session ปัจจุบัน แล้วเริ่ม session ใหม่ที่มีสรุปของอันเดิมติดไปด้วย — ได้ context สะอาดที่ยังจำได้ว่าทำอะไรค้างไว้ |
+| `/resume ID\|NAME` | (CLI flag `--resume`) เริ่มใหม่พร้อมโหลด session |
+| `/clear` | ล้างประวัติในหน่วยความจำ (ไม่แตะไฟล์ที่บันทึกไว้) |
+| `/history` | พิมพ์สรุปจำนวนข้อความ |
+| `/translate [--language=<code>] <ข้อความหรือพาธไฟล์>` | แปลข้อความหรือไฟล์ในบทสนทนาแยก — เป็น alias ของ `/agent translator …` จึงไม่ไปแตะเซสชันที่คุยอยู่ |
+| `/summarize [--language=<code>] <ข้อความ>` | สรุปในบทสนทนาแยก — alias ของ `/agent summarizer …`; `--language` กำหนดภาษาของ*บทสรุป* ไม่ใช่ภาษาต้นทาง |
+| `/extract <url หรือไฟล์>` | คลิปหน้าเว็บหรือไฟล์ออกมาเป็น markdown สะอาด ๆ พร้อมโหลดรูปมาเก็บไว้ด้วย รันแยกจากบทสนทนา หน้าดิบจึงไม่เข้ามากิน context ของคุณ — ซึ่งเป็นเหตุผลทั้งหมดที่มีคำสั่งนี้สำหรับหน้ายาว ๆ |
+| `/compact` | ตัดข้อความเก่าออก เขียน checkpoint ลง JSONL เพื่อประหยัด token (auto-run ที่ 80% ของ context window ด้วย) |
+| `/fork` | บันทึก session ปัจจุบัน, สรุปประวัติด้วย LLM, เริ่ม session ใหม่ที่ seed ด้วย summary — ใช้ตอนไฟล์ JSONL ใหญ่เกิน 5 MB (ดู[บทที่ 7](ch07-sessions.md)) |
+| `/cwd` | แสดง working directory (sandbox root) |
+| `/pwd` | อันเดียวกัน — เรียกด้วยชื่อแบบ shell |
+
+### Memory และ context
+
+| Command | ทำอะไร |
+|---|---|
+| `/memory` | แสดงรายการ memory entry |
+| `/memory read NAME` | พิมพ์เนื้อหา memory entry ออกมา |
+| `/context` | แสดงสถิติ context ของ session ปัจจุบัน — จำนวนข้อความ, content block, ขนาด system prompt, token ที่ประเมินว่าใช้ไป, context window ของโมเดล และ progress bar สี % ที่ใช้อยู่ |
+
+### Tools, skills, plugins, MCP
+
+| Command | ทำอะไร |
+|---|---|
+| `/marketplace [--refresh]` | เปิด marketplace browser รวม (GUI modal: skills · MCP · plugins · subagents); CLI พิมพ์สรุปรวม |
+| `/skills` | แสดงรายการ skill ที่โหลดไว้ |
+| `/skill show NAME` | แสดงคำอธิบายเต็มพร้อม path ของ skill |
+| `/skill marketplace [--refresh]` | เปิดดู catalog จาก thclaws.ai/api/marketplace.json |
+| `/skill search QUERY` | ค้น marketplace catalog แบบ substring |
+| `/skill info NAME` | รายละเอียด marketplace ของ skill (license, source, install URL) |
+| `/skill install [--user] <name-or-url> [name]` | ติดตั้ง skill — slug ตรง ๆ จะ lookup จาก marketplace, หรือใช้ URL git/`.zip` |
+| `/mcp marketplace [--refresh]` | เปิดดู MCP servers ใน catalog (ทั้งแบบ hosted และ installable) |
+| `/mcp search QUERY` | ค้น MCP marketplace แบบ substring |
+| `/mcp info NAME` | รายละเอียด MCP จาก marketplace (transport, command/url, license) |
+| `/mcp install [--user] NAME` | ติดตั้ง MCP จาก marketplace — clone source (ถ้าจำเป็น) แล้วเขียนเข้า mcp.json |
+| `/plugin marketplace [--refresh]` | เปิดดู plugin catalog |
+| `/plugin search QUERY` | ค้น plugin marketplace แบบ substring |
+| `/plugin info NAME` | รายละเอียด plugin จาก marketplace (`/plugin show NAME` ใช้สำหรับ plugin ที่ติดตั้งแล้ว) |
+| `/subagent marketplace [--refresh]` | เปิดดู subagent (agent defs) ใน catalog |
+| `/subagent search QUERY` | ค้นหา subagent ใน marketplace |
+| `/subagent info NAME` | รายละเอียด subagent ใน marketplace |
+| `/subagent install [--user] <name-or-url> [name]` | ติดตั้งไฟล์ `.md` ของ subagent — ชื่อล้วน → marketplace, หรือ git/`.zip` URL |
+| `/<skill-name> [args]` | เรียกใช้ skill ที่ติดตั้งไว้โดยตรง |
+| `/<command-name> [args]` | เรียกใช้ legacy prompt command (template) |
+| `/plugins` | แสดงรายการ plugin ที่ติดตั้งไว้ (ทั้งเปิดและปิด) |
+| `/plugin install [--user] <url>` | ติดตั้งชุด plugin |
+| `/plugin remove [--user] <name>` | ถอนการติดตั้ง plugin |
+| `/plugin enable [--user] <name>` | เปิด plugin ที่ปิดอยู่ |
+| `/plugin disable [--user] <name>` | ปิดใช้งานโดยไม่ต้องถอนการติดตั้ง |
+| `/plugin show <name>` | แสดงรายละเอียด manifest |
+| `/mcp` | แสดง MCP server ที่ใช้งานอยู่พร้อม tool ที่มี |
+| `/mcp add [--user] <name> <url>` | ลงทะเบียน MCP server ระยะไกล (HTTP) |
+| `/mcp remove [--user] <name>` | ลบ MCP server ออกจาก config |
+
+### ฐานความรู้ (KMS)
+
+| Command | ทำอะไร |
+|---|---|
+| `/kms` (หรือ `/kms list`) | แสดง KMS ทั้งหมดที่ค้นพบ โดยมี `*` กำกับหน้า KMS ที่ผูกกับโปรเจกต์นี้ |
+| `/kms new [--project] NAME` | สร้าง KMS ใหม่ (scope ดีฟอลต์คือ user) |
+| `/kms use NAME` | ผูก KMS เข้ากับการสนทนาของโปรเจกต์นี้ |
+| `/kms off NAME` | ถอด KMS ออก |
+| `/kms entry [NAME] [--set SLUG \| --clear]` | ดูหรือตั้งหน้าที่ KMS browser เปิดขึ้นมา บันทึกตอนสร้าง page แรกของ KMS ถ้าไม่มีค่าบันทึกจะอนุมานให้ |
+| `/kms verify [NAME] [--llm] [--fix]` | ตรวจหลักฐาน: citation ชี้ถูก, source ที่ archive ไว้ยังมีข้อความที่ claim อ้าง, ไม่มีตัวเลขที่อ้างโดยไม่มีที่มา `--llm` เพิ่มการตรวจว่าประโยคตามมาจาก claim จริงไหม `--fix` ถอด link ที่ถูกเขียนทับในที่อยู่เว็บ |
+| `/kms rename OLD NEW` | เปลี่ยนชื่อโฟลเดอร์ KMS การผูกตามไปด้วย (หรือคลิกขวาที่ KMS บน sidebar) |
+| `/kms drop NAME [--force]` | ลบ KMS ถ้าไม่ใส่ `--force` เป็น dry-run (หรือคลิกขวาบน sidebar → Delete…) |
+| `/kms show NAME` | พิมพ์ `index.md` ของ KMS ออกมา |
+| `/kms html NAME [OUT]` | สร้าง HTML site แบบ single-file ที่ interactive จาก KMS (v0.8.5+) Agent อ่าน KMS ผ่าน tools, ออกแบบ component, แล้วเขียน `<OUT>/index.html` (default `./<NAME>-site/`) ลง workspace |
+| `/dream [FOCUS]` | Consolidate KMS ของโปรเจกต์โดย mine session ล่าสุด (GUI-only, dispatch built-in side-channel agent) |
+
+แนวคิดและเวิร์กโฟลว์ KMS ฉบับเต็มอยู่ใน [บทที่ 9](ch09-knowledge-bases-kms.md) รวมถึง `/kms html` สำหรับ HTML export, graph view, และ flow ของ `/dream`
+
+### Background research
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/research <query>` | spawn งาน research background — multi-iteration web search + multi-page KMS write |
+| `/research [--kms NAME] [--max-notes N] [--max-iter K] [--novelty 0.X] [--worker-model ID] [--append] [--dry-run] [--budget-time T] <query>` | เริ่มพร้อม override (ดูบทที่ 20) |
+| `/research` (หรือ `/research list`) | list ทุก job (newest first) |
+| `/research status ID` | detail (phase, iteration, score) |
+| `/research show ID` | print synthesized result ใน chat |
+| `/research cancel ID` | cancel job ที่รัน; partial result ทิ้ง |
+| `/research wait ID` | block CLI prompt จน terminal (CLI-only) |
+| `/policy` (หรือ `/policy status`) | org policy ที่ active อยู่: ไฟล์ต้นทาง, issuer, วันหมดอายุ, block ไหนเปิดอยู่ และ audit sink พร้อมจำนวน record ที่ drop (Enterprise) |
+
+ดู [บทที่ 20](ch20-research.md) สำหรับ pipeline ฉบับเต็ม + KMS layout + flag reference
+
+### พฤติกรรม Agent
+
+| Command | ทำอะไร |
+|---|---|
+| `/permissions MODE` | สลับระหว่าง `auto` และ `ask` ระหว่าง session |
+| `/thinking 0-5` | ระดับ thinking ใช้ได้ทุก provider: `0` ปิด · `1` low · `2` medium · `3` high · `4` xhigh · `5` max · `auto` (ค่า default ของ provider) โมเดลที่ไม่มีระดับนั้นจะได้ค่าที่ใกล้ที่สุดที่รับได้ หรือ `/thinking <tokens>` ระบุ budget ตรง ๆ ปุ่มเดียวกับ pill **think** ใต้ชื่อโมเดลใน sidebar บันทึกลง `thinkingBudget` |
+| `/tasks` | แสดง task / todo ที่ agent สร้างไว้ |
+| `/plan [enter\|exit\|status]` | สลับโหมดวางแผน — สำรวจแบบอ่านอย่างเดียวก่อน แล้วค่อยลงมือทีละขั้นโดยมีการอนุมัติ `status` บอกสถานะแผนปัจจุบันโดยไม่เปลี่ยนโหมด ([บทที่ 18](ch18-plan-mode.md)) |
+| `/config key=val` | เขียนทับค่า config เฉพาะ session นี้ |
+| `/agent NAME PROMPT` | Spawn user-driven side-channel subagent (GUI-only รันขนานกับ main) |
+| `/agents` | ลิสต์ side-channel agent ที่กำลังทำงาน (id, name, elapsed) |
+| `/agent cancel ID` | ยกเลิก side-channel agent ที่กำลังรัน |
+| `/agent new NAME` | เปิด GUI editor เขียน agent def ใหม่ (`.thclaws/agents/NAME.md`) — GUI เท่านั้น |
+| `/agent edit NAME` | เปิด GUI editor แก้ agent def เดิม/built-in — GUI เท่านั้น |
+| `/dream [FOCUS]` | Dispatch built-in dream agent เพื่อ consolidate KMS (GUI-only) — ดู [บทที่ 9](ch09-knowledge-bases-kms.md) |
+| `/team` | เข้าร่วม tmux session ของทีม (หรือแสดงสถานะทีม) |
+| `/doctor` | รันการตรวจสอบวินิจฉัย |
+| `/cost` | ค่าใช้จ่ายของ session นี้ แยกตาม provider และ model |
+| `/usage` | แสดงการใช้ token แยกตาม provider และ model |
+| `/version` | แสดงเวอร์ชัน thClaws และ commit SHA |
+| `/system [stats \| grep <pattern>]` | พิมพ์ system prompt ที่ถูกส่งจริงในเทิร์นนี้ `stats` แสดงขนาดแยกตามส่วน ส่วน `grep <pattern>` ค้นในนั้น — มีประโยชน์เวลาอยากรู้ว่า "AGENTS.md ของเราเข้าไปจริงมั้ย" |
+| `/reload` | อ่าน settings, skill, agent และ MCP config ใหม่โดยไม่ต้องรีสตาร์ท |
+| `/reload-prompt` | อ่านเฉพาะ prompt template ใหม่ |
+| `/quit` | ออกจากโปรแกรม (alias: `/exit`, `/q`) ใน GUI จะเปิด native confirm dialog ("Quit?") ก่อนปิด — กด Cancel เพื่อใช้ session ต่อ |
+
+### งานอัตโนมัติ
+
+แต่ละตัวมีบทของตัวเอง ตารางนี้เป็นแค่รายการอ้างอิงเร็วๆ
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/schedule list \| show <id> \| run <id> \| pause\|resume <id> \| rm <id>` | จัดการงานที่ทำซ้ำ (cron / ตามช่วงเวลา / เฝ้าไฟล์) — ดู [บทที่ 19](ch19-scheduling.md) |
+| `/loop <interval> <body>` \| `status` \| `stop` | ส่งข้อความซ้ำตามช่วงเวลา (ค่าเริ่มต้น 5 นาที) มีได้ทีละหนึ่ง loop — ดู[บทที่ 31](ch31-loops-and-goals.md) |
+| `/goal start <objective> [--budget-tokens N] [--budget-time T] [--auto] [--require <path>]` \| `status` \| `show` \| `continue` \| `complete` \| `abandon` | เป้าหมายระยะยาวที่ agent ตรวจสอบตัวเองว่าถึงหรือยัง มีงบประมาณและเพดานแข็ง ใช้คู่กับ `/loop` หรือให้มันขับตัวเองด้วย `--auto` — ดู[บทที่ 31](ch31-loops-and-goals.md) |
+| `/workflow run <goal> \| exec <path> \| list \| inspect <id> \| resume <id> \| rm <id>` | ให้เขียน ตรวจ แล้วรัน workflow หลาย agent — ดู [บทที่ 25](ch25-workflows.md) |
+
+### Cloud และการ deploy
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/cloud list [--mine] \| get <slug> \| status` | ดูและติดตั้ง agent จากแคตตาล็อก thClaws.cloud — ดู [บทที่ 27](ch27-thclaws-cloud.md) |
+| `/publish <file.html>` | เอาหน้า HTML ไฟล์เดียวขึ้นเว็บที่ URL ส่วนตัว หมดอายุใน 3 วัน ต้องมี token ของ thClaws.cloud และเครดิตมากกว่าศูนย์ |
+| `/deploy [--pod URL] [--token T] [--dry-run] [--full] [--no-restart]` | ส่ง `.thclaws/` ของ workspace นี้ขึ้น pod ปลายทาง ลอง `--dry-run` ก่อนเสมอ |
+
+### การเรียนรู้
+
+| คำสั่ง | ทำอะไร |
+|---|---|
+| `/quiz <topic\|url\|file>` | สร้างแบบทดสอบจากหัวข้อ URL หรือไฟล์ในเครื่อง แล้วเล่นได้เลย |
+
+### Shell escape
+
+| Command | ทำอะไร |
+|---|---|
+| `! <command>` | รัน `<command>` ใน terminal โดยตรง ข้าม agent |
+
+เหมาะสำหรับตรวจสอบเร็ว ๆ (`! ls`, `! git status`) โดยไม่เปลือง
+model token
+
+## ทางลัดของ skill และ command
+
+skill ที่ติดตั้งไว้ทุกตัวเรียกใช้ได้ผ่าน `/<skill-name>`:
+
+```
+❯ /skills
+  docx — Create, read, edit Word documents
+  pdf  — Read, split, merge, OCR PDFs
+  …
+
+❯ /pdf extract text from report.pdf
+(/pdf → Skill(name: "pdf"))
+Using the pdf skill to extract text from report.pdf…
+```
+
+Legacy prompt command เก็บในรูปไฟล์ markdown:
+
+```markdown
+# .thclaws/commands/review.md
+---
+description: Code review a branch
+---
+Review the diff from `main` to HEAD. Flag security issues, bad naming,
+and missing tests. Focus on $ARGUMENTS.
+```
+
+```
+❯ /review authentication
+(/review → prompt from .thclaws/commands/review.md)
+Reviewing the diff, focused on authentication…
+```
+
+`$ARGUMENTS` จะถูกแทนด้วยข้อความที่ตามหลังชื่อคำสั่ง หาก template
+ไม่มี placeholder แต่ผู้ใช้พิมพ์ args มา ข้อความนั้นจะถูกต่อท้ายใน
+บรรทัดว่าง
+
+## เขียน slash command ของคุณเอง
+
+สำหรับคำสั่งบรรทัดเดียว ให้ใส่ไฟล์ `.md` ลงใน `.thclaws/commands/`
+หากต้องมี script หรือ scaffolding ให้ทำเป็น **skill** ([บทที่ 12](ch12-skills.md))
+แต่ถ้าเป็นชุดรวม (skill + command + MCP) ให้ส่งเป็น
+**plugin** ([บทที่ 16](ch16-plugins.md))

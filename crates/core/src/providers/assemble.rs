@@ -1,0 +1,978 @@
+//! Stream adapter: fold raw [`ProviderEvent`]s into semantic [`AssembledEvent`]s.
+//!
+//! - `TextDelta` passes through as `AssembledEvent::Text` (for streaming UI).
+//! - `ToolUseStart` + N× `ToolUseDelta` + `ContentBlockStop` collapses into a
+//!   single `AssembledEvent::ToolUse` with a fully-parsed JSON input.
+//! - `MessageStop` becomes `AssembledEvent::Done`.
+//!
+//! The agent loop typically drains this via [`collect_turn`] to get a complete
+//! turn result, or consumes it live when the UI wants streaming text.
+
+use crate::error::Result;
+use crate::providers::{ProgressKind, ProviderEvent, Usage};
+use crate::types::ContentBlock;
+use async_stream::try_stream;
+use futures::{Stream, StreamExt};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssembledEvent {
+    Text(String),
+    /// Reasoning delta from a thinking model. Streamed live so the GUI can
+    /// surface it (collapsed by default), and folded into the persisted
+    /// assistant message so the next turn can echo it back to providers
+    /// that require it (DeepSeek v4-*, OpenAI o-series).
+    Thinking(String),
+    /// Always `ContentBlock::ToolUse { id, name, input }`.
+    ToolUse(ContentBlock),
+    /// L4 (M6.17): the partial JSON for a tool_use block didn't parse
+    /// (truncated stream, provider bug). Pre-fix this killed the entire
+    /// turn via `?`, losing any successful text or other tool calls in
+    /// the same response. Now emitted so the agent loop can synthesize
+    /// an error tool_result and let the model self-correct on the next
+    /// iteration.
+    ToolParseFailed {
+        id: String,
+        name: String,
+        error: String,
+    },
+    Done {
+        stop_reason: Option<String>,
+        usage: Option<Usage>,
+    },
+    /// Display-only progress signal — passed through from provider.
+    Progress(ProgressKind),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnResult {
+    pub text: String,
+    /// Concatenated reasoning_content from the turn (empty for non-thinking
+    /// models). Persisted as a `ContentBlock::Thinking` on the assistant
+    /// message so subsequent requests carry it back to the provider.
+    pub thinking: String,
+    /// Each entry is a `ContentBlock::ToolUse`.
+    pub tool_uses: Vec<ContentBlock>,
+    pub stop_reason: Option<String>,
+    pub usage: Option<Usage>,
+}
+
+enum BlockState {
+    None,
+    Text,
+    ToolUse {
+        id: String,
+        name: String,
+        buf: String,
+        thought_signature: Option<String>,
+    },
+}
+
+/// Returns true for model families known to emit *implicit* reasoning —
+/// they start streaming chain-of-thought text with no opening `<think>`,
+/// then close it with `</think>` before the actual answer. We use this to
+/// gate the speculative pre-seed in `assemble`. Be conservative: only the
+/// specific families that need it. Other families (qwen2.5-coder, qwen-vl,
+/// generic *r1 finetunes) must NOT match, or their answers are held back
+/// until the turn ends (see `ThinkState::speculative`).
+///
+/// M6.21 BUG M1: vision/multimodal Qwen3 variants (`qwen3-vl-plus`,
+/// `qwen3-omni`, etc.) DO NOT emit `<think>...</think>` blocks. Pre-fix
+/// the broad `contains("qwen3")` match pre-seeded `ThinkState::in_block`
+/// for them too — when those models then emitted plain text without
+/// `</think>`, every byte got routed to `Thinking` events and the user
+/// saw an empty chat. Exclude `-vl`, `vision`, `-omni` substrings.
+fn is_implicit_thinking_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // Qwen3 thinking variants. Plain "qwen" / "qwen2" must not match.
+    // Vision / multimodal variants (qwen3-vl, qwen3-omni) also don't
+    // emit `<think>` blocks — exclude them.
+    if (m.contains("qwen3") || m.contains("qwq"))
+        && !m.contains("-vl")
+        && !m.contains("vision")
+        && !m.contains("-omni")
+    {
+        return true;
+    }
+    // DeepSeek R1 family (and OpenRouter prefix form).
+    if m.contains("deepseek-r1") || m.contains("deepseek/deepseek-r1") {
+        return true;
+    }
+    false
+}
+
+/// Streaming state for `split_think_text`. Persists across SSE chunks so
+/// tags split on chunk boundaries — and the blank lines Qwen3-style models
+/// emit between `</think>` and the answer — are handled correctly.
+#[derive(Default)]
+struct ThinkState {
+    in_block: bool,
+    tag_buf: String,
+    /// Set right after a `</think>` is consumed. Strips leading newlines
+    /// from the next text the model emits, in case `</think>\n\n` straddles
+    /// two SSE chunks.
+    trim_leading_newlines: bool,
+    /// True while `in_block` came from the model-name pre-seed rather than a
+    /// real `<think>` tag — i.e. we are only *guessing* the turn opened in
+    /// reasoning. Issue #199: a Qwen3.5 served with `enable_thinking:false`
+    /// matches the name heuristic but never sends `</think>`, so the guess
+    /// swallowed the entire answer into the thinking channel and the chat
+    /// body stayed empty. While speculative, reasoning text is held in
+    /// `spec_buf` instead of emitted, so it can still be re-classified as
+    /// `Text` when the close tag never arrives.
+    speculative: bool,
+    /// Text held back while `speculative` is set.
+    spec_buf: String,
+}
+
+/// How much text to hold before accepting the pre-seed guess as real
+/// reasoning. Genuine chain-of-thought runs far past this, while a
+/// non-thinking model's whole answer rarely reaches it — and holding more
+/// would stall the live thinking view for the entire turn.
+const SPECULATIVE_LIMIT: usize = 16 * 1024;
+
+/// Emit reasoning text — or, while the opening `<think>` is only *assumed*
+/// (see [`ThinkState::speculative`]), hold it so it can still turn out to
+/// be answer text.
+fn push_thinking(out: &mut Vec<AssembledEvent>, state: &mut ThinkState, text: &str) {
+    if !state.speculative {
+        out.push(AssembledEvent::Thinking(text.to_string()));
+        return;
+    }
+    state.spec_buf.push_str(text);
+    if state.spec_buf.len() >= SPECULATIVE_LIMIT {
+        commit_speculative(out, state);
+    }
+}
+
+/// Resolve the guess as *reasoning*: flush what was held to the thinking
+/// channel and stream live from here on.
+fn commit_speculative(out: &mut Vec<AssembledEvent>, state: &mut ThinkState) {
+    state.speculative = false;
+    if !state.spec_buf.is_empty() {
+        out.push(AssembledEvent::Thinking(std::mem::take(
+            &mut state.spec_buf,
+        )));
+    }
+}
+
+/// [`commit_speculative`] for the event-loop side, where there is no `out`
+/// vec to push into.
+fn commit_speculative_event(state: &mut ThinkState) -> Option<AssembledEvent> {
+    let mut out = Vec::new();
+    commit_speculative(&mut out, state);
+    out.pop()
+}
+
+/// Resolve the guess as *answer text*: the turn ended — or the model moved
+/// on to a tool call — without ever closing the block, so it was never
+/// reasoning to begin with. Any dangling partial tag is plain text too.
+fn resolve_speculative_as_text(state: &mut ThinkState) -> Option<AssembledEvent> {
+    if !state.speculative {
+        return None;
+    }
+    state.speculative = false;
+    state.in_block = false;
+    let mut buf = std::mem::take(&mut state.spec_buf);
+    buf.push_str(&std::mem::take(&mut state.tag_buf));
+    (!buf.is_empty()).then(|| AssembledEvent::Text(buf))
+}
+
+/// Split a text chunk that may contain `<think>…</think>` blocks into the
+/// appropriate `AssembledEvent`s. Any text inside the tags becomes
+/// `Thinking`; text outside becomes `Text`.
+fn split_think_text(chunk: &str, state: &mut ThinkState) -> Vec<AssembledEvent> {
+    let mut out = Vec::new();
+    let mut combined = if state.tag_buf.is_empty() {
+        chunk.to_string()
+    } else {
+        format!("{}{}", std::mem::take(&mut state.tag_buf), chunk)
+    };
+    if state.trim_leading_newlines && !state.in_block {
+        let trimmed = combined.trim_start_matches('\n');
+        if trimmed.len() < combined.len() {
+            combined = trimmed.to_string();
+        }
+        if !combined.is_empty() {
+            state.trim_leading_newlines = false;
+        }
+    }
+    let mut s = combined.as_str();
+    loop {
+        if s.is_empty() {
+            break;
+        }
+        if state.in_block {
+            const CLOSE: &str = "</think>";
+            if let Some(pos) = s.find(CLOSE) {
+                if pos > 0 {
+                    push_thinking(&mut out, state, &s[..pos]);
+                }
+                // The close tag proves the pre-seed guess was right — commit
+                // whatever was held to the thinking channel.
+                commit_speculative(&mut out, state);
+                state.in_block = false;
+                let after = &s[pos + CLOSE.len()..];
+                let trimmed = after.trim_start_matches('\n');
+                // If nothing remains after stripping newlines in this chunk,
+                // remember to strip leading newlines from the next chunk too.
+                state.trim_leading_newlines = trimmed.is_empty();
+                s = trimmed;
+            } else {
+                let keep = longest_tag_prefix(s, CLOSE);
+                if s.len() > keep {
+                    push_thinking(&mut out, state, &s[..s.len() - keep]);
+                }
+                if keep > 0 {
+                    state.tag_buf.push_str(&s[s.len() - keep..]);
+                }
+                break;
+            }
+        } else {
+            const OPEN: &str = "<think>";
+            const CLOSE: &str = "</think>";
+            if let Some(pos) = s.find(OPEN) {
+                if pos > 0 {
+                    out.push(AssembledEvent::Text(s[..pos].to_string()));
+                }
+                state.in_block = true;
+                s = s[pos + OPEN.len()..].trim_start_matches('\n');
+            } else if let Some(pos) = s.find(CLOSE) {
+                // Found </think> but we weren't in a think block. This happens
+                // with models (like Qwen3) where the opening <think> is pre-filled
+                // in the prompt. Treat preceding text in this chunk as thinking.
+                if pos > 0 {
+                    out.push(AssembledEvent::Thinking(s[..pos].to_string()));
+                }
+                let after = &s[pos + CLOSE.len()..];
+                let trimmed = after.trim_start_matches('\n');
+                state.trim_leading_newlines = trimmed.is_empty();
+                s = trimmed;
+            } else {
+                let keep = longest_tag_prefix(s, OPEN);
+                if s.len() > keep {
+                    out.push(AssembledEvent::Text(s[..s.len() - keep].to_string()));
+                }
+                if keep > 0 {
+                    state.tag_buf.push_str(&s[s.len() - keep..]);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn longest_tag_prefix(haystack: &str, needle: &str) -> usize {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let max = h.len().min(n.len() - 1);
+    for len in (1..=max).rev() {
+        if h[h.len() - len..] == n[..len] {
+            return len;
+        }
+    }
+    0
+}
+
+pub fn assemble<S>(inner: S) -> impl Stream<Item = Result<AssembledEvent>> + Send + 'static
+where
+    S: Stream<Item = Result<ProviderEvent>> + Send + 'static,
+{
+    try_stream! {
+        let mut state = BlockState::None;
+        // For implicit-thinking models (Qwen3, DeepSeek-R1) the stream begins
+        // with reasoning that has no opening `<think>` tag — only a closing
+        // `</think>` before the answer. Pre-seed `in_block = true` so
+        // `split_think_text` emits the prefix as Thinking until it finds
+        // `</think>`, and no chain-of-thought leaks as Text.
+        //
+        // The pre-seed is a *guess* from the model name, so it is marked
+        // speculative: the prefix is held rather than emitted until the
+        // close tag confirms it. When the tag never arrives (issue #199 —
+        // the same family served with `enable_thinking:false`) the held
+        // text is released as Text instead of stranding the whole answer
+        // in the thinking channel.
+        let mut think = ThinkState::default();
+
+        let mut inner = Box::pin(inner);
+        while let Some(ev) = inner.next().await {
+            let ev = ev?;
+            match ev {
+                ProviderEvent::MessageStart { model } => {
+                    if is_implicit_thinking_model(&model) {
+                        think.in_block = true;
+                        think.speculative = true;
+                    }
+                }
+                ProviderEvent::TextDelta(s) => {
+                    state = BlockState::Text;
+                    for ev in split_think_text(&s, &mut think) {
+                        yield ev;
+                    }
+                }
+                ProviderEvent::ThinkingDelta(s) => {
+                    // A structured ThinkingDelta means the provider
+                    // already separates reasoning (DashScope/OpenRouter
+                    // `reasoning_content`, Ollama `message.thinking`,
+                    // OpenAI o-series). The implicit-thinking
+                    // pre-seed was guarding against models that stream
+                    // raw chain-of-thought as text up to a closing
+                    // `</think>` tag — that mode is mutually exclusive
+                    // with structured reasoning, so flip the buffer
+                    // off the first time we see one. Without this,
+                    // qwen3.6 on DashScope would never emit any text
+                    // (the `</think>` close never arrives in the
+                    // content stream because reasoning lives elsewhere).
+                    // Anything held by the pre-seed guess was answer text.
+                    if let Some(ev) = resolve_speculative_as_text(&mut think) {
+                        yield ev;
+                    }
+                    think.in_block = false;
+                    yield AssembledEvent::Thinking(s);
+                }
+                ProviderEvent::ToolUseStart { id, name, thought_signature } => {
+                    // An implicit-thinking model closes `</think>` before it
+                    // calls a tool, so anything still held here was answer
+                    // text (a preamble), not reasoning.
+                    if let Some(ev) = resolve_speculative_as_text(&mut think) {
+                        yield ev;
+                    }
+                    state = BlockState::ToolUse {
+                        id,
+                        name,
+                        buf: String::new(),
+                        thought_signature,
+                    };
+                }
+                ProviderEvent::ToolUseDelta { partial_json } => {
+                    if let BlockState::ToolUse { buf, .. } = &mut state {
+                        buf.push_str(&partial_json);
+                    }
+                }
+                ProviderEvent::ContentBlockStop => {
+                    let prev = std::mem::replace(&mut state, BlockState::None);
+                    if let BlockState::ToolUse { id, name, buf, thought_signature } = prev {
+                        if buf.trim().is_empty() {
+                            yield AssembledEvent::ToolUse(ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input: serde_json::json!({}),
+                                thought_signature,
+                            });
+                        } else {
+                            match serde_json::from_str::<serde_json::Value>(&buf) {
+                                Ok(input) => {
+                                    yield AssembledEvent::ToolUse(ContentBlock::ToolUse {
+                                        id,
+                                        name,
+                                        input,
+                                        thought_signature,
+                                    });
+                                }
+                                Err(e) => {
+                                    // L4 (M6.17): graceful degradation — emit
+                                    // ToolParseFailed instead of returning Err
+                                    // and killing the whole turn. The agent
+                                    // will synthesize an error tool_result so
+                                    // the model sees what went wrong and can
+                                    // retry with valid JSON. The raw buf is
+                                    // included (truncated to 200 chars) for
+                                    // diagnostic value.
+                                    let preview = buf.chars().take(200).collect::<String>();
+                                    yield AssembledEvent::ToolParseFailed {
+                                        id,
+                                        name,
+                                        error: format!(
+                                            "tool_use json parse failed: {e} (raw input preview: {preview})"
+                                        ),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                ProviderEvent::MessageStop { stop_reason, usage } => {
+                    // A turn cut off by the token cap really can end
+                    // mid-reasoning — the close tag was never going to
+                    // arrive. Keep that in the thinking channel instead of
+                    // dumping raw chain-of-thought into the answer. Any
+                    // other stop reason means the model finished talking
+                    // and simply never opened a think block at all.
+                    let truncated = matches!(
+                        stop_reason.as_deref(),
+                        Some("length") | Some("max_tokens")
+                    );
+                    let resolved = if truncated {
+                        commit_speculative_event(&mut think)
+                    } else {
+                        resolve_speculative_as_text(&mut think)
+                    };
+                    if let Some(ev) = resolved {
+                        yield ev;
+                    }
+                    yield AssembledEvent::Done { stop_reason, usage };
+                }
+                ProviderEvent::Progress(kind) => {
+                    yield AssembledEvent::Progress(kind);
+                }
+            }
+        }
+        // A stream that ends without a MessageStop (transport EOF) must not
+        // drop the held prefix either.
+        if let Some(ev) = resolve_speculative_as_text(&mut think) {
+            yield ev;
+        }
+    }
+}
+
+pub async fn collect_turn<S>(stream: S) -> Result<TurnResult>
+where
+    S: Stream<Item = Result<AssembledEvent>> + Send,
+{
+    let mut out = TurnResult::default();
+    let mut stream = Box::pin(stream);
+    while let Some(ev) = stream.next().await {
+        match ev? {
+            AssembledEvent::Text(s) => out.text.push_str(&s),
+            AssembledEvent::Thinking(s) => out.thinking.push_str(&s),
+            AssembledEvent::ToolUse(block) => out.tool_uses.push(block),
+            AssembledEvent::Progress(_) => {}
+            AssembledEvent::ToolParseFailed { id, name, .. } => {
+                // Synthesize an empty-input ToolUse so collectors that
+                // count tool calls still see one. The matching error
+                // tool_result is generated by the agent loop, not here.
+                out.tool_uses.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                });
+            }
+            AssembledEvent::Done { stop_reason, usage } => {
+                out.stop_reason = stop_reason;
+                out.usage = usage;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn src(events: Vec<ProviderEvent>) -> impl Stream<Item = Result<ProviderEvent>> + Send {
+        stream::iter(events.into_iter().map(Ok))
+    }
+
+    async fn collected(events: Vec<ProviderEvent>) -> TurnResult {
+        collect_turn(assemble(src(events))).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn text_only_turn() {
+        let r = collected(vec![
+            ProviderEvent::MessageStart { model: "m".into() },
+            ProviderEvent::TextDelta("Hello".into()),
+            ProviderEvent::TextDelta(", world".into()),
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: Some(Usage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_output_tokens: None,
+                }),
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "Hello, world");
+        assert_eq!(r.tool_uses.len(), 0);
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(r.usage.unwrap().output_tokens, 2);
+    }
+
+    /// Issue #199: `openai-compat` against a self-hosted vLLM. The served
+    /// model name (`Qwen3.5-…`) trips `is_implicit_thinking_model`, but the
+    /// server runs with `enable_thinking:false` so the template never
+    /// prefills `<think>` and `</think>` never arrives. Pre-fix the pre-seed
+    /// routed the entire reply into the thinking channel — the persisted
+    /// `.jsonl` held a lone `thinking` block, the chat body stayed empty.
+    #[tokio::test]
+    async fn implicit_thinking_preseed_falls_back_to_text_without_close_tag() {
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "Qwen3.5-30B-A3B".into(),
+            },
+            ProviderEvent::TextDelta("กรุงเทพฯ".into()),
+            ProviderEvent::TextDelta(" (กรุงเทพมหานคร) ค่ะ".into()),
+            ProviderEvent::MessageStop {
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "กรุงเทพฯ (กรุงเทพมหานคร) ค่ะ");
+        assert_eq!(r.thinking, "");
+    }
+
+    /// Same guess, but the model really was thinking — the close tag lands,
+    /// so the held prefix commits to the thinking channel and only the tail
+    /// is answer text. This is the behaviour the pre-seed exists for.
+    #[tokio::test]
+    async fn implicit_thinking_preseed_still_captures_real_reasoning() {
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "qwen3-235b".into(),
+            },
+            ProviderEvent::TextDelta("let me check".into()),
+            ProviderEvent::TextDelta(" the capital</think>".into()),
+            ProviderEvent::TextDelta("Bangkok.".into()),
+            ProviderEvent::MessageStop {
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.thinking, "let me check the capital");
+        assert_eq!(r.text, "Bangkok.");
+    }
+
+    /// An agentic turn on the same server: the model opens with a preamble
+    /// and goes straight to a tool call. A real implicit-thinking model
+    /// closes `</think>` before calling a tool, so the held text is the
+    /// answer — release it rather than carrying it into the tool block.
+    #[tokio::test]
+    async fn implicit_thinking_preseed_releases_text_before_a_tool_call() {
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "Qwen3.5-30B-A3B".into(),
+            },
+            ProviderEvent::TextDelta("Checking the hostname.".into()),
+            ProviderEvent::ToolUseStart {
+                id: "call_1".into(),
+                name: "Bash".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: r#"{"command":"hostname"}"#.into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "Checking the hostname.");
+        assert_eq!(r.thinking, "");
+        assert_eq!(r.tool_uses.len(), 1);
+    }
+
+    /// Reasoning longer than `SPECULATIVE_LIMIT` must not be held to the end
+    /// of the turn — past that point the guess is accepted and thinking
+    /// streams live again.
+    #[tokio::test]
+    async fn implicit_thinking_preseed_commits_once_the_hold_gets_long() {
+        let long = "ก".repeat(SPECULATIVE_LIMIT);
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "deepseek-r1".into(),
+            },
+            ProviderEvent::TextDelta(long.clone()),
+            ProviderEvent::MessageStop {
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.thinking, long);
+        assert_eq!(r.text, "");
+    }
+
+    /// M6.21 BUG M1: vision/multimodal Qwen3 variants don't emit
+    /// `<think>...</think>` blocks. Pre-fix the broad `contains("qwen3")`
+    /// match pre-seeded `ThinkState::in_block` for them too, swallowing
+    /// every TextDelta as Thinking. Verify `is_implicit_thinking_model`
+    /// rejects the vision/omni siblings.
+    #[test]
+    fn implicit_thinking_excludes_vision_and_omni_qwen3_variants() {
+        // Should match (real thinking models)
+        assert!(is_implicit_thinking_model("qwen3"));
+        assert!(is_implicit_thinking_model("qwen3-235b"));
+        assert!(is_implicit_thinking_model("Qwen3-Thinking-30B"));
+        assert!(is_implicit_thinking_model("qwq-32b-preview"));
+        assert!(is_implicit_thinking_model("deepseek-r1"));
+        assert!(is_implicit_thinking_model(
+            "openrouter/deepseek/deepseek-r1"
+        ));
+
+        // Must NOT match (vision/multimodal — emit plain text without
+        // </think> close tags; pre-fix this would have hung the user
+        // with an empty chat bubble).
+        assert!(!is_implicit_thinking_model("qwen3-vl"));
+        assert!(!is_implicit_thinking_model("qwen3-vl-plus"));
+        assert!(!is_implicit_thinking_model("Qwen3-VL-72B-Instruct"));
+        assert!(!is_implicit_thinking_model("qwen3-omni"));
+        assert!(!is_implicit_thinking_model("qwen3-vision"));
+        assert!(!is_implicit_thinking_model("qwq-vision-preview"));
+
+        // Must NOT match (other model families that happen to share substrings)
+        assert!(!is_implicit_thinking_model("qwen2.5-coder"));
+        assert!(!is_implicit_thinking_model("qwen-vl-7b"));
+        assert!(!is_implicit_thinking_model("claude-sonnet-4-5"));
+        assert!(!is_implicit_thinking_model("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn structured_thinking_disables_implicit_thinking_buffer() {
+        // qwen3.6-flash on DashScope: the model name contains "qwen3" so
+        // is_implicit_thinking_model returns true and the assembler used
+        // to pre-seed in_block=true, waiting for a `</think>` tag in the
+        // text stream that never arrives because reasoning lives in a
+        // separate `reasoning_content` field. Result: every TextDelta
+        // got swallowed as Thinking and the user saw an empty bubble.
+        // Once a structured ThinkingDelta lands we know reasoning is
+        // out-of-band, so subsequent TextDeltas should render as the
+        // answer.
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "qwen3.6-flash".into(),
+            },
+            ProviderEvent::ThinkingDelta("Let me consider…".into()),
+            ProviderEvent::TextDelta("Hello".into()),
+            ProviderEvent::TextDelta("!".into()),
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "Hello!");
+        assert!(
+            r.thinking.contains("consider"),
+            "reasoning should still land in a Thinking block, got: {:?}",
+            r.thinking
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_use_accumulates_partial_json() {
+        let r = collected(vec![
+            ProviderEvent::ToolUseStart {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{\"pa".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "th\":\"".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "/tmp/x\"}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "");
+        assert_eq!(r.tool_uses.len(), 1);
+        match &r.tool_uses[0] {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({"path": "/tmp/x"}));
+            }
+            _ => panic!("expected ToolUse"),
+        }
+        assert_eq!(r.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[tokio::test]
+    async fn text_then_tool_use_in_one_turn() {
+        let r = collected(vec![
+            ProviderEvent::TextDelta("Let me check ".into()),
+            ProviderEvent::TextDelta("that file.".into()),
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::ToolUseStart {
+                id: "toolu_2".into(),
+                name: "glob".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{\"pattern\":\"*.rs\"}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.text, "Let me check that file.");
+        assert_eq!(r.tool_uses.len(), 1);
+        if let ContentBlock::ToolUse { name, input, .. } = &r.tool_uses[0] {
+            assert_eq!(name, "glob");
+            assert_eq!(input["pattern"], "*.rs");
+        } else {
+            panic!("expected ToolUse");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_tool_uses_in_one_turn() {
+        let r = collected(vec![
+            ProviderEvent::ToolUseStart {
+                id: "a".into(),
+                name: "read".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{\"p\":1}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::ToolUseStart {
+                id: "b".into(),
+                name: "write".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{\"p\":2}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ])
+        .await;
+
+        assert_eq!(r.tool_uses.len(), 2);
+        let ids: Vec<_> = r
+            .tool_uses
+            .iter()
+            .map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn empty_tool_input_becomes_empty_object() {
+        let r = collected(vec![
+            ProviderEvent::ToolUseStart {
+                id: "x".into(),
+                name: "list_projects".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ])
+        .await;
+        assert_eq!(r.tool_uses.len(), 1);
+        if let ContentBlock::ToolUse { input, .. } = &r.tool_uses[0] {
+            assert_eq!(input, &serde_json::json!({}));
+        } else {
+            panic!("expected ToolUse");
+        }
+    }
+
+    #[test]
+    fn implicit_thinking_detection_is_specific() {
+        // Should match: qwen3 family, qwq, deepseek-r1 family.
+        assert!(is_implicit_thinking_model("qwen3-30b-a3b-thinking"));
+        assert!(is_implicit_thinking_model("qwen/qwen3-235b"));
+        assert!(is_implicit_thinking_model("qwq-32b-preview"));
+        assert!(is_implicit_thinking_model("deepseek-r1"));
+        assert!(is_implicit_thinking_model("deepseek/deepseek-r1-distill"));
+
+        // Must NOT match: non-thinking qwen variants and unrelated -r1 ids.
+        assert!(!is_implicit_thinking_model("qwen2.5-coder-32b"));
+        assert!(!is_implicit_thinking_model("qwen-vl-plus"));
+        assert!(!is_implicit_thinking_model("qwen-turbo"));
+        assert!(!is_implicit_thinking_model("gpt-4o"));
+        assert!(!is_implicit_thinking_model("anthropic/claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn split_think_text_handles_lone_closing_tag() {
+        let mut state = ThinkState::default();
+
+        // Case: starts with reasoning (no <think>) and ends with </think>
+        let ev = split_think_text("reasoning here </think>actual answer", &mut state);
+        assert!(!state.in_block);
+        let thinking: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let AssembledEvent::Thinking(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let text: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let AssembledEvent::Text(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(thinking.join(""), "reasoning here ");
+        assert_eq!(text.join(""), "actual answer");
+    }
+
+    #[test]
+    fn split_think_text_strips_newlines_across_chunk_boundary() {
+        // Real Qwen3 / vLLM behavior: `</think>` ends one SSE chunk and the
+        // next chunk starts with `\n\n`. The blank lines must not leak into
+        // the rendered Text.
+        let mut state = ThinkState {
+            in_block: true,
+            ..Default::default()
+        };
+        let ev1 = split_think_text("</think>", &mut state);
+        let ev2 = split_think_text("\n\nHi.", &mut state);
+
+        let text: String = ev1
+            .iter()
+            .chain(ev2.iter())
+            .filter_map(|e| {
+                if let AssembledEvent::Text(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "Hi.");
+    }
+
+    #[tokio::test]
+    async fn implicit_thinking_routes_prefix_to_thinking() {
+        // Qwen3 streams reasoning then `</think>` then answer, with no
+        // opening tag. Reasoning must land in `thinking`, not `text`.
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "qwen3.6-35b-a3b-fp8".into(),
+            },
+            ProviderEvent::TextDelta("let me think about this".into()),
+            ProviderEvent::TextDelta(" carefully</think>".into()),
+            ProviderEvent::TextDelta("Final answer.".into()),
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ])
+        .await;
+        assert_eq!(r.thinking, "let me think about this carefully");
+        assert_eq!(r.text, "Final answer.");
+    }
+
+    #[tokio::test]
+    async fn implicit_thinking_truncated_mid_reasoning_stays_in_thinking() {
+        // Degenerate case: the token cap cuts the turn off mid-reasoning,
+        // so `</think>` was never going to arrive. The chain-of-thought
+        // must NOT leak as `text` — keep it in `thinking`.
+        //
+        // Note the stop reason is what separates this from issue #199: a
+        // clean `end_turn` with no close tag means the model was never
+        // thinking, and the held text is the answer (see
+        // `implicit_thinking_preseed_falls_back_to_text_without_close_tag`).
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "qwen3-30b".into(),
+            },
+            ProviderEvent::TextDelta("step 1, step 2, step 3".into()),
+            ProviderEvent::MessageStop {
+                stop_reason: Some("length".into()),
+                usage: None,
+            },
+        ])
+        .await;
+        assert_eq!(r.text, "");
+        assert_eq!(r.thinking, "step 1, step 2, step 3");
+    }
+
+    #[tokio::test]
+    async fn non_thinking_model_passes_text_through() {
+        // qwen2.5-coder must not be detected as implicit-thinking — its
+        // output is plain text and should not be re-routed.
+        let r = collected(vec![
+            ProviderEvent::MessageStart {
+                model: "qwen2.5-coder-32b".into(),
+            },
+            ProviderEvent::TextDelta("hello world".into()),
+            ProviderEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ])
+        .await;
+        assert_eq!(r.text, "hello world");
+        assert_eq!(r.thinking, "");
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_json_emits_parse_failed_event() {
+        // M6.17 BUG L4: pre-fix, a malformed tool_use JSON killed the
+        // entire turn via `?`. Now assemble emits ToolParseFailed
+        // (collapsed by `collect_turn` into an empty-input ToolUse so
+        // counters still see one) and the agent loop synthesizes an
+        // error tool_result for the model to read on next iteration.
+        let result = collect_turn(assemble(src(vec![
+            ProviderEvent::ToolUseStart {
+                id: "x".into(),
+                name: "t".into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{not-json".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+        ])))
+        .await
+        .expect("collect_turn should succeed; parse failure is in-band now");
+        assert_eq!(result.tool_uses.len(), 1, "synthetic ToolUse expected");
+        // Synthetic block has empty input.
+        if let ContentBlock::ToolUse {
+            id, name, input, ..
+        } = &result.tool_uses[0]
+        {
+            assert_eq!(id, "x");
+            assert_eq!(name, "t");
+            assert_eq!(input, &serde_json::json!({}));
+        } else {
+            panic!("expected ToolUse, got {:?}", result.tool_uses[0]);
+        }
+    }
+}

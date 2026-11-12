@@ -1,0 +1,1371 @@
+//! Filesystem sandbox: restricts file tool access to the startup directory
+//! and its subdirectories. Prevents `../` escapes, absolute paths outside
+//! the project, and symlink traversal.
+//!
+//! Set once at startup via `Sandbox::init()`. File tools call
+//! `Sandbox::check(path)` before every filesystem operation.
+
+use crate::error::{Error, Result};
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+static SANDBOX_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+pub struct Sandbox;
+
+impl Sandbox {
+    /// Initialize (or re-initialize) the sandbox root. First call sets the
+    /// root; subsequent calls update it so the GUI's "change directory"
+    /// modal can re-point the sandbox before any tools run.
+    ///
+    /// Prefers `$THCLAWS_PROJECT_ROOT` if set — exported by SpawnTeammate so
+    /// teammates spawned with `cd .worktrees/<name>` still treat the parent
+    /// project as their writable region (matching Claude Code's
+    /// `getOriginalCwd()` model). Without this override, a worktree teammate's
+    /// sandbox would shrink to its worktree and shared artifacts at the
+    /// project root would be denied.
+    /// Falls back to current_dir for standalone (non-team) invocations.
+    pub fn init() -> Result<()> {
+        // A workspace host's agent shares the workspace's files (dev-plan/61);
+        // a worktree teammate's project root is the next choice.
+        let root_path = match (
+            std::env::var("THCLAWS_WORKSPACE_ROOT"),
+            std::env::var("THCLAWS_PROJECT_ROOT"),
+        ) {
+            (Ok(s), _) if !s.trim().is_empty() => PathBuf::from(s),
+            (_, Ok(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => std::env::current_dir()?,
+        };
+        let root = root_path
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("cannot canonicalize sandbox root: {e}")))?;
+        *SANDBOX_ROOT.write().unwrap() = Some(root);
+        Ok(())
+    }
+
+    /// Returns the active sandbox root directory.
+    ///
+    /// dev-plan/42: when a per-session working root is scoped (multiuser
+    /// `--serve` — one `workspace-<id>/` per user), that takes priority
+    /// over the process-global `SANDBOX_ROOT`. `SANDBOX_ROOT` is a single
+    /// mutable global; in a shared multi-tenant process it can only hold
+    /// one root, so resolving against it would let one user's path
+    /// resolution land in another user's tree. The task-local root is
+    /// per-session and follows the task across runtime threads. Single-
+    /// tenant / desktop / CLI never scope it, so the global path is
+    /// unchanged.
+    ///
+    /// A multiuser process outside any member scope gets `None` here, never
+    /// the pod root; use [`Self::try_root`] where `None` would mean "allow".
+    pub fn root() -> Option<PathBuf> {
+        Self::try_root().ok().flatten()
+    }
+
+    /// [`Self::root`], but an error in a multiuser process with no member
+    /// scope active (a thread or task that dropped it): callers fail closed.
+    pub fn try_root() -> Result<Option<PathBuf>> {
+        if crate::workdir::workdir_is_scoped() {
+            return Ok(Some(crate::workdir::current_workdir()));
+        }
+        if crate::workdir::is_multiuser() {
+            return Err(Error::Tool(crate::workdir::UNSCOPED_REFUSAL.into()));
+        }
+        Ok(SANDBOX_ROOT.read().ok().and_then(|r| r.clone()))
+    }
+
+    /// Clear the global sandbox root back to its initial unset state.
+    /// Tests that swap cwd via a `with_temp_cwd`-style helper must
+    /// call this to drop the tempdir-scoped sandbox they set with
+    /// `init()` — otherwise SANDBOX_ROOT keeps pointing at the
+    /// restored saved_cwd and breaks every later tool test that
+    /// expects the default unset state (no `init()` called in unit
+    /// tests = allow-all branch). Regression caught 2026-05-30 from
+    /// dev-plan/33 Task 16 image_gen tests cascading into ~38
+    /// tool-test failures.
+    pub fn reset() {
+        if let Ok(mut w) = SANDBOX_ROOT.write() {
+            *w = None;
+        }
+    }
+
+    /// Validate a path for a write/mutate operation. In addition to the
+    /// standard sandbox rules, this denies any path inside the `.thclaws/`
+    /// directory at the sandbox root — that directory holds team state,
+    /// settings, agent defs, and mailbox files and must not be rewritten by
+    /// file tools. Teammate worktrees live at `.worktrees/<name>/` (sibling
+    /// of `.thclaws/`) and are writable like any other project subdirectory.
+    pub fn check_write(path: &str) -> Result<PathBuf> {
+        let resolved = Self::check(path)?;
+        if let Some(root) = Self::try_root()? {
+            return Self::enforce_write_policy(&root, resolved);
+        }
+        Ok(resolved)
+    }
+
+    fn enforce_write_policy_with(
+        root: &Path,
+        resolved: PathBuf,
+        allow_instructions: bool,
+    ) -> Result<PathBuf> {
+        // finding 11: an agent's own folder sits under `.thclaws/bots/<slug>/`,
+        // so the blanket deny below also locked an agent out of its own state —
+        // Book Author could not write the `book.json` it reads every turn. That
+        // folder IS the agent, so it is writable; the host's `.thclaws/` and a
+        // sibling agent's folder stay denied.
+        if let Some(agent) = crate::workdir::agent_dir() {
+            // Both forms: `resolved` is canonical for a path that exists and a
+            // normalized landing path for one that does not, and on macOS the
+            // canonical form of a temp dir gains a `/private` prefix the raw
+            // one lacks — comparing only one of them denies writes to new
+            // files in the agent's own folder.
+            let under = |a: &Path| resolved == a || resolved.starts_with(a);
+            if under(&agent) || agent.canonicalize().is_ok_and(|a| under(&a)) {
+                return Ok(resolved);
+            }
+        }
+        let Some(hit) = protected_match(root, &resolved) else {
+            return Ok(resolved);
+        };
+        if allow_instructions && hit.kind == ProtectedKind::Instructions {
+            return Ok(resolved);
+        }
+        if hit.rel == ".thclaws" {
+            return Err(Error::Tool(format!(
+                "access denied: {} is inside .thclaws/ — that directory is reserved for team \
+                 state (settings, agents, inboxes, tasks). Write shared artifacts to the \
+                 project root or a subdirectory other than .thclaws/.",
+                resolved.display()
+            )));
+        }
+        Err(Error::Tool(format!(
+            "access denied: {} is a protected path ({}) — thClaws or git loads it as \
+             configuration or instructions, so agent tools may not write it. Ask the user \
+             to edit it themselves.",
+            resolved.display(),
+            hit.rel
+        )))
+    }
+
+    /// `check_write` for a write the user approved explicitly: Write/Edit
+    /// force an approval prompt for root `AGENTS.md`/`CLAUDE.md`
+    /// ([`forces_instructions_approval`]), and the Files tab is the user's
+    /// own hand, so those two may write the instruction files. Every other
+    /// protected path stays denied.
+    pub fn check_write_approved(path: &str) -> Result<PathBuf> {
+        let resolved = Self::check(path)?;
+        if let Some(root) = Self::root() {
+            return Self::enforce_write_policy_with(&root, resolved, true);
+        }
+        Ok(resolved)
+    }
+
+    /// Whether a Write/Edit of `path` targets the workspace's own
+    /// `AGENTS.md`/`CLAUDE.md`, which needs an approval prompt even in
+    /// auto mode — they are loaded into every later system prompt.
+    pub fn forces_instructions_approval(path: &str) -> bool {
+        let (Some(root), Ok(resolved)) = (Self::root(), Self::check(path)) else {
+            return false;
+        };
+        protected_match(&root, &resolved).is_some_and(|h| h.kind == ProtectedKind::Instructions)
+    }
+
+    fn enforce_write_policy(root: &Path, resolved: PathBuf) -> Result<PathBuf> {
+        Self::enforce_write_policy_with(root, resolved, false)
+    }
+
+    /// Validate and resolve a path. Returns the canonicalized absolute path
+    /// if it's inside the sandbox, or an error if it escapes.
+    ///
+    /// Handles:
+    /// - Relative paths: joined to sandbox root.
+    /// - Absolute paths: checked directly.
+    /// - `../` traversal: resolved by canonicalize, then boundary-checked.
+    /// - Symlinks: canonicalize follows them, so a symlink pointing outside is denied.
+    /// - New files (don't exist yet): parent directory is validated instead.
+    pub fn check(path: &str) -> Result<PathBuf> {
+        refuse_remote(path)?;
+        let Some(root) = Self::try_root()? else {
+            // No sandbox initialized — allow everything (backward compat),
+            // while still returning the path's actual landing so callers
+            // can safely use O_NOFOLLOW for the final open.
+            let initial = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                crate::workdir::tool_base(path).join(path)
+            };
+            return Ok(resolve_landing(&initial));
+        };
+        // dev-plan/42: resolve relative paths against the per-session
+        // working dir (task-local when scoped, else process cwd) — except an
+        // agent's own `.thclaws/…`, which finding 11 resolves in its folder.
+        let cwd = crate::workdir::tool_base(path);
+        Self::validate_against(&root, &cwd, path)
+    }
+
+    /// Same algorithm as `check`, but rooted at an arbitrary directory
+    /// instead of the global workspace `SANDBOX_ROOT`. Used by GUI Shell
+    /// asset serving where the shell's folder is outside the workspace
+    /// (e.g. `~/.config/thclaws/gui-shell/<id>/`) so the global check would
+    /// reject it. Relative paths in `path` are resolved against `root`.
+    ///
+    /// Canonicalises `root` before validating so callers can pass
+    /// non-canonical paths (e.g. tempdir paths on macOS where `/tmp`
+    /// symlinks to `/private/tmp` — without this, the path's canonical
+    /// form has `/private/` prefix while the un-canonical root doesn't,
+    /// and the `starts_with` check spuriously fails).
+    pub fn check_in(root: &Path, path: &str) -> Result<PathBuf> {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| Error::Tool(format!("cannot canonicalize shell root: {e}")))?;
+        Self::validate_against(&canonical_root, &canonical_root, path)
+    }
+
+    /// dev-plan/35 multi-tenant: validate that `path` lives inside
+    /// the user's writable subtree(s) under `project_root`. Two-stage
+    /// check: (a) `check_in(project_root, path)` to confirm it's at
+    /// least inside the project, (b)
+    /// [`crate::multi_tenant::user_state::is_in_user_writable`] to
+    /// confirm it's also in one of `<project>/output/users/<id>/` or
+    /// `<project>/.thclaws/users/<id>/`. Rejects shared assets
+    /// (AGENTS.md, kms/, settings.json) and other users' subtrees.
+    ///
+    /// `paths` is the resolved [`UserStatePaths`] for the
+    /// authenticated user — same instance the IPC dispatch builds
+    /// once per request.
+    pub fn check_write_for_user(
+        project_root: &Path,
+        paths: &crate::multi_tenant::user_state::UserStatePaths,
+        path: &str,
+    ) -> Result<PathBuf> {
+        let resolved = Self::check_in(project_root, path)?;
+        if !crate::multi_tenant::user_state::is_in_user_writable(paths, &resolved) {
+            return Err(Error::Tool(format!(
+                "access denied: '{}' is outside the per-user writable subtree \
+                 (allowed: '{}/' and '{}/' for this user). In multi-tenant \
+                 mode, shared project assets (AGENTS.md, kms/, settings.json) \
+                 and other users' subtrees are read-only.",
+                resolved.display(),
+                paths.output_root.display(),
+                paths.thclaws_user_root.display(),
+            )));
+        }
+        Ok(resolved)
+    }
+
+    fn validate_against(root: &Path, cwd: &Path, path: &str) -> Result<PathBuf> {
+        refuse_remote(path)?;
+        // Resolve relative paths from cwd, not root. A teammate in
+        // .worktrees/backend/ calling Write("src/server.ts") must land the
+        // file in its worktree (where it stays on team/backend), not in the
+        // workspace's src/ (which is on main). Joining to root would silently
+        // route every relative write onto main, breaking branch isolation.
+        let initial = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            cwd.join(path)
+        };
+
+        // Lexically resolve `..` and `.` without touching the FS. Required
+        // because the parent-walk below checks each *existing* ancestor for
+        // containment, but `cwd/../outside.txt` has cwd as its parent (which
+        // is inside the sandbox) yet points outside. Normalizing first means
+        // the eventual ancestor check is meaningful.
+        let resolved = lexical_normalize(&initial);
+        refuse_windows_names(path, &resolved)?;
+
+        // Existing path: canonicalize so symlinks pointing outside are caught.
+        if let Ok(canonical) = resolved.canonicalize() {
+            return if canonical.starts_with(root) {
+                Ok(canonical)
+            } else {
+                Err(Self::denied(&canonical, root))
+            };
+        }
+
+        // Path doesn't exist yet (e.g. Write into a deep new tree like
+        // `src/api/handlers/auth.ts` where `src/api/handlers/` isn't there).
+        // The Write tool will `create_dir_all` the parent — we just need to
+        // confirm the path lands inside the sandbox. `resolve_landing` walks
+        // to the longest existing ancestor AND expands any symlink in the
+        // tail: this used to assume a non-existent tail could hold no
+        // symlink, which a dangling one disproves — it exists as a link, so
+        // `ws/dangling -> /outside/x.txt` passed the check and the write
+        // landed outside the workspace (issue #219).
+        let landing = resolve_landing(&resolved);
+        if landing.starts_with(root) {
+            return Ok(landing);
+        }
+        Err(Self::denied(&landing, root))
+    }
+
+    fn denied(path: &Path, root: &Path) -> Error {
+        // Keep the "access denied" prefix (tests + callers match on it) but
+        // spell out that this is a workspace-boundary limit, not a
+        // permission/approval gate. Weak models otherwise paraphrase the
+        // terse old message as "rejected by the security policy even though
+        // you approved" (issue #119), which sends users hunting in
+        // settings.json for a permission that was never the problem.
+        Error::Tool(format!(
+            "access denied: '{}' is outside the workspace root '{}'. File \
+             tools and the Bash working directory are confined to the \
+             workspace — this is a path boundary, NOT a permission/approval \
+             issue (approving a tool does not widen it). Use a path inside \
+             the workspace, or relaunch thClaws with a root that contains \
+             this path.",
+            path.display(),
+            root.display()
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedKind {
+    /// The directory and everything under it.
+    Dir,
+    File,
+    /// Any file directly in the root whose name starts with `rel`, except
+    /// the [`ENV_TEMPLATES`].
+    FilePrefix,
+    /// A file the agent may write only after an explicit approval.
+    Instructions,
+}
+
+#[derive(Debug)]
+pub struct ProtectedPath {
+    pub rel: &'static str,
+    pub kind: ProtectedKind,
+}
+
+/// Paths under the workspace root that thClaws, Claude Code or git load as
+/// configuration, hooks or instructions. Writing one plants code or prompt
+/// text that runs on a later start with no prompt (audit 2026-11-01 #4, #6,
+/// #7), so the file tools ([`Sandbox::check_write`]) and the OS confiner for
+/// Bash ([`crate::confine::build_policy`]) both deny them from this one list.
+pub const PROTECTED_PATHS: &[ProtectedPath] = &[
+    ProtectedPath {
+        rel: ".thclaws",
+        kind: ProtectedKind::Dir,
+    },
+    ProtectedPath {
+        rel: ".claude",
+        kind: ProtectedKind::Dir,
+    },
+    ProtectedPath {
+        rel: ".mcp.json",
+        kind: ProtectedKind::File,
+    },
+    ProtectedPath {
+        rel: ".env",
+        kind: ProtectedKind::File,
+    },
+    ProtectedPath {
+        rel: ".env.",
+        kind: ProtectedKind::FilePrefix,
+    },
+    ProtectedPath {
+        rel: ".git/config",
+        kind: ProtectedKind::File,
+    },
+    ProtectedPath {
+        rel: ".git/hooks",
+        kind: ProtectedKind::Dir,
+    },
+    ProtectedPath {
+        rel: ".git/info",
+        kind: ProtectedKind::Dir,
+    },
+    ProtectedPath {
+        rel: "AGENTS.md",
+        kind: ProtectedKind::Instructions,
+    },
+    ProtectedPath {
+        rel: "CLAUDE.md",
+        kind: ProtectedKind::Instructions,
+    },
+];
+
+/// `.env.*` names no loader reads: committed placeholders agents are asked
+/// to write.
+pub const ENV_TEMPLATES: &[&str] = &[".env.example", ".env.sample", ".env.template"];
+
+/// Whether `name` (one path component) falls under a `FilePrefix` entry.
+pub fn matches_file_prefix(name: &str, prefix: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with(&prefix.to_ascii_lowercase()) && !ENV_TEMPLATES.contains(&name.as_str())
+}
+
+/// Windows: a path that reaches the network or a raw device instead of a
+/// drive. Touching `\\host\share` at all — `canonicalize`, `metadata`,
+/// `is_file` — makes Windows authenticate to that host with the user's NTLM
+/// hash, so the sandbox has to refuse it before its first filesystem call
+/// (audit 2026-11-01 #10). Always false elsewhere, where `//x` is just `/x`.
+pub fn is_remote_or_device_path(path: &str) -> bool {
+    cfg!(windows) && remote_or_device(path)
+}
+
+fn refuse_remote(path: &str) -> Result<()> {
+    if is_remote_or_device_path(path) {
+        return Err(Error::Tool(format!(
+            "access denied: '{path}' is a network (UNC) or device path. File tools only \
+             open files on a local drive inside the workspace."
+        )));
+    }
+    Ok(())
+}
+
+/// [`is_remote_or_device_path`] without the OS gate, so it is tested on
+/// every CI host. Refuses any path opening with two separators (`\\`, `//`,
+/// `\/`) except a verbatim drive path `\\?\C:\…`, which `canonicalize`
+/// produces for every local file; also the NT object prefix `\??\`.
+pub(crate) fn remote_or_device(path: &str) -> bool {
+    let sep = |c: char| c == '\\' || c == '/';
+    let mut chars = path.chars();
+    let (a, b) = (chars.next(), chars.next());
+    if a.is_some_and(sep) && path[1..].starts_with("??") && path[3..].starts_with(sep) {
+        return true;
+    }
+    if !(a.is_some_and(sep) && b.is_some_and(sep)) {
+        return false;
+    }
+    let rest: Vec<char> = path.chars().skip(2).collect();
+    let verbatim_drive = rest.len() >= 4
+        && rest[0] == '?'
+        && sep(rest[1])
+        && rest[2].is_ascii_alphabetic()
+        && rest[3] == ':'
+        && (rest.len() == 4 || sep(rest[4]));
+    !verbatim_drive
+}
+
+/// `CON`, `NUL`, `COM1`… — Windows opens the device for these names in any
+/// folder and with any extension (`nul.txt` is still NUL).
+pub fn is_windows_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut chars = stem.chars();
+    let head: String = chars.by_ref().take(3).collect();
+    let digit = chars.next();
+    (head == "COM" || head == "LPT")
+        && chars.next().is_none()
+        && digit.is_some_and(|d| matches!(d, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'))
+}
+
+/// `PROGRA~1`, `THCLAW~1`: the shape of an 8.3 short name, which Windows
+/// resolves to the long name it abbreviates (`.thclaws`), so a check that
+/// compares names sees a harmless folder.
+pub fn looks_like_short_name(component: &str) -> bool {
+    let b = component.as_bytes();
+    b.windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// Why `component` names something other than itself on Windows: `a:b` is
+/// an alternate data stream of `a`, a trailing dot or space is stripped
+/// (`.git.` is `.git`), and a device name opens the device. Short names are
+/// left to [`looks_like_short_name`]: they are fine once they resolve.
+pub fn windows_component_problem(component: &str) -> Option<&'static str> {
+    if component.is_empty() || component == "." || component == ".." {
+        return None;
+    }
+    if component.contains(':') {
+        return Some("an alternate data stream or drive-relative name (':')");
+    }
+    if component.ends_with('.') || component.ends_with(' ') {
+        return Some("a name ending in a dot or space, which Windows strips");
+    }
+    if is_windows_device_name(component) {
+        return Some("a reserved device name (CON, NUL, COM1, ...)");
+    }
+    None
+}
+
+/// [`windows_component_problem`] over a whole tool path, past the drive
+/// (`C:\`) and verbatim (`\\?\C:\`) prefixes. A drive-relative `C:x`
+/// resolves against that drive's own cwd, not the tool's, so it is refused.
+pub fn windows_path_problem(raw: &str) -> Option<&'static str> {
+    let sep = |c: char| c == '\\' || c == '/';
+    let mut rest = raw;
+    for verbatim in [r"\\?\", "//?/", r"\\.\", "//./"] {
+        if let Some(r) = rest.strip_prefix(verbatim) {
+            rest = r;
+            break;
+        }
+    }
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        match rest[2..].chars().next() {
+            Some(c) if sep(c) => rest = &rest[2..],
+            None => return None,
+            Some(_) => return Some("a drive-relative path (C:name)"),
+        }
+    }
+    rest.split(sep).find_map(windows_component_problem)
+}
+
+fn refuse_windows_names(path: &str, resolved: &Path) -> Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    if let Some(why) = windows_path_problem(path) {
+        return Err(Error::Tool(format!(
+            "access denied: '{path}' is {why}. Use a plain file name."
+        )));
+    }
+    // An existing short name canonicalizes to its long name before any
+    // comparison; one that does not exist yet cannot be resolved.
+    let mut prefix = PathBuf::new();
+    for comp in resolved.components() {
+        prefix.push(comp);
+        if let std::path::Component::Normal(name) = comp {
+            let name = name.to_string_lossy();
+            if looks_like_short_name(&name) && !prefix.exists() {
+                return Err(Error::Tool(format!(
+                    "access denied: '{path}' contains an 8.3 short name ('{name}') that \
+                     does not exist, so it cannot be resolved to its long name. Use the \
+                     full name."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an archive entry name is unsafe to join onto an extraction root.
+/// Only plain relative names pass: no root, no `..`, and — when `windows` —
+/// no backslash, no `:` (`C:x` is drive-relative, `a:b` an alternate data
+/// stream), no device name and no component ending in a dot or space, which
+/// Windows strips (`.git.` is `.git`). `Path::is_absolute` is false for
+/// `\Users\x.bat` and `C:x`, which is how such entries got past the old
+/// check (audit 2026-11-01 #11). Checked on the raw name so the rule is the
+/// same on every OS the archive may be unpacked on.
+pub fn is_unsafe_archive_entry(raw: &str, windows: bool) -> bool {
+    use std::path::Component;
+    if raw.is_empty() || raw.starts_with('/') || raw.starts_with('\\') {
+        return true;
+    }
+    if windows && (raw.contains('\\') || raw.contains(':')) {
+        return true;
+    }
+    let seps: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+    for part in raw.split(seps) {
+        if part == ".." {
+            return true;
+        }
+        if windows
+            && part != "."
+            && (part.ends_with('.') || part.ends_with(' ') || is_windows_device_name(part))
+        {
+            return true;
+        }
+    }
+    !Path::new(raw)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// The protected entry `path` falls under, if any. Case-insensitive: macOS
+/// and Windows file systems resolve `.CLAUDE/x` and `.Env` to the same files
+/// the loaders read, and a false positive on Linux only refuses an odd name.
+pub fn protected_match(root: &Path, path: &Path) -> Option<&'static ProtectedPath> {
+    let rel = path.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| {
+            // APFS/NTFS fold these two to ASCII, so `.thclawſ` opens `.thclaws`.
+            let name = c
+                .as_os_str()
+                .to_string_lossy()
+                .replace('\u{17f}', "s")
+                .replace('\u{212a}', "k")
+                .to_ascii_lowercase();
+            let name = name.split(':').next().unwrap_or("");
+            match name.trim_end_matches(['.', ' ']) {
+                "" => name.to_string(),
+                t => t.to_string(),
+            }
+        })
+        .collect();
+    PROTECTED_PATHS.iter().find(|p| {
+        let rel = p.rel.to_ascii_lowercase();
+        let want: Vec<&str> = rel.split('/').collect();
+        match p.kind {
+            ProtectedKind::Dir => parts.len() >= want.len() && parts[..want.len()] == want[..],
+            ProtectedKind::File | ProtectedKind::Instructions => parts == want,
+            ProtectedKind::FilePrefix => parts.len() == 1 && matches_file_prefix(&parts[0], &rel),
+        }
+    })
+}
+
+/// Resolve `..` and `.` components lexically (no filesystem access).
+/// Used by `validate_against` to make the parent-walk meaningful when the
+/// target path doesn't exist yet — without this, `cwd/../outside.txt`
+/// would falsely pass containment checks because cwd itself is inside the
+/// sandbox. Shared with `subagent`'s `writePaths` scoping, which needs the
+/// same resolution before its globs see a path.
+/// A symlink chain longer than this is a loop, not a path.
+const MAX_SYMLINK_HOPS: usize = 32;
+
+/// Where a path will actually LAND on disk: `..`/`.` collapsed and every
+/// symlink followed — including a **dangling** one, whose target does not
+/// exist even though the link itself very much does.
+///
+/// `canonicalize` refuses a dangling final component, and the obvious
+/// fallback — canonicalise the longest existing ancestor and re-join the
+/// tail — rests on "the tail cannot contain a symlink, it does not exist".
+/// A dangling symlink is exactly the counter-example: `ws/dangling ->
+/// /outside/x.txt` made the tail `dangling`, the ancestor `ws`, and the
+/// answer `ws/dangling`, which is inside the sandbox while the write landed
+/// outside it (issue #219). So walk the tail a component at a time and
+/// expand any link found there.
+pub(crate) fn resolve_landing(path: &Path) -> PathBuf {
+    let lexical = lexical_normalize(path);
+    if let Ok(canonical) = lexical.canonicalize() {
+        return canonical;
+    }
+    let mut ancestor = lexical.parent();
+    let (base, tail) = loop {
+        match ancestor {
+            Some(p) => {
+                if let Ok(canonical) = p.canonicalize() {
+                    let tail = lexical
+                        .strip_prefix(p)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf();
+                    break (canonical, tail);
+                }
+                ancestor = p.parent();
+            }
+            None => return lexical,
+        }
+    };
+
+    let mut out = base;
+    let mut hops = 0usize;
+    for comp in tail.components() {
+        out.push(comp);
+        while hops < MAX_SYMLINK_HOPS {
+            let Ok(meta) = std::fs::symlink_metadata(&out) else {
+                break;
+            };
+            if !meta.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = std::fs::read_link(&out) else {
+                break;
+            };
+            out = if target.is_absolute() {
+                target
+            } else {
+                out.parent().map(|p| p.join(&target)).unwrap_or(target)
+            };
+            out = lexical_normalize(&out);
+            if let Ok(canonical) = out.canonicalize() {
+                out = canonical;
+            }
+            hops += 1;
+        }
+    }
+    out
+}
+
+pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// Issue #219: a dangling symlink exists as a LINK even though
+    /// `canonicalize` refuses it, so treating the non-existent tail as
+    /// symlink-free let a write leave the workspace entirely. Reproduced
+    /// against the real binary before this fix: the file landed outside.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_cannot_carry_a_write_out_of_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // The link exists; its target does not.
+        let link = ws.join("dangling");
+        std::os::unix::fs::symlink(outside.join("escaped.txt"), &link).unwrap();
+        assert!(link.symlink_metadata().is_ok(), "the link itself exists");
+        assert!(link.canonicalize().is_err(), "but it does not canonicalise");
+
+        assert_eq!(
+            resolve_landing(&link),
+            outside.join("escaped.txt"),
+            "the write lands where the link points, not where it sits"
+        );
+        assert!(
+            Sandbox::validate_against(&ws, &ws, "dangling").is_err(),
+            "so the sandbox must refuse it"
+        );
+
+        // A dangling link that stays inside is still allowed — the rule is
+        // about where it lands, not that it dangles.
+        let inside = ws.join("inside-link");
+        std::os::unix::fs::symlink(ws.join("new.txt"), &inside).unwrap();
+        assert_eq!(resolve_landing(&inside), ws.join("new.txt"));
+        assert!(Sandbox::validate_against(&ws, &ws, "inside-link").is_ok());
+
+        // An ordinary new file in a tree that does not exist yet still
+        // resolves — that is the case the old code was written for.
+        assert_eq!(
+            resolve_landing(&ws.join("a/b/c.txt")),
+            ws.join("a/b/c.txt"),
+            "a genuinely absent tail is joined, not rejected"
+        );
+
+        // A symlink loop terminates instead of hanging.
+        let a = ws.join("loop-a");
+        let b = ws.join("loop-b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let _ = resolve_landing(&a);
+    }
+
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Helper: run a test with a temporary root directory, calling
+    /// `validate_against` directly so tests don't fight over the global.
+    fn with_sandbox<F>(f: F)
+    where
+        F: FnOnce(&Path),
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        f(&root);
+    }
+
+    #[test]
+    fn relative_path_resolves_inside_sandbox() {
+        with_sandbox(|root| {
+            std::fs::write(root.join("hello.txt"), "hi").unwrap();
+            let result = Sandbox::validate_against(root, root, "hello.txt").unwrap();
+            assert!(result.starts_with(root));
+            assert!(result.ends_with("hello.txt"));
+        });
+    }
+
+    #[test]
+    fn absolute_path_inside_sandbox_allowed() {
+        with_sandbox(|root| {
+            let file = root.join("abs.txt");
+            std::fs::write(&file, "").unwrap();
+            let result = Sandbox::validate_against(root, root, file.to_str().unwrap()).unwrap();
+            assert!(result.starts_with(root));
+        });
+    }
+
+    #[test]
+    fn dotdot_escape_denied() {
+        with_sandbox(|root| {
+            let err = Sandbox::validate_against(root, root, "../../etc/passwd").unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("access denied") || msg.contains("not accessible"),
+                "got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn absolute_path_outside_denied() {
+        with_sandbox(|root| {
+            let err = Sandbox::validate_against(root, root, "/etc/passwd").unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("access denied") || msg.contains("not accessible"),
+                "got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn new_file_in_sandbox_allowed() {
+        with_sandbox(|root| {
+            let result = Sandbox::validate_against(root, root, "new_file.txt").unwrap();
+            assert!(result.starts_with(root));
+            assert!(result.ends_with("new_file.txt"));
+        });
+    }
+
+    // Issue #119: the denied message must read as a workspace-boundary
+    // limit, not a permission gate, so weak models stop paraphrasing it
+    // as "rejected by the security policy even though you approved".
+    #[test]
+    fn denied_message_names_workspace_boundary_not_permission() {
+        with_sandbox(|root| {
+            let err = Sandbox::validate_against(root, root, "/etc/passwd").unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("access denied"), "keeps prefix; got: {msg}");
+            assert!(
+                msg.contains("outside the workspace root"),
+                "names the boundary; got: {msg}"
+            );
+            assert!(
+                msg.contains("NOT a permission"),
+                "disclaims the permission framing; got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn new_file_outside_denied() {
+        with_sandbox(|root| {
+            let outside = format!("{}/../outside.txt", root.display());
+            let err = Sandbox::validate_against(root, root, &outside).unwrap_err();
+            assert!(
+                format!("{err}").contains("access denied")
+                    || format!("{err}").contains("not accessible")
+            );
+        });
+    }
+
+    #[test]
+    fn subdirectory_access_allowed() {
+        with_sandbox(|root| {
+            let sub = root.join("sub/dir");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("deep.txt"), "").unwrap();
+            let result = Sandbox::validate_against(root, root, "sub/dir/deep.txt").unwrap();
+            assert!(result.starts_with(root));
+        });
+    }
+
+    /// A worktree teammate's cwd is `.worktrees/<name>/` but its sandbox
+    /// root is the workspace. Relative writes must land in the worktree
+    /// (so they stay on `team/<name>`), not in the workspace root (which
+    /// would put them on `main`).
+    #[test]
+    fn relative_path_resolves_from_cwd_not_root() {
+        with_sandbox(|root| {
+            let worktree = root.join(".worktrees/backend");
+            std::fs::create_dir_all(worktree.join("src")).unwrap();
+            let result = Sandbox::validate_against(root, &worktree, "src/server.ts").unwrap();
+            assert!(
+                result.starts_with(&worktree),
+                "expected resolution under worktree, got {}",
+                result.display()
+            );
+            assert!(result.ends_with("src/server.ts"));
+        });
+    }
+
+    /// From a worktree cwd, escaping with ../../ to write a shared artifact
+    /// at the workspace root is allowed (still inside the sandbox boundary).
+    #[test]
+    fn worktree_dotdot_into_workspace_allowed() {
+        with_sandbox(|root| {
+            let worktree = root.join(".worktrees/backend");
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::create_dir_all(&worktree).unwrap();
+            let result =
+                Sandbox::validate_against(root, &worktree, "../../docs/api-spec.md").unwrap();
+            assert!(
+                result.starts_with(root) && !result.starts_with(&worktree),
+                "expected resolution at workspace root, got {}",
+                result.display()
+            );
+        });
+    }
+
+    /// Write tool calls `create_dir_all(parent)` so it can target a path
+    /// whose intermediate directories don't exist yet. Sandbox::check_write
+    /// must not reject those paths just because the immediate parent is
+    /// missing — otherwise backend can't write `src/api/handlers/auth.ts`
+    /// in a fresh worktree, which is the exact failure mode that bit us.
+    #[test]
+    fn deep_new_path_allowed_when_intermediate_dirs_missing() {
+        with_sandbox(|root| {
+            let result = Sandbox::validate_against(root, root, "src/api/handlers/auth.ts").unwrap();
+            assert!(result.starts_with(root));
+            assert!(result.ends_with("src/api/handlers/auth.ts"));
+        });
+    }
+
+    /// Same case from a worktree cwd: backend's relative `Write("src/foo.ts")`
+    /// where neither `src/` nor any parent exists in its worktree yet.
+    #[test]
+    fn worktree_deep_new_path_allowed() {
+        with_sandbox(|root| {
+            let worktree = root.join(".worktrees/backend");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let result =
+                Sandbox::validate_against(root, &worktree, "src/api/handlers/auth.ts").unwrap();
+            assert!(result.starts_with(&worktree));
+        });
+    }
+
+    /// `..` must not slip past the parent-walk into a non-existing path
+    /// segment — `cwd/../outside.txt` could be falsely accepted if we only
+    /// canonicalized the existing parent (cwd) without normalizing `..`
+    /// in the resolved path first.
+    #[test]
+    fn dotdot_in_non_existing_path_is_normalized_and_denied() {
+        with_sandbox(|root| {
+            let outside = format!("{}/../outside.txt", root.display());
+            let err = Sandbox::validate_against(root, root, &outside).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("access denied") || msg.contains("not accessible"),
+                "got: {msg}"
+            );
+        });
+    }
+
+    /// From a worktree cwd, an absolute path pointing back into the workspace
+    /// is also allowed — the canonical form is inside the sandbox.
+    #[test]
+    fn worktree_absolute_workspace_path_allowed() {
+        with_sandbox(|root| {
+            let worktree = root.join(".worktrees/backend");
+            let docs = root.join("docs");
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::create_dir_all(&worktree).unwrap();
+            let target = docs.join("api-spec.md");
+            let result =
+                Sandbox::validate_against(root, &worktree, target.to_str().unwrap()).unwrap();
+            assert!(result.starts_with(root));
+        });
+    }
+
+    #[test]
+    fn write_denied_inside_thclaws() {
+        with_sandbox(|root| {
+            let settings = root.join(".thclaws/settings.json");
+            let err = Sandbox::enforce_write_policy(root, settings).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("access denied"), "got: {msg}");
+            assert!(msg.contains(".thclaws/"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn write_denied_on_every_protected_path() {
+        with_sandbox(|root| {
+            for rel in [
+                ".claude/settings.json",
+                ".claude/skills/x/SKILL.md",
+                ".CLAUDE/agents/x.md",
+                ".mcp.json",
+                ".env",
+                ".env.local",
+                ".Env",
+                ".env.example.local",
+                ".env.examples",
+                ".git/config",
+                ".git/hooks/pre-commit",
+                ".git/info/attributes",
+                "AGENTS.md",
+                "claude.md",
+            ] {
+                let err = Sandbox::enforce_write_policy(root, root.join(rel)).unwrap_err();
+                assert!(format!("{err}").contains("access denied"), "{rel}");
+            }
+        });
+    }
+
+    #[test]
+    fn protected_list_leaves_lookalikes_writable() {
+        with_sandbox(|root| {
+            for rel in [
+                "src/.env",
+                "docs/AGENTS.md",
+                ".git/HEAD",
+                ".git/objects/ab/cd",
+                ".gitignore",
+                ".environment",
+                ".claudeignore",
+                "app/.claude/x.md",
+                ".env.example",
+                ".env.Sample",
+                ".ENV.TEMPLATE",
+            ] {
+                let p = root.join(rel);
+                assert_eq!(
+                    Sandbox::enforce_write_policy(root, p.clone()).unwrap(),
+                    p,
+                    "{rel}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn approved_write_reaches_instructions_but_nothing_else() {
+        with_sandbox(|root| {
+            for rel in ["AGENTS.md", "CLAUDE.md"] {
+                let p = root.join(rel);
+                assert_eq!(
+                    Sandbox::enforce_write_policy_with(root, p.clone(), true).unwrap(),
+                    p
+                );
+            }
+            for rel in [
+                ".mcp.json",
+                ".claude/settings.json",
+                ".thclaws/settings.json",
+            ] {
+                assert!(Sandbox::enforce_write_policy_with(root, root.join(rel), true).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn remote_and_device_paths_are_recognised_on_every_os() {
+        for p in [
+            r"\\host\share\x.txt",
+            "//host/share/x.txt",
+            r"\/host/share",
+            r"/\host\share",
+            r"\\?\UNC\host\share\x",
+            r"\\?\GLOBALROOT\Device\x",
+            r"\\.\pipe\x",
+            r"\\.\C:\x",
+            r"\??\UNC\host\share",
+            r"\??\C:\x",
+            r"\\?\C",
+            r"\\?\CC:\x",
+        ] {
+            assert!(remote_or_device(p), "{p}");
+        }
+        for p in [
+            r"\\?\C:\Users\me\ws\a.txt",
+            r"\\?\d:",
+            r"C:\Users\me\a.txt",
+            r"\Users\me",
+            "src/main.rs",
+            "/home/me/ws/a.txt",
+            "",
+            "?",
+        ] {
+            assert!(!remote_or_device(p), "{p}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_paths_are_refused_before_touching_the_network() {
+        with_sandbox(|root| {
+            let err = Sandbox::validate_against(root, root, r"\\attacker\share\x").unwrap_err();
+            assert!(format!("{err}").contains("UNC"));
+        });
+    }
+
+    #[test]
+    fn archive_entries_must_be_plain_relative_names() {
+        for (raw, windows) in [
+            ("/etc/passwd", false),
+            ("../x", false),
+            ("a/../../x", false),
+            ("", false),
+            (r"\Users\Public\x.bat", false),
+            (r"\Users\Public\x.bat", true),
+            ("C:foo", true),
+            ("C:/x", true),
+            ("a/b:stream", true),
+            (r"a\..\..\x", true),
+            ("nul", true),
+            ("dir/COM3.log", true),
+            (".git./config", true),
+            ("x /y", true),
+        ] {
+            assert!(is_unsafe_archive_entry(raw, windows), "{raw} ({windows})");
+        }
+        for (raw, windows) in [
+            ("a/b/c.md", true),
+            ("./", true),
+            ("./.thclaws/skills/", true),
+            ("dir/", true),
+            ("console.log", true),
+            ("COM10", true),
+            ("LPT", true),
+        ] {
+            assert!(!is_unsafe_archive_entry(raw, windows), "{raw} ({windows})");
+        }
+        // `a:` is a drive prefix to a Windows host's own path parser, so the
+        // name is refused there even for a POSIX archive.
+        assert_eq!(is_unsafe_archive_entry("a:b.txt", false), cfg!(windows));
+    }
+
+    #[test]
+    fn windows_device_names() {
+        for n in ["CON", "nul", "Aux.txt", "com1", "LPT9.tar.gz", "prn "] {
+            assert!(is_windows_device_name(n), "{n}");
+        }
+        for n in ["CONFIG", "com0", "COM10", "lpt", "nul_", "x.nul"] {
+            assert!(!is_windows_device_name(n), "{n}");
+        }
+        for n in ["COM\u{b9}", "lpt\u{b3}.txt", "CONIN$", "conout$.log"] {
+            assert!(is_windows_device_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn windows_path_problems_are_recognised_on_every_os() {
+        for bad in [
+            "a.txt:evil",
+            ".env::$DATA",
+            "C:evil.bat",
+            "src\\NUL.txt",
+            "out/con",
+            ".git./config",
+            "notes.txt ",
+            r"C:\ws\com1.log",
+            r"\\?\C:\ws\x.txt:s",
+        ] {
+            assert!(windows_path_problem(bad).is_some(), "{bad}");
+        }
+        for ok in [
+            "src/main.rs",
+            r"C:\Users\me\ws\file.txt",
+            r"\\?\C:\ws\a\b.rs",
+            "C:/ws/.env.example",
+            "../x/./y",
+            "console.log",
+            "C:",
+            "PROGRA~1/x",
+        ] {
+            assert!(windows_path_problem(ok).is_none(), "{ok}");
+        }
+        assert!(looks_like_short_name("THCLAW~1"));
+        assert!(looks_like_short_name("git~12"));
+        assert!(!looks_like_short_name("a~b"));
+        assert!(!looks_like_short_name("backup~"));
+    }
+
+    #[test]
+    fn protected_match_sees_through_stream_and_trailing_dot_suffixes() {
+        let root = Path::new("/ws");
+        for rel in [
+            ".env::$DATA",
+            ".env.",
+            ".THCLAWS./settings.json",
+            ".Git /Config",
+            ".mcp.json:x",
+            ".ENV",
+        ] {
+            assert!(protected_match(root, &root.join(rel)).is_some(), "{rel}");
+        }
+        assert!(protected_match(root, &root.join(".env.example.")).is_none());
+        assert!(protected_match(root, &root.join(".thclaw\u{17f}/gui-shell/x")).is_some());
+        assert!(protected_match(root, &root.join(".git/hoo\u{212a}s/pre-commit")).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unresolvable_short_names_and_streams_are_refused_on_windows() {
+        with_sandbox(|root| {
+            let v = |p: &str| Sandbox::validate_against(root, root, p);
+            assert!(v("NOSUCH~1/x.txt").is_err());
+            assert!(v("a.txt:evil").is_err());
+            assert!(v("nul.txt").is_err());
+            assert!(v("ok.txt").is_ok());
+            std::fs::create_dir_all(root.join(".thclaws")).unwrap();
+            if let Ok(p) = v("THCLAW~1") {
+                assert!(Sandbox::enforce_write_policy(root, p.join("x")).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn write_allowed_inside_worktree() {
+        with_sandbox(|root| {
+            let file = root.join(".worktrees/backend/src/lib.rs");
+            let result = Sandbox::enforce_write_policy(root, file.clone()).unwrap();
+            assert_eq!(result, file);
+        });
+    }
+
+    #[test]
+    fn write_allowed_outside_thclaws() {
+        with_sandbox(|root| {
+            let file = root.join("src/main.rs");
+            let result = Sandbox::enforce_write_policy(root, file.clone()).unwrap();
+            assert_eq!(result, file);
+        });
+    }
+
+    #[test]
+    fn symlink_escape_denied() {
+        with_sandbox(|root| {
+            let link = root.join("escape_link");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("/tmp", &link).unwrap();
+            #[cfg(unix)]
+            {
+                let err =
+                    Sandbox::validate_against(root, root, "escape_link/something").unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("access denied") || msg.contains("not accessible"),
+                    "got: {msg}"
+                );
+            }
+        });
+    }
+
+    /// `check_in` works for roots completely unrelated to the global
+    /// `SANDBOX_ROOT` — the GUI Shell case where the shell folder lives
+    /// outside the workspace (e.g. `~/.config/thclaws/gui-shell/<id>/`).
+    #[test]
+    fn check_in_resolves_inside_arbitrary_root() {
+        with_sandbox(|root| {
+            std::fs::write(root.join("index.html"), "<!doctype html>").unwrap();
+            let result = Sandbox::check_in(root, "index.html").unwrap();
+            assert!(result.starts_with(root));
+            assert!(result.ends_with("index.html"));
+        });
+    }
+
+    #[test]
+    fn check_in_denies_dotdot_escape() {
+        with_sandbox(|root| {
+            let err = Sandbox::check_in(root, "../../etc/passwd").unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("access denied") || msg.contains("not accessible"),
+                "got: {msg}"
+            );
+        });
+    }
+
+    /// dev-plan/35 multi-tenant: a per-user write check accepts paths
+    /// in the user's own `output/users/<id>/` and
+    /// `.thclaws/users/<id>/` subtrees, and rejects shared assets +
+    /// other users' subtrees.
+    #[test]
+    fn check_write_for_user_isolates_per_user_subtrees() {
+        use crate::multi_tenant::{user_state::UserStatePaths, UserId};
+        with_sandbox(|root| {
+            // Real on-disk per-user subtrees so canonicalize() works
+            // and the starts_with check meets the canonical root.
+            std::fs::create_dir_all(root.join("output/users/alice")).unwrap();
+            std::fs::create_dir_all(root.join(".thclaws/users/alice")).unwrap();
+            std::fs::create_dir_all(root.join("output/users/bob")).unwrap();
+            std::fs::create_dir_all(root.join(".thclaws/users/bob")).unwrap();
+
+            let alice = UserStatePaths::new(root, &UserId::new_for_test("alice"));
+
+            // OK: alice writes into her output subtree.
+            let ok = Sandbox::check_write_for_user(root, &alice, "output/users/alice/img.png");
+            assert!(ok.is_ok(), "alice → her output: {ok:?}");
+
+            // OK: alice writes into her .thclaws subtree.
+            let ok = Sandbox::check_write_for_user(
+                root,
+                &alice,
+                ".thclaws/users/alice/storage/sess.json",
+            );
+            assert!(ok.is_ok(), "alice → her storage: {ok:?}");
+
+            // REJECT: alice writes to shared AGENTS.md (read-only).
+            let err = Sandbox::check_write_for_user(root, &alice, "AGENTS.md").unwrap_err();
+            assert!(format!("{err}").contains("outside the per-user writable subtree"));
+
+            // REJECT: alice writes to bob's output.
+            let err = Sandbox::check_write_for_user(root, &alice, "output/users/bob/img.png")
+                .unwrap_err();
+            assert!(format!("{err}").contains("outside the per-user writable subtree"));
+
+            // REJECT: alice writes to bob's storage.
+            let err =
+                Sandbox::check_write_for_user(root, &alice, ".thclaws/users/bob/storage/leak.json")
+                    .unwrap_err();
+            assert!(format!("{err}").contains("outside the per-user writable subtree"));
+
+            // REJECT: alice writes to shared output.
+            let err = Sandbox::check_write_for_user(root, &alice, "output/shared.png").unwrap_err();
+            assert!(format!("{err}").contains("outside the per-user writable subtree"));
+        });
+    }
+
+    /// M-a/M-e: a multiuser call that lost its member scope (a thread or
+    /// blocking task) is refused, never resolved against the pod root.
+    #[test]
+    fn multiuser_without_a_member_scope_fails_closed() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        crate::workdir::set_multiuser(true);
+        let root = Sandbox::try_root();
+        let plain_root = Sandbox::root();
+        let check = Sandbox::check("notes.md");
+        let write = Sandbox::check_write("notes.md");
+        let scoped = crate::workdir::sync_scope_workdir(ws.clone(), || {
+            (
+                Sandbox::try_root().unwrap(),
+                Sandbox::check("notes.md").is_ok(),
+            )
+        });
+        crate::workdir::set_multiuser(false);
+
+        assert!(root.is_err());
+        assert!(plain_root.is_none());
+        assert!(check
+            .unwrap_err()
+            .to_string()
+            .contains("no member workspace"));
+        assert!(write.is_err());
+        assert_eq!(scoped, (Some(ws), true));
+    }
+
+    // dev-plan/42 security proof: in a multiuser process two concurrent
+    // sessions resolve against their OWN workspace. `Sandbox::root()`
+    // returns the per-session task-local root and never falls through to
+    // the shared process-global `SANDBOX_ROOT` (the scoped branch returns
+    // first), and interleaving (yield mid-task on a multi-thread runtime)
+    // can't make one session see another's root. Deliberately does NOT
+    // touch the global root — that would pollute it for sibling tests
+    // (the codebase convention; see `with_sandbox`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_sessions_isolate_workdir_roots() {
+        let alice = tempdir().unwrap();
+        let bob = tempdir().unwrap();
+        let ap = alice.path().to_path_buf();
+        let bp = bob.path().to_path_buf();
+
+        // Two sessions, each scoped to its own workspace, yielding mid-task
+        // to force interleaving across the runtime's worker threads. That
+        // `root()` returns the scoped dir at all proves the scoped branch
+        // fired instead of consulting the global.
+        let a = crate::workdir::scope_workdir(ap.clone(), async {
+            tokio::task::yield_now().await;
+            Sandbox::root().unwrap()
+        });
+        let b = crate::workdir::scope_workdir(bp.clone(), async {
+            tokio::task::yield_now().await;
+            Sandbox::root().unwrap()
+        });
+        let (ra, rb) = tokio::join!(a, b);
+
+        assert_eq!(ra, ap, "alice's turn resolves into alice's workspace");
+        assert_eq!(rb, bp, "bob's turn resolves into bob's workspace");
+        assert_ne!(ra, rb, "no cross-tenant leakage under interleaving");
+    }
+}
